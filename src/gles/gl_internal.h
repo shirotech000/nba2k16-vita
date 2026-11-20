@@ -65,6 +65,17 @@ typedef struct gl_texture {
   SceGxmOutputRegisterFormat out_fmt;
   SceGxmOutputRegisterSize out_size;
   int is_depth;             // depth texture (no real support yet)
+  // mips / cube maps / srgb (gl_tex.c). w/h/stride above are level 0.
+  // 2d: linear, level 0 at mem->ptr, mips packed after it. cube: gxm CUBE
+  // (swizzled), not renderable.
+  unsigned levels;          // mip levels the allocation has room for (>= 1)
+  uint16_t defined[6];      // per face, bit n = level n was specified
+  int is_cube;
+  uint32_t face_size;       // cube: bytes per face incl. its whole chain
+  int base_level, max_level;
+  int srgb;                 // sampled with gxm gamma decode
+  unsigned mips_used;       // levels in the current gxm descriptor
+  int chain_guess;          // chain allocated up front on a hint, no level > 0 seen yet
 } gl_texture;
 
 gl_texture *tex_get(GLuint name);
@@ -89,6 +100,7 @@ typedef struct gl_framebuffer {
   GLuint name;
   GLuint color_tex, color_rb;
   GLuint depth_tex, depth_rb, stencil_rb;
+  GLuint stencil_tex;       // set by STENCIL / DEPTH_STENCIL texture attachments
 } gl_framebuffer;
 
 // what the current scene is drawing into
@@ -98,6 +110,9 @@ typedef struct {
   int has_color, has_depth;
   SceGxmOutputRegisterFormat out_fmt;
   GLuint fbo;
+  // GL has a stencil buffer here. gxm surfaces are always d24s8, but a D16/D24
+  // fbo has no stencil in GL, so the stencil test must act as always-pass there
+  int has_stencil;
 } gl_cur_target;
 
 extern gl_cur_target T;
@@ -294,3 +309,6 @@ static inline uint32_t fnv1a(const void *data, size_t n, uint32_t h)
   while (n--) { h ^= *p++; h *= 16777619u; }
   return h;
 }
+
+// etc.c: decoded bytes per pixel (4 rgba8, 1 r11, 2 rg11), 0 if not etc
+int etc_out_bpp(GLenum fmt);

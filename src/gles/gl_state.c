@@ -6,6 +6,7 @@
 
 gl_state G;
 static name_table g_bufs;
+extern int config_int(const char *key, int def);
 
 // ============================================================ name tables
 
@@ -357,6 +358,7 @@ static const GLenum g_comp_fmts[] = {
   GL_ETC1_RGB8_OES, GL_COMPRESSED_RGB8_ETC2, GL_COMPRESSED_SRGB8_ETC2,
   GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2, GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2,
   GL_COMPRESSED_RGBA8_ETC2_EAC, GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC,
+  GL_COMPRESSED_R11_EAC, GL_COMPRESSED_SIGNED_R11_EAC, GL_COMPRESSED_RG11_EAC, GL_COMPRESSED_SIGNED_RG11_EAC,
 };
 
 const GLubyte *glGetString(GLenum name)
@@ -623,9 +625,23 @@ int gl_apply_state(int prim)
   sceGxmSetFrontDepthWriteEnable(c, dw);
   sceGxmSetBackDepthWriteEnable(c, dw);
 
-  // stencil. assumption: gxm "front" = ccw on screen (y down)
-  int st = G.stencil_test && T.has_depth;
-  int swap = (G.front_face == GL_CW) ^ (!T.flip);
+  // winding test knobs (config.txt), both unverified on hw:
+  //   fbo_cull_flip=0  don't mirror winding on fbos (if gxm judges facing pre-viewport)
+  //   stencil_swap=1   swap gxm front/back stencil (if gxm "front" = cw on screen)
+  static int k_fbo_flip = -1, k_sswap;
+  if (k_fbo_flip < 0) {
+    k_fbo_flip = config_int("fbo_cull_flip", 1) ? 1 : 0;
+    k_sswap = config_int("stencil_swap", 0) ? 1 : 0;
+    if (!k_fbo_flip || k_sswap) L("gl: winding knobs fbo_cull_flip=%d stencil_swap=%d", k_fbo_flip, k_sswap);
+  }
+  int mirrored = !T.flip && k_fbo_flip;
+
+  // stencil. assumption: gxm "front" = ccw on screen (y down). no stencil
+  // attachment in GL (D16 fbo) = test always passes, gxm's plane is junk there
+  int st = G.stencil_test && T.has_stencil;
+  if (G.stencil_test && !T.has_stencil && T.has_depth)
+    L_ONCE("gl: stencil test on a depth-only fbo (%ux%u), treated as always-pass", T.w, T.h);
+  int swap = (G.front_face == GL_CW) ^ mirrored ^ k_sswap;
   for (int side = 0; side < 2; side++) {
     const gl_stencil_side *s = &G.stencil[side ^ swap];
     void (*fn)(SceGxmContext *, SceGxmStencilFunc, SceGxmStencilOp, SceGxmStencilOp, SceGxmStencilOp,
@@ -650,7 +666,7 @@ int gl_apply_state(int prim)
     if (G.cull_face == GL_FRONT_AND_BACK) return 0;
     int front_ccw = G.front_face != GL_CW;
     int cull_ccw = (G.cull_face == GL_FRONT) ? front_ccw : !front_ccw;
-    if (!T.flip) cull_ccw = !cull_ccw;
+    if (mirrored) cull_ccw = !cull_ccw;
     cm = cull_ccw ? SCE_GXM_CULL_CCW : SCE_GXM_CULL_CW;
   }
   sceGxmSetCullMode(c, cm);

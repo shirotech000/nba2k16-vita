@@ -52,6 +52,12 @@ static int is_depth_fmt(GLenum f)
          f == GL_DEPTH_COMPONENT || f == GL_DEPTH_STENCIL;
 }
 
+static int rb_has_stencil(GLenum f)
+{
+  return f == GL_DEPTH24_STENCIL8 || f == GL_DEPTH32F_STENCIL8 || f == GL_STENCIL_INDEX8 ||
+         f == GL_DEPTH_STENCIL;
+}
+
 void glRenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h)
 {
   (void)target;
@@ -155,18 +161,26 @@ void glFramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint 
   if (level) L_ONCE("fbo: attaching mip level %d, only level 0 exists", level);
   if (textarget != GL_TEXTURE_2D && tex) L_ONCE("fbo: attaching cube face 0x%X, TODO", textarget);
   if (f->name == G.draw_fbo) gl_fbo_changed();
+  // note: nba2k16 never gets here with depth/stencil, it only attaches
+  // COLOR_ATTACHMENT0 textures and uses renderbuffers for depth
+  if (tex && att != GL_COLOR_ATTACHMENT0)
+    L_ONCE("fbo: depth/stencil texture attachment, depth renders to a private surface and can't be sampled (TODO)");
   switch (att) {
   case GL_COLOR_ATTACHMENT0:
     f->color_tex = tex;
     f->color_rb = 0;
     break;
   case GL_DEPTH_ATTACHMENT:
-  case GL_DEPTH_STENCIL_ATTACHMENT:
-    if (tex) L_ONCE("fbo: depth texture attachment, depth renders to a private surface and can't be sampled (TODO)");
     f->depth_tex = tex;
     f->depth_rb = 0;
     break;
+  case GL_DEPTH_STENCIL_ATTACHMENT:
+    f->depth_tex = f->stencil_tex = tex;
+    f->depth_rb = f->stencil_rb = 0;
+    break;
   case GL_STENCIL_ATTACHMENT:
+    f->stencil_tex = tex;
+    f->stencil_rb = 0;
     break;
   default:
     L_ONCE("fbo: attachment 0x%X not supported", att);
@@ -183,8 +197,11 @@ void glFramebufferRenderbuffer(GLenum target, GLenum att, GLenum rbtarget, GLuin
   switch (att) {
   case GL_COLOR_ATTACHMENT0: f->color_rb = rb; f->color_tex = 0; break;
   case GL_DEPTH_ATTACHMENT: f->depth_rb = rb; f->depth_tex = 0; break;
-  case GL_STENCIL_ATTACHMENT: f->stencil_rb = rb; break;
-  case GL_DEPTH_STENCIL_ATTACHMENT: f->depth_rb = f->stencil_rb = rb; f->depth_tex = 0; break;
+  case GL_STENCIL_ATTACHMENT: f->stencil_rb = rb; f->stencil_tex = 0; break;
+  case GL_DEPTH_STENCIL_ATTACHMENT:
+    f->depth_rb = f->stencil_rb = rb;
+    f->depth_tex = f->stencil_tex = 0;
+    break;
   default: L_ONCE("fbo: renderbuffer attachment 0x%X not supported", att); break;
   }
 }
@@ -193,7 +210,7 @@ GLenum glCheckFramebufferStatus(GLenum target)
 {
   gl_framebuffer *f = bound_fbo(target);
   if (!f) return GL_FRAMEBUFFER_COMPLETE;
-  if (!f->color_tex && !f->color_rb && !f->depth_rb && !f->depth_tex)
+  if (!f->color_tex && !f->color_rb && !f->depth_rb && !f->depth_tex && !f->stencil_rb && !f->stencil_tex)
     return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
   return GL_FRAMEBUFFER_COMPLETE;
 }
@@ -246,7 +263,7 @@ int gl_ensure_scene(int full_ds_clear)
   memset(&t, 0, sizeof(t));
   gl_framebuffer *f = G.draw_fbo ? fbo_get(G.draw_fbo) : NULL;
   gl_texture *ctex = NULL;
-  gl_renderbuffer *crb = NULL, *drb = NULL;
+  gl_renderbuffer *crb = NULL, *zrb = NULL;
 
   if (!f) {
     gxm_display_target(&t);
@@ -255,6 +272,7 @@ int gl_ensure_scene(int full_ds_clear)
     T.flip = 1;
     T.has_color = 1;
     T.has_depth = 1;
+    T.has_stencil = 1;   // egl reports 24/8
     T.out_fmt = SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4;
     T.fbo = 0;
   } else {
@@ -262,6 +280,7 @@ int gl_ensure_scene(int full_ds_clear)
     T.flip = 0;
     T.has_color = 0;
     T.has_depth = 0;
+    T.has_stencil = 0;
     T.out_fmt = SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4;
     T.fbo = f->name;
     if (f->color_tex) {
@@ -295,23 +314,33 @@ int gl_ensure_scene(int full_ds_clear)
         }
       }
     }
-    if (f->depth_rb) {
-      drb = rb_get(f->depth_rb);
-      if (drb && drb->mem && drb->is_depth) {
-        if (!w) { w = drb->w; h = drb->h; }
-        if (drb->w >= w && drb->h >= h) {
-          t.depth = &drb->ds;
-          T.has_depth = 1;
-        } else {
-          L_ONCE("fbo: depth rb %ux%u smaller than color %ux%u, depth off", drb->w, drb->h, w, h);
-        }
+    // depth + stencil. every gxm surface here is packed d24s8, but GL only has
+    // a stencil buffer if something is attached at the stencil point. the game
+    // puts its D24S8 rb on both points and its D16 / D24 rbs on depth only.
+    gl_renderbuffer *drb = f->depth_rb ? rb_get(f->depth_rb) : NULL;
+    gl_renderbuffer *srb = f->stencil_rb ? rb_get(f->stencil_rb) : NULL;
+    if (drb && !(drb->mem && drb->is_depth && drb->ifmt != GL_STENCIL_INDEX8)) drb = NULL;
+    if (srb && !(srb->mem && srb->is_depth && rb_has_stencil(srb->ifmt))) srb = NULL;
+    zrb = drb ? drb : srb;
+    if (zrb) {
+      if (!w) { w = zrb->w; h = zrb->h; }
+      if (zrb->w >= w && zrb->h >= h) {
+        t.depth = &zrb->ds;
+        T.has_depth = drb != NULL;
+        T.has_stencil = srb != NULL;
+        // gxm can't bind two surfaces, stencil ends up in the depth rb's plane
+        if (drb && srb && drb != srb) L_ONCE("fbo: separate depth + stencil renderbuffers, sharing one surface");
+      } else {
+        L_ONCE("fbo: depth rb %ux%u smaller than color %ux%u, depth off", zrb->w, zrb->h, w, h);
+        zrb = NULL;
       }
-    } else if (f->depth_tex) {
-      gl_texture *dt = tex_get(f->depth_tex);
+    } else if (f->depth_tex || f->stencil_tex) {
+      gl_texture *dt = tex_get(f->depth_tex ? f->depth_tex : f->stencil_tex);
       if (!w && dt && dt->valid) { w = dt->w; h = dt->h; }
       if (w) {
         t.depth = scratch_depth_for(w, h);
-        T.has_depth = t.depth != NULL;
+        T.has_depth = t.depth && f->depth_tex;
+        T.has_stencil = t.depth && f->stencil_tex;
       }
     }
     if (!w || !h) {
@@ -329,26 +358,95 @@ int gl_ensure_scene(int full_ds_clear)
   uint32_t sc = gxm_scene_counter();
   if (ctex) ctex->last_use = sc;
   if (crb) crb->last_use = sc;
-  if (drb) drb->last_use = sc;
+  if (zrb) zrb->last_use = sc;
   G.dirty = 1;
   return 0;
 }
 
 // ============================================================ readback
 
+// the game reads back with whatever format/type its texture table says
+// (portrait + career photo capture), so 565/4444/5551 show up next to
+// RGBA/UB. everything goes through rgba8 in between.
+
+static unsigned rp_src_bpp(SceGxmColorFormat cf)
+{
+  switch (cf) {
+  case SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR:
+  case SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB:
+    return 4;
+  case SCE_GXM_COLOR_FORMAT_U5U6U5_RGB:
+  case SCE_GXM_COLOR_FORMAT_U4U4U4U4_RGBA:
+  case SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA:
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+static unsigned rp_dst_bpp(GLenum fmt, GLenum type)
+{
+  switch (type) {
+  case GL_UNSIGNED_BYTE: return fmt == GL_RGBA ? 4 : fmt == GL_RGB ? 3 : 0;
+  case GL_UNSIGNED_SHORT_5_6_5: return fmt == GL_RGB ? 2 : 0;
+  case GL_UNSIGNED_SHORT_4_4_4_4:
+  case GL_UNSIGNED_SHORT_5_5_5_1: return fmt == GL_RGBA ? 2 : 0;
+  default: return 0;
+  }
+}
+
+// gxm packed names list channels msb first, same bit order as GL's packed types
+static void rp_decode(SceGxmColorFormat cf, const uint8_t *s, uint8_t *o)
+{
+  unsigned v = s[0] | (s[1] << 8);
+  switch (cf) {
+  case SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB:
+    o[0] = s[2]; o[1] = s[1]; o[2] = s[0]; o[3] = s[3];
+    break;
+  case SCE_GXM_COLOR_FORMAT_U5U6U5_RGB:
+    o[0] = (v >> 11) * 255 / 31; o[1] = ((v >> 5) & 63) * 255 / 63; o[2] = (v & 31) * 255 / 31; o[3] = 255;
+    break;
+  case SCE_GXM_COLOR_FORMAT_U4U4U4U4_RGBA:
+    o[0] = (v >> 12) * 17; o[1] = ((v >> 8) & 15) * 17; o[2] = ((v >> 4) & 15) * 17; o[3] = (v & 15) * 17;
+    break;
+  case SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA:
+    o[0] = (v >> 11) * 255 / 31; o[1] = ((v >> 6) & 31) * 255 / 31; o[2] = ((v >> 1) & 31) * 255 / 31;
+    o[3] = (v & 1) ? 255 : 0;
+    break;
+  default:
+    o[0] = s[0]; o[1] = s[1]; o[2] = s[2]; o[3] = s[3];
+    break;
+  }
+}
+
+static void rp_encode(GLenum type, unsigned dbpp, const uint8_t *c, uint8_t *d)
+{
+  unsigned v;
+  switch (type) {
+  case GL_UNSIGNED_SHORT_5_6_5: v = ((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3); break;
+  case GL_UNSIGNED_SHORT_4_4_4_4: v = ((c[0] >> 4) << 12) | ((c[1] >> 4) << 8) | ((c[2] >> 4) << 4) | (c[3] >> 4); break;
+  case GL_UNSIGNED_SHORT_5_5_5_1: v = ((c[0] >> 3) << 11) | ((c[1] >> 3) << 6) | ((c[2] >> 3) << 1) | (c[3] >> 7); break;
+  default: memcpy(d, c, dbpp); return;
+  }
+  d[0] = v & 0xFF;
+  d[1] = v >> 8;
+}
+
 void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, void *out)
 {
   L_ONCE("gl: glReadPixels used (stalls the gpu)");
   if (w <= 0 || h <= 0 || !out) return;
-  if (fmt != GL_RGBA || type != GL_UNSIGNED_BYTE) {
-    L_ONCE("gl: glReadPixels fmt 0x%X type 0x%X unsupported (only RGBA/UNSIGNED_BYTE)", fmt, type);
+  unsigned dbpp = rp_dst_bpp(fmt, type);
+  if (!dbpp) {
+    L_ONCE("gl: glReadPixels fmt 0x%X type 0x%X unsupported", fmt, type);
+    GL_ERR(GL_INVALID_OPERATION);
     return;
   }
   gxm_finish();
 
   const uint8_t *base;
-  unsigned sw, sh, sstride, bpp = 4;
-  int flip;
+  unsigned sw, sh, sstride;
+  int flip, force_a = 0;
   SceGxmColorFormat cf = SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR;
   gl_framebuffer *f = G.read_fbo ? fbo_get(G.read_fbo) : NULL;
   if (!f) {
@@ -359,39 +457,38 @@ void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum typ
   } else {
     gl_texture *t = f->color_tex ? tex_get(f->color_tex) : NULL;
     gl_renderbuffer *r = f->color_rb ? rb_get(f->color_rb) : NULL;
-    if (t && t->valid) {
-      base = t->mem->ptr; sw = t->w; sh = t->h; sstride = t->stride; bpp = t->bpp; cf = t->color_fmt;
-    } else if (r && r->mem && !r->is_depth) {
+    if (t && t->valid && t->renderable && t->bpp == rp_src_bpp(t->color_fmt)) {
+      base = t->mem->ptr; sw = t->w; sh = t->h; sstride = t->stride; cf = t->color_fmt;
+      force_a = t->fmt == SCE_GXM_TEXTURE_FORMAT_X8U8U8U8_1BGR;   // GL_RGB texture
+    } else if (r && r->mem && !r->is_depth && rp_src_bpp(r->color_fmt)) {
       base = r->mem->ptr; sw = r->w; sh = r->h; cf = r->color_fmt;
-      bpp = (cf == SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR || cf == SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB) ? 4 : 2;
-      sstride = r->stride_px * bpp;
+      sstride = r->stride_px * rp_src_bpp(cf);
     } else {
-      L_ONCE("gl: glReadPixels on fbo without readable color");
+      L_ONCE("gl: glReadPixels on fbo without readable color (f16 or unrenderable?)");
       return;
     }
     flip = 0;
   }
-  if (bpp != 4) {
-    L_ONCE("gl: glReadPixels from 16-bit surface not supported");
-    return;
-  }
-  int swap_rb = cf == SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB;
-  unsigned dstride = ALIGN_UP((unsigned)w * 4, (unsigned)(G.pack_align > 0 ? G.pack_align : 4));
+  unsigned sbpp = rp_src_bpp(cf);
+  // source rows go through cached ram first, uncached byte reads crawl
+  uint8_t *row = malloc(sw * sbpp);
+  if (!row) return;
+  unsigned dstride = ALIGN_UP((unsigned)w * dbpp, (unsigned)(G.pack_align > 0 ? G.pack_align : 4));
   uint8_t *dst = out;
   for (int yy = 0; yy < h; yy++, dst += dstride) {
     int gy = y + yy;
-    if (gy < 0 || gy >= (int)sh) { memset(dst, 0, w * 4); continue; }
-    int row = flip ? (int)sh - 1 - gy : gy;
-    const uint8_t *s = base + row * sstride;
+    if (gy < 0 || gy >= (int)sh) { memset(dst, 0, w * dbpp); continue; }
+    int srow = flip ? (int)sh - 1 - gy : gy;
+    memcpy(row, base + srow * sstride, sw * sbpp);
     for (int xx = 0; xx < w; xx++) {
       int gx = x + xx;
-      uint8_t *d = dst + xx * 4;
-      if (gx < 0 || gx >= (int)sw) { d[0] = d[1] = d[2] = d[3] = 0; continue; }
-      const uint8_t *p = s + gx * 4;
-      d[0] = swap_rb ? p[2] : p[0];
-      d[1] = p[1];
-      d[2] = swap_rb ? p[0] : p[2];
-      d[3] = p[3];
+      uint8_t *d = dst + xx * dbpp;
+      if (gx < 0 || gx >= (int)sw) { memset(d, 0, dbpp); continue; }
+      uint8_t c[4];
+      rp_decode(cf, row + gx * sbpp, c);
+      if (force_a) c[3] = 255;
+      rp_encode(type, dbpp, c, d);
     }
   }
+  free(row);
 }

@@ -6,6 +6,8 @@
 #include <string.h>
 #include <psp2/shacccg.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -36,15 +38,117 @@ static gl_shader *sh_get(GLuint name) { return nt_get(&g_shaders, name); }
 static int g_shacc = 0;  // 0 untried, 1 ok, -1 missing
 static SceShaccCgSourceFile g_src;
 
-// the compiler's own memory, tracked so we can tell if it's what eats the heap
+// ---- fallback arena for the compiler ----
+// mid-game newlib's heap is full, so the Cg compiler died with "out of
+// memory" and those programs never drew (126 of 245 draws skipped in one
+// log). when malloc says no, the compiler gets its own memblock with a tiny
+// first-fit allocator. it's handed back once the compile queue goes idle.
+typedef struct ablk {
+  uint32_t size;          // payload bytes
+  uint32_t free;
+  struct ablk *next, *prev;
+} ablk;                   // 16 bytes, keeps payloads 16-aligned
+
+static uint8_t *arena;
+static uint32_t arena_size;
+static SceUID arena_uid = -1;
+static ablk *arena_head;
+static int arena_live;    // bytes handed out from the arena
+
+static int in_arena(const void *p) {
+  return arena && (const uint8_t *)p >= arena && (const uint8_t *)p < arena + arena_size;
+}
+
+static int arena_open(void) {
+  if (arena) return 1;
+  static const uint32_t sizes[] = { 8 * 1024 * 1024, 4 * 1024 * 1024 };
+  for (unsigned i = 0; i < 2 && arena_uid < 0; i++) {
+    arena_uid = sceKernelAllocMemBlock("nba_cgheap", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_L1WBWA_RW, sizes[i], NULL);
+    if (arena_uid < 0) arena_uid = sceKernelAllocMemBlock("nba_cgheap", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, sizes[i], NULL);
+    if (arena_uid >= 0) arena_size = sizes[i];
+  }
+  if (arena_uid < 0) {
+    L_ONCE("shader: no fallback arena for the Cg compiler either (0x%08X)", arena_uid);
+    return 0;
+  }
+  void *base = NULL;
+  sceKernelGetMemBlockBase(arena_uid, &base);
+  arena = base;
+  arena_head = (ablk *)arena;
+  arena_head->size = arena_size - sizeof(ablk);
+  arena_head->free = 1;
+  arena_head->next = arena_head->prev = NULL;
+  arena_live = 0;
+  L("shader: Cg compiler fallback arena up (%uK)", arena_size / 1024);
+  return 1;
+}
+
+static void arena_close_if_idle(void) {
+  if (!arena || arena_live) return;
+  sceKernelFreeMemBlock(arena_uid);
+  arena_uid = -1;
+  arena = NULL;
+  arena_head = NULL;
+  L("shader: Cg compiler fallback arena handed back");
+}
+
+static void *arena_alloc(uint32_t n) {
+  n = ALIGN_UP(n ? n : 1, 16);
+  for (ablk *b = arena_head; b; b = b->next) {
+    if (!b->free || b->size < n) continue;
+    if (b->size >= n + sizeof(ablk) + 64) {
+      // split, the tail stays free
+      ablk *t = (ablk *)((uint8_t *)(b + 1) + n);
+      t->size = b->size - n - sizeof(ablk);
+      t->free = 1;
+      t->prev = b;
+      t->next = b->next;
+      if (b->next) b->next->prev = t;
+      b->next = t;
+      b->size = n;
+    }
+    b->free = 0;
+    arena_live += b->size;
+    return b + 1;
+  }
+  return NULL;
+}
+
+static void arena_free(void *p) {
+  ablk *b = (ablk *)p - 1;
+  b->free = 1;
+  arena_live -= b->size;
+  // merge with free neighbours (blocks are in address order)
+  if (b->next && b->next->free) {
+    ablk *n = b->next;
+    b->size += sizeof(ablk) + n->size;
+    b->next = n->next;
+    if (n->next) n->next->prev = b;
+  }
+  if (b->prev && b->prev->free) {
+    ablk *pv = b->prev;
+    pv->size += sizeof(ablk) + b->size;
+    pv->next = b->next;
+    if (b->next) b->next->prev = pv;
+  }
+}
+
+// the compiler's own memory, tracked so we can tell if it's what eats the heap.
+// only one compile runs at a time (the worker, or init before it exists), so
+// the arena needs no lock
 static volatile int shacc_live, shacc_peak;
 static void *shacc_malloc(unsigned int n) {
   void *p = malloc(n);
+  size_t got = p ? malloc_usable_size(p) : 0;
+  if (!p && arena_open()) {
+    p = arena_alloc(n);
+    if (p) got = ((ablk *)p - 1)->size;
+  }
   if (!p) {
     L("shader: Cg compiler malloc(%u) failed, live %uK", n, shacc_live / 1024);
     return NULL;
   }
-  int l = __sync_add_and_fetch(&shacc_live, (int)malloc_usable_size(p));
+  int l = __sync_add_and_fetch(&shacc_live, (int)got);
   if (l > shacc_peak + 4 * 1024 * 1024) {
     shacc_peak = l;
     L("shader: Cg compiler memory peak %uK", l / 1024);
@@ -54,7 +158,13 @@ static void *shacc_malloc(unsigned int n) {
 unsigned shacc_mem_live(void) { return (unsigned)shacc_live; }
 
 static void shacc_free(void *p) {
-  if (p) __sync_sub_and_fetch(&shacc_live, (int)malloc_usable_size(p));
+  if (!p) return;
+  if (in_arena(p)) {
+    __sync_sub_and_fetch(&shacc_live, (int)((ablk *)p - 1)->size);
+    arena_free(p);
+    return;
+  }
+  __sync_sub_and_fetch(&shacc_live, (int)malloc_usable_size(p));
   free(p);
 }
 
@@ -631,6 +741,35 @@ static int type_is_int(g2c_type t)
 }
 
 static int g_link_logs;
+static unsigned uni_words(const prog_uniform *u, int stage);
+
+// sanity check for the upload layout: res is taken as a 32-bit word offset.
+// if that's ever wrong (vec4 units etc), uniforms overlap and we say so.
+// the first few programs also dump res/comps/arr per uniform.
+static void check_uniform_layout(gl_program *p, int stage, uint32_t bufsize)
+{
+  static int overlaps;
+  int dump = g_link_logs < 8;
+  for (int i = 0; i < p->n_uniforms; i++) {
+    prog_uniform *a = &p->uniforms[i];
+    if (a->is_sampler || !a->st[stage].p) continue;
+    unsigned a0 = a->st[stage].res, a1 = a0 + uni_words(a, stage);
+    if (dump)
+      L("shader:   %s uniform %s res %u comps %u arr %u type %d -> words [%u,%u) of %u", stage ? "fs" : "vs",
+        a->name, a->st[stage].res, a->st[stage].comps, a->st[stage].arr, a->st[stage].type, a0, a1, bufsize / 4);
+    if (a->st[stage].type != SCE_GXM_PARAMETER_TYPE_F32) continue;
+    for (int k = i + 1; k < p->n_uniforms && overlaps < 16; k++) {
+      prog_uniform *b = &p->uniforms[k];
+      if (b->is_sampler || !b->st[stage].p || b->st[stage].type != SCE_GXM_PARAMETER_TYPE_F32) continue;
+      unsigned b0 = b->st[stage].res, b1 = b0 + uni_words(b, stage);
+      if (a0 < b1 && b0 < a1) {
+        overlaps++;
+        L("shader: !! prog %u %s: uniform %s words [%u,%u) overlaps %s [%u,%u), upload layout is wrong",
+          p->name, stage ? "fs" : "vs", a->name, a0, a1, b->name, b0, b1);
+      }
+    }
+  }
+}
 
 static void setup_uniform_stage(gl_program *p, prog_uniform *u, int stage)
 {
@@ -784,6 +923,8 @@ static int link_back(gl_program *p, char **log)
   }
   collect_samplers(p, 0);
   collect_samplers(p, 1);
+  check_uniform_layout(p, 0, p->vbuf_size);
+  check_uniform_layout(p, 1, p->fbuf_size);
 
   if (g_link_logs < 40) {
     g_link_logs++;
@@ -803,6 +944,8 @@ typedef struct compile_job {
   SceGxmProgram *vgxp, *fgxp;     // whichever came from the cache are already set
   char *log;
   int done, orphan;               // guarded by q_lock
+  int attempts;                   // compiles tried so far
+  SceUInt64 not_before;           // retry backoff (process time, us)
   struct compile_job *next;
 } compile_job;
 
@@ -833,6 +976,9 @@ static int compile_worker(SceSize args, void *argp)
     sceKernelUnlockLwMutex(&q_lock, 1);
     if (!j) continue;
 
+    SceUInt64 now = sceKernelGetProcessTimeWide();
+    if (j->not_before > now) sceKernelDelayThread((SceUInt32)(j->not_before - now));
+    j->attempts++;
     if (!j->vgxp) j->vgxp = shacc_compile(j->vcg, 0, &j->log);
     if (j->vgxp && !j->fgxp) j->fgxp = shacc_compile(j->fcg, 1, &j->log);
 
@@ -840,7 +986,7 @@ static int compile_worker(SceSize args, void *argp)
     int orphan = j->orphan;
     j->done = 1;
     sceKernelUnlockLwMutex(&q_lock, 1);
-    __sync_sub_and_fetch(&q_pending, 1);
+    if (!__sync_sub_and_fetch(&q_pending, 1)) arena_close_if_idle();
     if (orphan) job_free(j);  // program got relinked/deleted meanwhile
   }
   return 0;
@@ -911,6 +1057,22 @@ int prog_try_finish(gl_program *p)
   p->fgxp = j->fgxp; j->fgxp = NULL;
   char *log = j->log; j->log = NULL;
   int ok = p->vgxp && p->fgxp && link_back(p, &log);
+  // out of memory (and the compiler's "fatal internal error", which is
+  // usually the same thing) isn't the shader's fault: try again later
+  if (!ok && log && j->attempts < 3 &&
+      (strstr(log, "out of memory") || strstr(log, "fatal internal error"))) {
+    L("shader: program %u failed to compile (try %d), retrying in %ds", p->name, j->attempts, j->attempts * 2);
+    if (p->vgxp && p->vid == NULL) { j->vgxp = p->vgxp; p->vgxp = NULL; }
+    if (p->fgxp && p->fid == NULL) { j->fgxp = p->fgxp; p->fgxp = NULL; }
+    free(log);
+    j->done = 0;
+    j->next = NULL;
+    j->not_before = sceKernelGetProcessTimeWide() + (SceUInt64)j->attempts * 2000000;
+    p->job = j;
+    p->pending = 1;
+    queue_job(j);
+    return 0;
+  }
   if (!ok) {
     dump_fail(p, j->vsrc, j->fsrc, j->vcg, j->fcg, log ? log : "?");
     L("!!!! shader: LINK FAILED for program %u (background compile):\n%s", p->name, log ? log : "?");
@@ -1144,19 +1306,25 @@ void glUniformMatrix4fv(GLint loc, GLsizei n, GLboolean tr, const GLfloat *v) { 
 
 // ============================================================ upload per draw
 
+// 32-bit words write_uniform puts at res. the cg compiler may shrink a partly
+// used array, so never go past what the gxp says it has
+static unsigned uni_words(const prog_uniform *u, int stage)
+{
+  int stride = u->st[stage].stride;
+  int slots = u->slots;
+  int arr = u->st[stage].arr ? (int)u->st[stage].arr : 1;
+  if (stride == 4 && slots > arr) slots = arr;
+  return (unsigned)((slots - 1) * stride + (stride == 4 ? 4 : u->comps));
+}
+
 static void write_uniform(void *buf, uint32_t bufsize, prog_uniform *u, int stage, GLuint prog)
 {
   int stride = u->st[stage].stride;
   unsigned res = u->st[stage].res;
-  // the cg compiler may shrink a partly used array, never write past what
-  // the gxp says it has or we stomp the next uniform
-  int slots = u->slots;
   int arr = u->st[stage].arr ? (int)u->st[stage].arr : 1;
-  if (stride == 4 && slots > arr) {
-    L_ONCE("shader: %s (prog %u) has %d slots in GLSL but %d in the gxp, clamping", u->name, prog, slots, arr);
-    slots = arr;
-  }
-  unsigned nfl = (unsigned)((slots - 1) * stride + (stride == 4 ? 4 : u->comps));
+  if (stride == 4 && u->slots > arr)
+    L_ONCE("shader: %s (prog %u) has %d slots in GLSL but %d in the gxp, clamping", u->name, prog, u->slots, arr);
+  unsigned nfl = uni_words(u, stage);
   if ((res + nfl) * 4 > bufsize) {
     L_ONCE("shader: uniform %s (prog %u) wants %u floats at %u, buffer is %u bytes, clamping",
            u->name, prog, nfl, res, bufsize);

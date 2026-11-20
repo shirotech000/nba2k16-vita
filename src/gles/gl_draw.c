@@ -442,7 +442,7 @@ void glClear(GLbitfield mask)
   SceGxmContext *c = gxm_ctx;
   uint8_t cmask = (mask & GL_COLOR_BUFFER_BIT) && T.has_color ? gl_gxm_color_mask() : 0;
   int do_depth = (mask & GL_DEPTH_BUFFER_BIT) && G.depth_mask && T.has_depth;
-  int do_sten = (mask & GL_STENCIL_BUFFER_BIT) && T.has_depth && (G.stencil[0].wmask & 0xFF);
+  int do_sten = (mask & GL_STENCIL_BUFFER_BIT) && T.has_stencil && (G.stencil[0].wmask & 0xFF);
   if (!cmask && !do_depth && !do_sten) return;
 
   SceGxmFragmentProgram *fp = clear_get_fp(cmask, T.out_fmt);
