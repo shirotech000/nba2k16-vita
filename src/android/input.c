@@ -70,7 +70,13 @@ int input_pending(void *queue) {
   return vq->head != vq->tail;
 }
 
+// per-window counters for the 5s monitor: are events reaching the game
+static unsigned g_ev_key, g_ev_stick, g_ev_touch, g_ev_read;
+
 static void push(const vevent *e) {
+  if (e->source == SRC_TOUCHSCREEN) g_ev_touch++;
+  else if (e->type == AINPUT_EVENT_TYPE_KEY) g_ev_key++;
+  else g_ev_stick++;
   sceKernelLockLwMutex(&q.lock, 1, NULL);
   int next = (q.head + 1) % QSIZE;
   if (next != q.tail) {
@@ -103,10 +109,19 @@ static int b_AInputQueue_getEvent(vqueue *vq, vevent **out) {
     *out = &held[held_i];
     held_i = (held_i + 1) % QSIZE;
     vq->tail = (vq->tail + 1) % QSIZE;
+    g_ev_read++;
     r = 0;
   }
   sceKernelUnlockLwMutex(&vq->lock, 1);
   return r;
+}
+
+// the 5s monitor reads and resets these. "queued but not read" is the
+// signal that the game's input side stopped draining our queue
+void input_stats(unsigned *key, unsigned *stick, unsigned *touch, unsigned *read)
+{
+  *key = g_ev_key; *stick = g_ev_stick; *touch = g_ev_touch; *read = g_ev_read;
+  g_ev_key = g_ev_stick = g_ev_touch = g_ev_read = 0;
 }
 
 static int b_AInputQueue_preDispatchEvent(void *q_, void *e) { (void)q_; (void)e; return 0; }

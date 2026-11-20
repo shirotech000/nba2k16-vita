@@ -85,14 +85,38 @@ static void pump(void)
   if (ime_state == 0 && qh == qt) { jni_mode = 0; jni_text[0] = 0; ime_open(); }
 }
 
-// always "connected": the game asks once at init too, and a "no" there
-// seems to switch keyboard text entry off for good (career save-name box
-// never asked for chars). the ime still only opens while a field has focus
+static uint32_t g_kb_base;   // game .so base, for telling call sites apart
+
+// answer per call site (vckeyboard analysis, call = lr - 4):
+//   +0x988ed0 TextEdit_IsCapsAllowed, +0x98955c / +0x989638 TextEdit_IsShift:
+//   the save box's text path -> yes
+//   +0x6f6874 Demo_InitMenu (only gates a buffer flush) and +0x6f6d70
+//   Demo_UpdateModule -> no. a yes there makes the front end route input
+//   through the keyboard and skip the controller loop: menus stopped taking
+//   buttons entirely (hw26). kb_conn=1 brings the blanket yes back
 static int my_is_connected(void)
 {
-  static int logged;
-  if (!logged++) L("textinput: game asked if a keyboard is connected (yes)");
-  return 1;
+  static int always = -1;
+  if (always < 0) {
+    extern int config_int(const char *key, int def);
+    always = config_int("kb_conn", 0) != 0;
+  }
+  uint32_t off = 0;
+  if (g_kb_base) {
+    uintptr_t lr = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
+    off = (uint32_t)(lr - g_kb_base) - 4;
+  }
+  int ans = always || off == 0x988ed0 || off == 0x98955c || off == 0x989638;
+  static uint32_t seen[8];
+  for (int i = 0; i < 8; i++) {
+    if (!seen[i]) {
+      seen[i] = off;
+      L("textinput: keyboard ask at +0x%X -> %s", off, ans ? "yes" : "no");
+      break;
+    }
+    if (seen[i] == off) break;
+  }
+  return ans;
 }
 
 static int my_get_next(uint32_t *ch, int *code, uint8_t *mod, int peek)
@@ -143,6 +167,7 @@ static int hook(so_module *m, uint32_t off, uint32_t w0, uint32_t w1, void *fn, 
 // called from patches_apply while the game's text is still writable
 void textinput_install(so_module *game)
 {
+  g_kb_base = (uint32_t)(uintptr_t)game->base;
   g_textedit_active = (int (*)(void))(game->base + 0x98a098);
   int ok = 0;
   ok += !hook(game, 0x12cebbc, 0xE92D4008, 0xEBFFFE7C, (void *)my_is_connected, "VCKeyboard_IsConnected");
