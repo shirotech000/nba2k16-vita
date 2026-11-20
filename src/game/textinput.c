@@ -29,6 +29,8 @@ static int ime_state;                    // 0 idle, 1 dialog up, 2 done for this
 static SceWChar16 ime_buf[SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1];
 static SceWChar16 ime_title[16];
 static SceWChar16 ime_empty[1];
+static int jni_mode;          // the game is reading this ime session through jni
+static char jni_text[4 * SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1];
 
 static void q_push(uint32_t c)
 {
@@ -81,11 +83,22 @@ static void ime_poll(void)
   memset(&res, 0, sizeof(res));
   sceImeDialogGetResult(&res);
   if (res.button == SCE_IME_DIALOG_BUTTON_ENTER) {
-    for (int i = 0; i < 40; i++) q_push(KEY_BACKSPACE);   // clear what the field had
-    int n = 0;
-    for (; ime_buf[n] && n < SCE_IME_DIALOG_MAX_TEXT_LENGTH; n++) q_push(ime_buf[n]);
-    q_push(KEY_ENTER);
-    L("textinput: ime returned %d chars", n);
+    // utf-16 -> utf-8 for getInputText
+    int o = 0, n = 0;
+    for (; ime_buf[n] && n < SCE_IME_DIALOG_MAX_TEXT_LENGTH; n++) {
+      unsigned c = ime_buf[n];
+      if (c < 0x80) jni_text[o++] = (char)c;
+      else if (c < 0x800) { jni_text[o++] = (char)(0xC0 | c >> 6); jni_text[o++] = (char)(0x80 | (c & 63)); }
+      else { jni_text[o++] = (char)(0xE0 | c >> 12); jni_text[o++] = (char)(0x80 | (c >> 6 & 63)); jni_text[o++] = (char)(0x80 | (c & 63)); }
+    }
+    jni_text[o] = 0;
+    if (!jni_mode) {
+      // native text field: feed it as key presses
+      for (int i = 0; i < 40; i++) q_push(KEY_BACKSPACE);   // clear what the field had
+      for (int i = 0; i < n; i++) q_push(ime_buf[i]);
+      q_push(KEY_ENTER);
+    }
+    L("textinput: ime returned %d chars (%s)", n, jni_mode ? "jni" : "keys");
   } else {
     L("textinput: ime cancelled");
   }
@@ -107,7 +120,7 @@ static void pump(void)
     last_active = active;
   }
   if (!active) { if (ime_state == 2 && qh == qt) ime_state = 0; return; }
-  if (ime_state == 0 && qh == qt) ime_open();
+  if (ime_state == 0 && qh == qt) { jni_mode = 0; jni_text[0] = 0; ime_open(); }
 }
 
 // always "connected": the game asks once at init too, and a "no" there
@@ -130,6 +143,26 @@ static int my_get_next(uint32_t *ch, int *code, uint8_t *mod, int peek)
   if (mod) *mod = 0;
   if (!peek) qh = (qh + 1) % QN;
   return 1;
+}
+
+// ---- jni side: gameactivity.showInput / isInputShown / getInputText ----
+void textinput_jni_show(void)
+{
+  jni_mode = 1;
+  jni_text[0] = 0;
+  if (ime_state != 1) ime_open();
+}
+
+int textinput_jni_shown(void)
+{
+  jni_mode = 1;
+  if (ime_state == 1) ime_poll();
+  return ime_state == 1;
+}
+
+const char *textinput_jni_text(void)
+{
+  return jni_text;
 }
 
 // entry-to-entry replacement: ldr pc, [pc, #-4] ; .word target

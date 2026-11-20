@@ -1140,7 +1140,9 @@ static void common_dialog_update(void)
   up.renderTarget.colorSurfaceData = g_disp_mb[g_back].base;
   up.renderTarget.depthSurfaceData = g_depth_mem ? g_depth_mem->ptr : NULL;
   up.displaySyncObject = g_disp_sync[g_back];
-  sceCommonDialogUpdate(&up);
+  int r = sceCommonDialogUpdate(&up);
+  static int n;
+  if (r < 0 || n < 3) { if (n++ < 12) L("gxm: sceCommonDialogUpdate -> 0x%08X", r); }
 }
 
 void gxm_swap(void)

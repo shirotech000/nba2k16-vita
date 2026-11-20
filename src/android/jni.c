@@ -125,6 +125,14 @@ static jvalue h_secure_string(jobj *self, const jvalue *a, jmeth *m) {
   return (jvalue){ .l = new_string("2b16f17a00c0ffee") };
 }
 static jvalue h_true(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .z = 1 }; }
+
+// text entry (career save name): the vita ime, see game/textinput.c
+void textinput_jni_show(void);
+int textinput_jni_shown(void);
+const char *textinput_jni_text(void);
+static jvalue h_show_input(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; textinput_jni_show(); return (jvalue){ .l = NULL }; }
+static jvalue h_input_shown(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .z = textinput_jni_shown() ? 1 : 0 }; }
+static jvalue h_input_text(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_string(textinput_jni_text()) }; }
 static jobj *find_class(const char *name);
 static jvalue h_class_loader(jobj *self, const jvalue *a, jmeth *m) {
   (void)self; (void)a; (void)m;
@@ -153,6 +161,9 @@ static jvalue h_load_class(jobj *self, const jvalue *a, jmeth *m) {
 
 static const struct { const char *name; const char *sig; jhandler fn; } handlers[] = {
   { "getPackageName", NULL, h_package },
+  { "showInput", NULL, h_show_input },
+  { "isInputShown", NULL, h_input_shown },
+  { "getInputText", NULL, h_input_text },
   { "getFilesDir", NULL, h_files_dir },
   { "getCacheDir", NULL, h_cache_dir },
   { "getExternalCacheDir", NULL, h_cache_dir },
