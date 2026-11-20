@@ -58,6 +58,12 @@ typedef SLuint8  SLchar;
 #define SL_PLAYSTATE_PAUSED  2
 #define SL_PLAYSTATE_PLAYING 3
 
+#define SL_PLAYEVENT_HEADATEND    ((SLuint32)0x01)
+#define SL_PLAYEVENT_HEADATMARKER ((SLuint32)0x02)
+#define SL_PLAYEVENT_HEADATNEWPOS ((SLuint32)0x04)
+#define SL_PLAYEVENT_HEADMOVING   ((SLuint32)0x08)
+#define SL_PLAYEVENT_HEADSTALLED  ((SLuint32)0x10)
+
 #define SL_TIME_UNKNOWN ((SLuint32)0xFFFFFFFF)
 
 #define SL_MILLIBEL_MAX ((SLmillibel)0x7FFF)
@@ -76,6 +82,9 @@ typedef SLuint8  SLchar;
 
 #define SL_DATAFORMAT_MIME 1
 #define SL_DATAFORMAT_PCM  2
+
+#define SL_CONTAINERTYPE_UNSPECIFIED 0x01
+#define SL_CONTAINERTYPE_RAW         0x02
 
 #define SL_BYTEORDER_BIGENDIAN    1
 #define SL_BYTEORDER_LITTLEENDIAN 2
@@ -247,6 +256,54 @@ struct SLBufferQueueItf_ {
   SLresult (*GetState)(SLBufferQueueItf self, SLBufferQueueState *pState);
   SLresult (*RegisterCallback)(SLBufferQueueItf self, slBufferQueueCallback callback,
                                void *pContext);
+};
+
+// SLAndroidBufferQueueItf: the source side of a decoder player. NOT the
+// simple BQ: own vtable, buffers carry a context + optional items (EOS etc)
+struct SLAndroidBufferQueueItf_;
+typedef const struct SLAndroidBufferQueueItf_ *const *SLAndroidBufferQueueItf;
+
+#define SL_ANDROID_ITEMKEY_NONE             ((SLuint32)0x00)
+#define SL_ANDROID_ITEMKEY_EOS              ((SLuint32)0x01)
+#define SL_ANDROID_ITEMKEY_DISCONTINUITY    ((SLuint32)0x02)
+#define SL_ANDROID_ITEMKEY_BUFFERQUEUEEVENT ((SLuint32)0x03)
+#define SL_ANDROID_ITEMKEY_FORMAT_CHANGE    ((SLuint32)0x04)
+
+#define SL_ANDROIDBUFFERQUEUEEVENT_NONE        ((SLuint32)0x00)
+#define SL_ANDROIDBUFFERQUEUEEVENT_PROCESSED   ((SLuint32)0x01)
+#define SL_ANDROIDBUFFERQUEUEEVENT_UNREALIZED  ((SLuint32)0x02)
+#define SL_ANDROIDBUFFERQUEUEEVENT_CLEARED     ((SLuint32)0x04)
+#define SL_ANDROIDBUFFERQUEUEEVENT_STOPPED     ((SLuint32)0x08)
+#define SL_ANDROIDBUFFERQUEUEEVENT_ERROR       ((SLuint32)0x10)
+#define SL_ANDROIDBUFFERQUEUEEVENT_CONTENT_END ((SLuint32)0x20)
+
+// items are packed back to back: {key, size, size bytes of data}
+typedef struct {
+  SLuint32 itemKey;
+  SLuint32 itemSize;
+  SLuint8 itemData[];
+} SLAndroidBufferItem;
+
+typedef struct {
+  SLuint32 count;
+  SLuint32 index;
+} SLAndroidBufferQueueState;
+
+typedef SLresult (*slAndroidBufferQueueCallback)(SLAndroidBufferQueueItf caller, void *pCallbackContext,
+                                                 void *pBufferContext, void *pBufferData,
+                                                 SLuint32 dataSize, SLuint32 dataUsed,
+                                                 const SLAndroidBufferItem *pItems,
+                                                 SLuint32 itemsLength);
+
+struct SLAndroidBufferQueueItf_ {
+  SLresult (*RegisterCallback)(SLAndroidBufferQueueItf self, slAndroidBufferQueueCallback callback,
+                               void *pCallbackContext);
+  SLresult (*Clear)(SLAndroidBufferQueueItf self);
+  SLresult (*Enqueue)(SLAndroidBufferQueueItf self, void *pBufferContext, void *pData,
+                      SLuint32 dataLength, const SLAndroidBufferItem *pItems, SLuint32 itemsLength);
+  SLresult (*GetState)(SLAndroidBufferQueueItf self, SLAndroidBufferQueueState *pState);
+  SLresult (*SetCallbackEventsMask)(SLAndroidBufferQueueItf self, SLuint32 eventFlags);
+  SLresult (*GetCallbackEventsMask)(SLAndroidBufferQueueItf self, SLuint32 *pEventFlags);
 };
 
 // SLVolumeItf

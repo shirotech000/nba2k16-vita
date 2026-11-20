@@ -7,24 +7,31 @@
 //    mono/stereo, any rate) with BUFFERQUEUE + VOLUME, first time also
 //    3DLOCATION/3DSOURCE (not required, game flips a flag on result 12)
 //  - AAC streams: a decoder player (ANDROIDBUFFERQUEUE src with
-//    "audio/vnd.android.aac-adts", simple BQ sink). no decoder here yet, we
-//    refuse it and the game marks that voice failed.
+//    "audio/vnd.android.aac-adts", simple BQ sink) per streaming voice. it
+//    feeds ADTS frames in and copies the PCM we hand back into one of its own
+//    PCM players. we decode with sceAudiodec, see the decoder section.
 //
 // one mixer thread owns a sceAudioOut port, pulls from every playing player
 // and runs the game's buffer queue callbacks itself (our lock not held).
+// decoder players get a thread each, the mixer never sees them.
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <malloc.h>
 #include <math.h>
 #include <pthread.h>
 #include <psp2/audioout.h>
+#include <psp2/audiodec.h>
+#include <psp2/sysmodule.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
 
 #include "loader/exports.h"
 #include "util/log.h"
 #include "android/opensles_types.h"
+#include "android/aac_adts.h"
 
 #define OUT_RATE    48000
 #define GRAIN       1024                         // samples per output call, ~21ms
@@ -35,6 +42,18 @@
 #define MIXER_STACK (512 * 1024)                 // game decode code runs in our callbacks
 #define MIXER_PRIO  64                           // top of the user range
 #define ONE         0x10000u                     // resampler 16.16
+
+// decoder players
+#define AAC_MIME      "audio/vnd.android.aac-adts"
+#define DEC_MAX_ABQ   16                         // android buffer queue depth cap
+#define DEC_ITEMS_MAX 64                         // bytes of buffer items we keep per buffer
+#define DEC_ES_SIZE   SCE_AUDIODEC_ROUND_UP(ADTS_MAX_FRAME + 256) // + slack, decoders read past the end
+#define DEC_PCM_SIZE  SCE_AUDIODEC_ROUND_UP(SCE_AUDIODEC_AAC_MAX_SAMPLES * 2 * 2)
+#define DEC_STACK     (256 * 1024)               // game callbacks run on it, shims want room
+#define DEC_PRIO      (MIXER_PRIO + 1)
+#define DEC_IDLE_US   20000
+#define AAC_FRAME     1024                       // samples per AAC-LC frame
+#define DEC_READAHEAD 4                          // sink buffers of source eaten ahead, see dec_step
 
 // vtable slots the game binary was seen calling, by byte offset
 _Static_assert(offsetof(struct SLObjectItf_, Realize) == 0, "obj slot");
@@ -57,6 +76,10 @@ _Static_assert(offsetof(struct SLVolumeItf_, SetVolumeLevel) == 0, "vol slot");
 _Static_assert(offsetof(struct SLVolumeItf_, GetMaxVolumeLevel) == 8, "vol slot");
 _Static_assert(offsetof(struct SLVolumeItf_, SetMute) == 12, "vol slot");
 _Static_assert(sizeof(struct SLVolumeItf_) == 36, "vol vtable size");
+_Static_assert(offsetof(struct SLAndroidBufferQueueItf_, RegisterCallback) == 0, "abq slot");
+_Static_assert(offsetof(struct SLAndroidBufferQueueItf_, Enqueue) == 8, "abq slot");
+_Static_assert(sizeof(struct SLAndroidBufferQueueItf_) == 24, "abq vtable size");
+_Static_assert(sizeof(SLAndroidBufferItem) == 8, "abq item header");
 _Static_assert(sizeof(struct SLInterfaceID_) == 16, "iid size");
 _Static_assert(sizeof(SLDataFormat_PCM) == 28, "pcm format size");
 
@@ -162,11 +185,17 @@ typedef struct {
   uint32_t size;
 } sl_buf;
 
+struct sl_dec;
+
+// a PCM player, or (dec != NULL) a decoder player: then q[] is the sink,
+// the game's empty buffers we fill with decoded PCM
 typedef struct {
   sl_object obj;
   const struct SLPlayItf_ *play;
   const struct SLBufferQueueItf_ *bq;
   const struct SLVolumeItf_ *vol;
+  const struct SLAndroidBufferQueueItf_ *abq; // decoder players only
+  struct sl_dec *dec;
   int slot;
 
   // source format, fixed at create
@@ -215,6 +244,13 @@ static const struct SLEngineItf_ engine_vtbl;
 static const struct SLPlayItf_ play_vtbl;
 static const struct SLBufferQueueItf_ bq_vtbl;
 static const struct SLVolumeItf_ vol_vtbl;
+static const struct SLAndroidBufferQueueItf_ abq_vtbl;
+
+// decoder bits the shared play/bq code calls into
+static void dec_flush_l(sl_player *p);
+static int dec_stale_l(sl_player *p);
+static void dec_wake(sl_player *p);
+static void dec_destroy(sl_player *p);
 
 // ---------------------------------------------------------------------------
 // globals + lock
@@ -520,7 +556,8 @@ static SLresult obj_GetInterface(SLObjectItf self, const SLInterfaceID iid, void
     sl_player *p = (sl_player *)o;
     who = WHO_PLAYER_GET;
     if (ix == IX_PLAY) itf = &p->play;
-    else if (ix == IX_BUFFERQUEUE) itf = &p->bq;
+    else if (ix == IX_BUFFERQUEUE) itf = &p->bq; // the sink, on a decoder player
+    else if (ix == IX_ABQSOURCE && p->dec) itf = &p->abq;
     else if (ix == IX_VOLUME) itf = &p->vol;
     break; // 3D* -> 12, the game checks for exactly that
   }
@@ -608,15 +645,21 @@ static SLresult play_SetPlayState(SLPlayItf self, SLuint32 state) {
   lock();
   if (state != p->play_state) {
     // android keeps the queue on stop (docs say Clear() after STOPPED),
-    // we just reset position + resampler
+    // we just reset position + resampler. decoder players do get flushed:
+    // the game stops them without a Clear and re-enqueues from scratch
     if (state == SL_PLAYSTATE_STOPPED) {
       p->frames = 0;
       reset_resampler(p);
+      if (p->dec) dec_flush_l(p);
     }
     p->play_state = state;
   }
   unlock();
-  if (state == SL_PLAYSTATE_PLAYING) check_mixer();
+  if (p->dec) {
+    if (state == SL_PLAYSTATE_PLAYING) dec_wake(p);
+  } else if (state == SL_PLAYSTATE_PLAYING) {
+    check_mixer();
+  }
   return SL_RESULT_SUCCESS;
 }
 
@@ -647,7 +690,8 @@ static SLresult play_GetPosition(SLPlayItf self, SLmillisecond *pMsec) {
 }
 
 // play events (marker/pos update/head at end) are stored, never fired.
-// android doesn't send HEADATEND for buffer queues either.
+// android doesn't send HEADATEND for buffer queues either. exception:
+// decoder players fire HEADATEND once an EOS item's been played out.
 static SLresult play_RegisterCallback(SLPlayItf self, slPlayCallback callback, void *pContext) {
   sl_player *p = PLAYER_OF_PLAY(self);
   lock();
@@ -716,7 +760,8 @@ static const struct SLPlayItf_ play_vtbl = {
 };
 
 // ---------------------------------------------------------------------------
-// SLBufferQueueItf / SLAndroidSimpleBufferQueueItf (same thing)
+// SLBufferQueueItf / SLAndroidSimpleBufferQueueItf (same thing). on a decoder
+// player this is the sink: the game queues empty buffers, we fill them.
 
 #define PLAYER_OF_BQ(self) OWNER(sl_player, bq, self)
 
@@ -725,7 +770,9 @@ static SLresult bq_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 
   sl_player *p = PLAYER_OF_BQ(self);
   SLresult r = SL_RESULT_SUCCESS;
   lock();
-  if (p->q_count >= p->q_cap) {
+  if (p->dec && dec_stale_l(p)) {
+    // a callback from before a stop refilling the old stream, drop it
+  } else if (p->q_count >= p->q_cap) {
     r = SL_RESULT_BUFFER_INSUFFICIENT;
   } else {
     // just the pointer, the game owns the memory until its callback
@@ -735,6 +782,7 @@ static SLresult bq_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 
     p->q_count++;
   }
   unlock();
+  if (p->dec) dec_wake(p);
   return r;
 }
 
@@ -863,6 +911,10 @@ static const struct SLVolumeItf_ vol_vtbl = {
 // player lifetime
 
 static void player_destroy(sl_player *p) {
+  if (p->dec) {
+    dec_destroy(p);
+    return;
+  }
   lock();
   if (p->slot >= 0 && p->slot < MAX_PLAYERS && g_players[p->slot] == p) g_players[p->slot] = NULL;
   p->dead = 1;
@@ -906,6 +958,786 @@ static int fmt_is_new(const SLDataFormat_PCM *f, uint32_t nbuf) {
 }
 
 // ---------------------------------------------------------------------------
+// decoder players: ADTS AAC in through an android buffer queue, s16 PCM out
+// into the game's simple-BQ buffers. how the game drives it (VCAudio, .so):
+//  - once per streaming voice: CreateAudioPlayer, Realize, PLAY (mask
+//    HEADATEND + callback), ABQSOURCE, BUFFERQUEUE, both RegisterCallbacks
+//  - per stream: 2 sink buffers of 4096 bytes, 2 ADTS frames (one whole frame
+//    per Enqueue, no items), PLAYING
+//  - its ABQ callback adds up dataSize and enqueues the next frame. frames
+//    split across its disk chunks get glued in a staging buffer it reuses, so
+//    we copy data the moment we take it. out of data: it enqueues {EOS} with
+//    no data and waits for HEADATEND
+//  - its sink callback turns a 4-slot ring that its own PCM player drains,
+//    and sleep-polls (5ms, up to 10s) while the ring's full. so every decoder
+//    gets its own thread, the mixer must never sit in these callbacks
+//  - stop is SetPlayState(STOPPED) with no Clear, then everything gets
+//    enqueued again for the next stream, so STOPPED flushes both queues
+// we eat ABQ data 4 sink buffers ahead (see dec_step), decode one frame at a
+// time (outside the lock), copy the PCM out. a sink buffer only goes back
+// once it's full, like android. EOS: pad the half-full buffer, return it,
+// then HEADATEND. config: no_aac=1 refuses decoder players like before,
+// aac_raw=1 feeds sceAudiodec bare AUs (isAdts=0) instead of whole frames,
+// aac_readahead=N changes the 4.
+
+typedef struct {
+  void *ctx;
+  const uint8_t *data;
+  uint32_t size;
+  uint32_t items_len;
+  uint32_t items[DEC_ITEMS_MAX / 4]; // our copy, the game hands us stack memory
+} abq_buf;
+
+typedef struct sl_dec {
+  // decoder thread only
+  SceAudiodecCtrl ctrl;
+  SceAudiodecInfo info;
+  int have_dec;
+  uint32_t dec_rate, dec_ch;
+  uint8_t *es;  // one frame (or AU) for the decoder, zero padded
+  uint8_t *pcm; // decoded, waiting for sink room
+  int raw;      // aac_raw=1 in config: strip ADTS headers, isAdts=0
+
+  SceUID sema;
+  volatile int thid;
+  volatile int exited;
+
+  // everything below is guarded by g_lock
+  slAndroidBufferQueueCallback cb;
+  void *cb_ctx;
+  SLuint32 mask;
+  uint32_t aq_cap, aq_head, aq_count, aq_pos, aq_index;
+  abq_buf aq[DEC_MAX_ABQ];
+  abq_buf done[DEC_MAX_ABQ]; // eaten, callback still owed
+  uint32_t done_count;
+  uint32_t pcm_len, pcm_pos;
+  uint32_t out_ch;
+  uint32_t sink_size; // last sink buffer size seen, for read-ahead
+  uint32_t readahead; // in sink buffers
+  int eos;       // EOS item eaten: drain, flush, HEADATEND
+  int clear_ctx; // decoder history should go (stop, discontinuity, EOS)
+  uint32_t gen;  // bumped on flush, a decode in flight for an old gen gets tossed
+  int stale;     // stopped from another thread while our callbacks ran: drop their enqueues
+  int cancel;    // stopped while our callbacks ran (any thread): skip the rest of the batch
+  uint32_t last_rate, last_ch, last_aot, last_junk;
+  adts_splitter split;
+} sl_dec;
+
+// what one pass of the pump wants done outside the lock
+typedef struct {
+  int decode;
+  uint32_t gen;
+  int clear_ctx;
+  adts_header h;
+  uint32_t es_len;
+
+  uint32_t n_abq;
+  abq_buf abq[DEC_MAX_ABQ];
+  slAndroidBufferQueueCallback abq_cb;
+  void *abq_ctx;
+
+  uint32_t n_sink;
+  slBufferQueueCallback sink_cb;
+  void *sink_ctx;
+
+  int headatend;
+  slPlayCallback play_cb;
+  void *play_ctx;
+
+  // logging, done after unlocking
+  uint32_t junk;
+  int fmt_new;
+  uint32_t bad_key;
+} dec_job;
+
+#define PLAYER_OF_ABQ(self) OWNER(sl_player, abq, self)
+
+#define IT_EOS  1
+#define IT_DISC 2
+
+static pthread_once_t g_aac_once = PTHREAD_ONCE_INIT;
+static int g_aac_ok;
+
+static void aac_lib_init(void) {
+  int r = sceSysmoduleIsLoaded(SCE_SYSMODULE_AUDIOCODEC);
+  if (r != SCE_SYSMODULE_LOADED) {
+    r = sceSysmoduleLoadModule(SCE_SYSMODULE_AUDIOCODEC);
+    if (r < 0) {
+      L("opensles: AAC: loading the audiocodec sysmodule failed 0x%08X, decoder players get refused", r);
+      return;
+    }
+  }
+  SceAudiodecInitParam ip;
+  memset(&ip, 0, sizeof(ip));
+  ip.aac.size = sizeof(ip.aac);
+  ip.aac.totalStreams = SCE_AUDIODEC_AAC_MAX_STREAMS;
+  r = sceAudiodecInitLibrary(SCE_AUDIODEC_TYPE_AAC, &ip);
+  if (r < 0 && r != (int)SCE_AUDIODEC_ERROR_ALREADY_INITIALIZED) {
+    L("opensles: AAC: sceAudiodecInitLibrary failed 0x%08X, decoder players get refused", r);
+    return;
+  }
+  g_aac_ok = 1;
+  L("opensles: AAC: sceAudiodec up (%d streams)", SCE_AUDIODEC_AAC_MAX_STREAMS);
+}
+
+// formats seen so far, one log line each
+static struct {
+  uint32_t rate, ch, aot;
+} g_aac_seen[16];
+static int g_aac_n;
+
+static int aac_fmt_is_new(const adts_header *h) {
+  for (int i = 0; i < g_aac_n; i++)
+    if (g_aac_seen[i].rate == h->rate && g_aac_seen[i].ch == h->channels && g_aac_seen[i].aot == h->object_type)
+      return 0;
+  if (g_aac_n >= (int)(sizeof(g_aac_seen) / sizeof(g_aac_seen[0]))) return 0;
+  g_aac_seen[g_aac_n].rate = h->rate;
+  g_aac_seen[g_aac_n].ch = h->channels;
+  g_aac_seen[g_aac_n].aot = h->object_type;
+  g_aac_n++;
+  return 1;
+}
+
+// first n of a kind, then every 500th
+static int log_some(volatile unsigned *ctr) {
+  unsigned n = __sync_add_and_fetch(ctr, 1);
+  return n <= 10 || n % 500 == 0;
+}
+
+static void dec_close(sl_dec *d) {
+  if (!d->have_dec) return;
+  int r = sceAudiodecDeleteDecoder(&d->ctrl);
+  if (r < 0) L("opensles: AAC: sceAudiodecDeleteDecoder failed 0x%08X", r);
+  d->have_dec = 0;
+}
+
+// (re)open the hw decoder for this layout. 0 on failure, logged
+static int dec_open(sl_dec *d, uint32_t rate, uint32_t ch) {
+  static volatile unsigned errs;
+  dec_close(d);
+  memset(&d->ctrl, 0, sizeof(d->ctrl));
+  memset(&d->info, 0, sizeof(d->info));
+  d->info.aac.size = sizeof(d->info.aac);
+  d->info.aac.isAdts = !d->raw;
+  d->info.aac.ch = ch;
+  d->info.aac.samplingRate = rate;
+  d->info.aac.isSbr = 0; // plain LC at the header's rate, the game sized its PCM player for that
+  d->ctrl.size = sizeof(d->ctrl);
+  d->ctrl.wordLength = SCE_AUDIODEC_WORD_LENGTH_16BITS;
+  d->ctrl.pInfo = &d->info;
+  int r = sceAudiodecCreateDecoder(&d->ctrl, SCE_AUDIODEC_TYPE_AAC);
+  if (r < 0) {
+    // a failed reopen retries every frame, keep the log sane
+    if (log_some(&errs))
+      L("opensles: AAC: sceAudiodecCreateDecoder(%u Hz, %u ch, %s) failed 0x%08X", rate, ch,
+        d->raw ? "raw" : "adts", r);
+    return 0;
+  }
+  d->have_dec = 1;
+  d->dec_rate = rate;
+  d->dec_ch = ch;
+  return 1;
+}
+
+// one frame through the hw decoder into d->pcm, returns s16 bytes out.
+// anything going wrong gives a frame of silence so the game's ring keeps turning
+static uint32_t dec_frame(sl_dec *d, const dec_job *j, uint32_t *out_ch) {
+  static volatile unsigned errs;
+  const adts_header *h = &j->h;
+  uint32_t ch = h->channels;
+  uint32_t expect = AAC_FRAME * ch * 2;
+
+  if (ch < 1 || ch > SCE_AUDIODEC_AAC_MAX_CH_IN_DECODER) {
+    if (log_some(&errs))
+      L("opensles: AAC: channel config %u not handled (1 or 2 only), silence", h->channels);
+    goto silence;
+  }
+  if (!d->have_dec || d->dec_rate != h->rate || d->dec_ch != ch) {
+    if (!dec_open(d, h->rate, ch)) goto silence;
+  } else if (j->clear_ctx) {
+    int r = sceAudiodecClearContext(&d->ctrl);
+    if (r < 0 && log_some(&errs)) L("opensles: AAC: sceAudiodecClearContext failed 0x%08X", r);
+  }
+
+  if (j->es_len > d->ctrl.maxEsSize) L_ONCE("opensles: AAC: %u byte frame > maxEsSize %u, trying anyway", j->es_len, d->ctrl.maxEsSize);
+  d->ctrl.pEs = d->es;
+  d->ctrl.inputEsSize = 0;
+  d->ctrl.pPcm = d->pcm;
+  d->ctrl.outputPcmSize = 0;
+  int r = sceAudiodecDecode(&d->ctrl);
+  uint32_t out = d->ctrl.outputPcmSize;
+  if (r < 0 || !out || out > DEC_PCM_SIZE) {
+    if (log_some(&errs))
+      L("opensles: AAC: sceAudiodecDecode failed 0x%08X (frame %u bytes, %u Hz %u ch, out %u), silence", r,
+        j->es_len, h->rate, ch, out);
+    goto silence;
+  }
+  if (d->ctrl.inputEsSize && d->ctrl.inputEsSize != j->es_len)
+    L_ONCE("opensles: AAC: decoder ate %u of a %u byte frame", d->ctrl.inputEsSize, j->es_len);
+  if (out != expect) {
+    if (ch == 1 && out == expect * 2) {
+      // mono came out stereo: keep the left side
+      L_ONCE("opensles: AAC: mono stream decoded to stereo, folding back");
+      int16_t *s = (int16_t *)d->pcm;
+      for (uint32_t i = 0; i < out / 4; i++) s[i] = s[i * 2];
+      out /= 2;
+    } else {
+      L_ONCE("opensles: AAC: %u byte frame gave %u bytes of PCM, wanted %u (SBR? the game's player won't match)",
+             j->es_len, out, expect);
+    }
+  }
+  *out_ch = ch;
+  return out;
+
+silence:
+  *out_ch = ch == 1 ? 1 : 2;
+  out = AAC_FRAME * *out_ch * 2;
+  memset(d->pcm, 0, out);
+  return out;
+}
+
+// item flags of a queued buffer. keys we don't know land in *bad
+static int abq_items(const abq_buf *a, uint32_t *bad) {
+  int f = 0;
+  const uint8_t *it = (const uint8_t *)a->items;
+  uint32_t left = a->items_len;
+  while (left >= 8) {
+    SLuint32 key, size;
+    memcpy(&key, it, 4);
+    memcpy(&size, it + 4, 4);
+    if (size > left - 8) break;
+    if (key == SL_ANDROID_ITEMKEY_EOS) f |= IT_EOS;
+    else if (key == SL_ANDROID_ITEMKEY_DISCONTINUITY || key == SL_ANDROID_ITEMKEY_FORMAT_CHANGE) f |= IT_DISC;
+    else if (key != SL_ANDROID_ITEMKEY_NONE) *bad = key;
+    it += 8 + size;
+    left -= 8 + size;
+  }
+  return f;
+}
+
+// forget all source data, no callbacks owed for any of it
+static void abq_clear_l(sl_dec *d) {
+  d->aq_head = d->aq_count = d->aq_pos = 0;
+  d->done_count = 0;
+  d->pcm_len = d->pcm_pos = 0;
+  d->eos = 0;
+  d->clear_ctx = 1;
+  d->gen++;
+  adts_reset(&d->split);
+  d->last_junk = d->split.dropped;
+}
+
+static void dec_flush_l(sl_player *p) {
+  sl_dec *d = p->dec;
+  p->q_head = p->q_count = p->q_pos = 0;
+  p->pending = 0;
+  abq_clear_l(d);
+  // a callback batch running right now belongs to the old stream: skip the
+  // rest of it, and if someone else stopped us, drop what it enqueues
+  if (p->cb_busy) {
+    d->cancel = 1;
+    if (sceKernelGetThreadId() != d->thid) d->stale = 1;
+  }
+}
+
+static int dec_stale_l(sl_player *p) {
+  return p->dec->stale && sceKernelGetThreadId() == p->dec->thid;
+}
+
+static void dec_wake(sl_player *p) {
+  sceKernelSignalSema(p->dec->sema, 1); // already up = overflow error, fine
+}
+
+// take bytes off the head source buffer into the splitter. 1 if anything moved
+static int abq_eat(sl_player *p, dec_job *j) {
+  sl_dec *d = p->dec;
+  abq_buf *a = &d->aq[d->aq_head];
+  int moved = 0;
+  int f = abq_items(a, &j->bad_key);
+  if (d->aq_pos == 0 && (f & IT_DISC)) {
+    adts_reset(&d->split);
+    d->last_junk = d->split.dropped;
+    d->clear_ctx = 1;
+  }
+  uint32_t n = a->size - d->aq_pos, room = adts_room(&d->split);
+  if (n > room) n = room;
+  if (n) {
+    adts_push(&d->split, a->data + d->aq_pos, n);
+    d->aq_pos += n;
+    moved = 1;
+  }
+  if (d->aq_pos >= a->size) {
+    if (f & IT_EOS) d->eos = 1;
+    if (d->mask & SL_ANDROIDBUFFERQUEUEEVENT_PROCESSED) d->done[d->done_count++] = *a;
+    d->aq_head = (d->aq_head + 1) % d->aq_cap;
+    d->aq_count--;
+    d->aq_pos = 0;
+    d->aq_index++;
+    moved = 1;
+  }
+  return moved;
+}
+
+// decoded-but-not-handed-back PCM plus what the buffered frames will make
+static uint32_t dec_ahead(sl_dec *d) {
+  return d->pcm_len - d->pcm_pos + adts_pcm_ahead(&d->split);
+}
+
+// one pass, g_lock held: move bytes along and note what has to happen
+// outside the lock. returns 1 if anything moved
+//
+// read-ahead: the game calls a stream done from source byte counts (its ABQ
+// callback adds up dataSize). its sink callback notes the count in a 12-entry
+// fifo, its PCM player's callback pops one per played buffer and checks the
+// one it popped last time. the fifo starts every stream with two zeros
+// (0x943484), so the check lands on the count noted 4 sink buffers back. so
+// when a sink buffer goes back, the source has to be eaten through 4 more,
+// like android's decoder input buffering happens to do. short of that the
+// game hands its player a stale ring slot, then waits 10s on one that never
+// fills (on our mixer thread: all audio stops). up to a frame too far only
+// trims the last buffer. aac_readahead=N in config overrides the 4.
+static int dec_step(sl_player *p, dec_job *j) {
+  sl_dec *d = p->dec;
+  int moved = 0;
+  j->decode = 0;
+  j->n_abq = j->n_sink = 0;
+  j->headatend = 0;
+  j->junk = 0;
+  j->fmt_new = 0;
+  j->bad_key = 0;
+  if (p->play_state != SL_PLAYSTATE_PLAYING) return 0;
+
+  if (p->q_count) d->sink_size = p->q[p->q_head].size;
+  uint32_t room = p->q_count ? d->sink_size - p->q_pos : d->sink_size;
+  while (d->aq_count && !d->eos && dec_ahead(d) < room + d->readahead * d->sink_size) {
+    if (!abq_eat(p, j)) break;
+    moved = 1;
+  }
+
+  // decoded PCM into the game's buffers
+  while (d->pcm_pos < d->pcm_len && p->q_count) {
+    sl_buf *b = &p->q[p->q_head];
+    uint32_t n = b->size - p->q_pos;
+    if (n > d->pcm_len - d->pcm_pos) n = d->pcm_len - d->pcm_pos;
+    // this one would go back now: not before the read-ahead's in, as long
+    // as the game is about to refill the source (its ABQ callback is owed)
+    if (p->q_pos + n >= b->size && !d->eos && d->done_count &&
+        dec_ahead(d) < (b->size - p->q_pos) + d->readahead * b->size)
+      break;
+    memcpy((uint8_t *)(uintptr_t)b->data + p->q_pos, d->pcm + d->pcm_pos, n);
+    p->q_pos += n;
+    d->pcm_pos += n;
+    p->frames += n / (2 * d->out_ch);
+    moved = 1;
+    if (p->q_pos >= b->size) pop_buffer(p); // full, owes a callback
+  }
+
+  if (d->pcm_pos >= d->pcm_len) {
+    d->pcm_pos = d->pcm_len = 0;
+    adts_header h;
+    int got = adts_next(&d->split, &h, d->eos);
+    if (d->split.dropped != d->last_junk) {
+      j->junk = d->split.dropped - d->last_junk;
+      d->last_junk = d->split.dropped;
+    }
+
+    if (got) {
+      // next frame -> private ES buffer, decoded once we let go of the lock
+      uint32_t skip = d->raw ? h.header_len : 0;
+      j->es_len = h.frame_len - skip;
+      memcpy(d->es, d->split.buf + skip, j->es_len);
+      memset(d->es + j->es_len, 0, DEC_ES_SIZE - j->es_len);
+      adts_pop(&d->split, h.frame_len);
+      if (h.rate != d->last_rate || h.channels != d->last_ch || h.object_type != d->last_aot) {
+        d->last_rate = h.rate;
+        d->last_ch = h.channels;
+        d->last_aot = h.object_type;
+        p->rate_mhz = h.rate * 1000;
+        j->fmt_new = aac_fmt_is_new(&h);
+      }
+      j->decode = 1;
+      j->h = h;
+      j->gen = d->gen;
+      j->clear_ctx = d->clear_ctx;
+      d->clear_ctx = 0;
+      moved = 1;
+    } else if (d->eos) {
+      // everything before EOS is out. the half-full buffer goes back padded
+      // so the tail gets played and the game's byte count reaches the end
+      if (p->q_count && p->q_pos) {
+        sl_buf *b = &p->q[p->q_head];
+        memset((uint8_t *)(uintptr_t)b->data + p->q_pos, 0, b->size - p->q_pos);
+        pop_buffer(p);
+      }
+      adts_reset(&d->split);
+      d->last_junk = d->split.dropped;
+      d->eos = 0;
+      d->clear_ctx = 1;
+      j->headatend = p->play_cb && (p->play_mask & SL_PLAYEVENT_HEADATEND);
+      j->play_cb = p->play_cb;
+      j->play_ctx = p->play_ctx;
+      moved = 1;
+    } else if (d->aq_count) {
+      // no whole frame yet (read-ahead satisfied by one that's still
+      // unconfirmed, say): eat more anyway
+      moved |= abq_eat(p, j);
+    }
+  }
+
+  // callbacks owed, run after unlocking
+  if (d->done_count && d->cb) {
+    memcpy(j->abq, d->done, d->done_count * sizeof(abq_buf));
+    j->n_abq = d->done_count;
+    j->abq_cb = d->cb;
+    j->abq_ctx = d->cb_ctx;
+  }
+  d->done_count = 0;
+  if (p->pending && p->bq_cb) {
+    j->n_sink = p->pending;
+    j->sink_cb = p->bq_cb;
+    j->sink_ctx = p->bq_ctx;
+  }
+  p->pending = 0;
+  if (j->n_abq || j->n_sink || j->headatend) p->cb_busy = 1;
+  return moved;
+}
+
+static int dec_cancelled(sl_player *p) {
+  lock();
+  int c = p->dead || p->dec->cancel;
+  unlock();
+  return c;
+}
+
+// source buffers first (the game refills from these), then full sink
+// buffers, then HEADATEND. our lock is not held
+static void dec_callbacks(sl_player *p, const dec_job *j) {
+  for (uint32_t i = 0; i < j->n_abq; i++) {
+    if (dec_cancelled(p)) goto out;
+    const abq_buf *a = &j->abq[i];
+    j->abq_cb((SLAndroidBufferQueueItf)&p->abq, j->abq_ctx, a->ctx, (void *)(uintptr_t)a->data, a->size,
+              a->size, a->items_len ? (const SLAndroidBufferItem *)a->items : NULL, a->items_len);
+  }
+  for (uint32_t i = 0; i < j->n_sink; i++) {
+    if (dec_cancelled(p)) goto out;
+    j->sink_cb((SLBufferQueueItf)&p->bq, j->sink_ctx);
+  }
+  if (j->headatend && !dec_cancelled(p)) j->play_cb((SLPlayItf)&p->play, j->play_ctx, SL_PLAYEVENT_HEADATEND);
+out:
+  lock();
+  p->cb_busy = 0;
+  p->dec->stale = 0;
+  p->dec->cancel = 0;
+  unlock();
+}
+
+static void dec_free(sl_player *p) {
+  sl_dec *d = p->dec;
+  dec_close(d);
+  if (d->sema >= 0) sceKernelDeleteSema(d->sema);
+  free(d->es);
+  free(d->pcm);
+  free(d);
+  free(p);
+}
+
+static void *dec_main(void *arg) {
+  static volatile unsigned junk_logs;
+  sl_player *p = arg;
+  sl_dec *d = p->dec;
+  dec_job *j = malloc(sizeof(*j));
+  d->thid = sceKernelGetThreadId();
+  int r = sceKernelChangeThreadPriority(d->thid, DEC_PRIO);
+  if (r < 0) L_ONCE("opensles: AAC: decoder thread priority change failed 0x%08X, carrying on", r);
+  if (!j) L("opensles: AAC: OUT OF MEMORY for a decoder thread, it idles");
+
+  while (j) {
+    lock();
+    if (p->dead) {
+      unlock();
+      break;
+    }
+    int moved = dec_step(p, j);
+    unlock();
+
+    if (j->junk && log_some(&junk_logs))
+      L("opensles: AAC: skipped %u bytes of junk looking for an ADTS sync", j->junk);
+    if (j->bad_key) L_ONCE("opensles: AAC: buffer item key 0x%X ignored", j->bad_key);
+    if (j->fmt_new)
+      L("opensles: AAC: new stream format %u Hz, %u ch, object type %u%s, ~%u byte frames, fed %s",
+        j->h.rate, j->h.channels, j->h.object_type, j->h.object_type == 2 ? " (LC)" : " (not LC!)",
+        j->h.frame_len, d->raw ? "raw (aac_raw=1)" : "as ADTS");
+
+    if (j->n_abq || j->n_sink || j->headatend) {
+      dec_callbacks(p, j);
+      moved = 1;
+    }
+    if (j->decode) {
+      uint32_t ch;
+      uint32_t n = dec_frame(d, j, &ch);
+      lock();
+      if (d->gen == j->gen) {
+        d->pcm_len = n;
+        d->pcm_pos = 0;
+        d->out_ch = ch;
+      }
+      unlock();
+      moved = 1;
+    }
+    if (!moved) {
+      SceUInt t = DEC_IDLE_US;
+      sceKernelWaitSema(d->sema, 1, &t);
+    }
+  }
+  if (!j) {
+    while (!p->dead) sceKernelDelayThread(DEC_IDLE_US);
+  }
+  free(j);
+
+  lock();
+  int self_free = p->free_later;
+  if (!self_free) d->exited = 1; // the destroyer frees once we unlock, hands off p
+  unlock();
+  if (self_free) dec_free(p); // Destroy'd from its own callback
+  return NULL;
+}
+
+static void dec_destroy(sl_player *p) {
+  sl_dec *d = p->dec;
+  lock();
+  p->dead = 1;
+  p->play_state = SL_PLAYSTATE_STOPPED;
+  int self = sceKernelGetThreadId() == d->thid;
+  if (self) p->free_later = 1; // from inside its own callback, the thread frees on the way out
+  unlock();
+  if (self) return;
+  dec_wake(p);
+  // wait out a callback that's running, like android (same rule as PCM players)
+  for (;;) {
+    lock();
+    int gone = d->exited;
+    unlock();
+    if (gone) break;
+    sceKernelDelayThread(100);
+  }
+  dec_free(p);
+}
+
+// SLAndroidBufferQueueItf
+
+static SLresult abq_RegisterCallback(SLAndroidBufferQueueItf self, slAndroidBufferQueueCallback callback,
+                                     void *pCallbackContext) {
+  sl_player *p = PLAYER_OF_ABQ(self);
+  lock();
+  p->dec->cb = callback;
+  p->dec->cb_ctx = pCallbackContext;
+  unlock();
+  return SL_RESULT_SUCCESS;
+}
+
+static SLresult abq_Clear(SLAndroidBufferQueueItf self) {
+  sl_player *p = PLAYER_OF_ABQ(self);
+  lock();
+  abq_clear_l(p->dec);
+  unlock();
+  return SL_RESULT_SUCCESS;
+}
+
+static SLresult abq_Enqueue(SLAndroidBufferQueueItf self, void *pBufferContext, void *pData, SLuint32 dataLength,
+                            const SLAndroidBufferItem *pItems, SLuint32 itemsLength) {
+  sl_player *p = PLAYER_OF_ABQ(self);
+  sl_dec *d = p->dec;
+  if ((!pData && dataLength) || (!pItems && itemsLength) || (!dataLength && !itemsLength))
+    return SL_RESULT_PARAMETER_INVALID;
+  if (itemsLength > DEC_ITEMS_MAX) {
+    L_ONCE("opensles: AAC: %u bytes of buffer items, we keep %d, refusing", itemsLength, DEC_ITEMS_MAX);
+    return SL_RESULT_PARAMETER_INVALID;
+  }
+  // items must tile exactly
+  for (uint32_t off = 0; off < itemsLength;) {
+    SLuint32 size;
+    if (itemsLength - off < 8) return SL_RESULT_PARAMETER_INVALID;
+    memcpy(&size, (const uint8_t *)pItems + off + 4, 4);
+    if (size > itemsLength - off - 8) return SL_RESULT_PARAMETER_INVALID;
+    off += 8 + size;
+  }
+
+  SLresult r = SL_RESULT_SUCCESS;
+  lock();
+  if (dec_stale_l(p)) {
+    // a callback from before a stop refilling the old stream, drop it
+  } else if (d->aq_count >= d->aq_cap) {
+    r = SL_RESULT_BUFFER_INSUFFICIENT;
+  } else {
+    abq_buf *a = &d->aq[(d->aq_head + d->aq_count) % d->aq_cap];
+    a->ctx = pBufferContext;
+    a->data = pData;
+    a->size = pData ? dataLength : 0;
+    a->items_len = itemsLength;
+    if (itemsLength) memcpy(a->items, pItems, itemsLength);
+    d->aq_count++;
+  }
+  unlock();
+  dec_wake(p);
+  return r;
+}
+
+static SLresult abq_GetState(SLAndroidBufferQueueItf self, SLAndroidBufferQueueState *pState) {
+  if (!pState) return SL_RESULT_PARAMETER_INVALID;
+  sl_player *p = PLAYER_OF_ABQ(self);
+  lock();
+  pState->count = p->dec->aq_count;
+  pState->index = p->dec->aq_index;
+  unlock();
+  return SL_RESULT_SUCCESS;
+}
+
+static SLresult abq_SetCallbackEventsMask(SLAndroidBufferQueueItf self, SLuint32 eventFlags) {
+  sl_player *p = PLAYER_OF_ABQ(self);
+  lock();
+  p->dec->mask = eventFlags;
+  unlock();
+  return SL_RESULT_SUCCESS;
+}
+
+static SLresult abq_GetCallbackEventsMask(SLAndroidBufferQueueItf self, SLuint32 *pEventFlags) {
+  if (!pEventFlags) return SL_RESULT_PARAMETER_INVALID;
+  *pEventFlags = PLAYER_OF_ABQ(self)->dec->mask;
+  return SL_RESULT_SUCCESS;
+}
+
+static const struct SLAndroidBufferQueueItf_ abq_vtbl = {
+  abq_RegisterCallback,
+  abq_Clear,
+  abq_Enqueue,
+  abq_GetState,
+  abq_SetCallbackEventsMask,
+  abq_GetCallbackEventsMask,
+};
+
+// ANDROIDBUFFERQUEUE source. anything going wrong -> refused like before,
+// the game marks that voice failed and carries on
+static SLresult create_decoder(SLObjectItf *pPlayer, SLDataSource *src, SLDataSink *snk) {
+  static volatile unsigned refused, created;
+  const SLDataFormat_MIME *m = src->pFormat;
+  const char *mime = m && m->formatType == SL_DATAFORMAT_MIME && m->mimeType ? (const char *)m->mimeType : NULL;
+  SLuint32 sink = *(const SLuint32 *)snk->pLocator;
+  uint32_t nsrc = ((const SLDataLocator_AndroidBufferQueue *)src->pLocator)->numBuffers;
+  uint32_t nsnk = 0;
+  const char *why = NULL;
+  sl_player *p = NULL;
+  sl_dec *d = NULL;
+
+  if (!mime || strcasecmp(mime, AAC_MIME)) why = "only ADTS AAC is done";
+  else if (sink != SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE && sink != SL_DATALOCATOR_BUFFERQUEUE)
+    why = "only decoding into a buffer queue is done";
+  else if (!nsrc || !(nsnk = ((const SLDataLocator_BufferQueue *)snk->pLocator)->numBuffers))
+    why = "zero buffers";
+  else if (config_int("no_aac", 0)) why = "no_aac set in config";
+  else {
+    pthread_once(&g_aac_once, aac_lib_init);
+    if (!g_aac_ok) why = "no sceAudiodec (see above)";
+  }
+  if (why) goto refuse;
+
+  if (nsrc > DEC_MAX_ABQ) {
+    L("opensles: AAC: decoder wants %u source buffers, capping at %d", nsrc, DEC_MAX_ABQ);
+    nsrc = DEC_MAX_ABQ;
+  }
+  if (nsnk > MAX_QUEUE) {
+    L("opensles: AAC: decoder wants %u sink buffers, capping at %d", nsnk, MAX_QUEUE);
+    nsnk = MAX_QUEUE;
+  }
+  const SLDataFormat_PCM *sf = snk->pFormat;
+  if (sf && sf->formatType == SL_DATAFORMAT_PCM)
+    L_ONCE("opensles: AAC: sink PCM format (%u ch, %u Hz, %u bit) ignored, out comes the stream's own s16 like on android",
+           sf->numChannels, sf->samplesPerSec / 1000, sf->bitsPerSample);
+
+  p = calloc(1, sizeof(*p) + nsnk * sizeof(sl_buf));
+  d = calloc(1, sizeof(*d));
+  if (p && d) {
+    d->es = memalign(SCE_AUDIODEC_ALIGNMENT_SIZE, DEC_ES_SIZE);
+    d->pcm = memalign(SCE_AUDIODEC_ALIGNMENT_SIZE, DEC_PCM_SIZE);
+  }
+  if (!p || !d || !d->es || !d->pcm) {
+    why = "out of memory";
+    goto fail;
+  }
+  memset(d->es, 0, DEC_ES_SIZE);
+  d->sema = -1;
+  d->thid = -1;
+  d->raw = config_int("aac_raw", 0) != 0;
+  d->aq_cap = nsrc;
+  d->mask = SL_ANDROIDBUFFERQUEUEEVENT_PROCESSED; // android's default
+  d->out_ch = 2;
+  d->sink_size = 4096;
+  int ra = config_int("aac_readahead", DEC_READAHEAD);
+  d->readahead = ra < 0 ? 0 : ra > 8 ? 8 : (uint32_t)ra;
+  adts_reset(&d->split);
+
+  obj_init(&p->obj, K_PLAYER);
+  p->play = &play_vtbl;
+  p->bq = &bq_vtbl;
+  p->vol = &vol_vtbl;
+  p->abq = &abq_vtbl;
+  p->dec = d;
+  p->slot = -1; // not in g_players, the mixer never sees it
+  p->rate_mhz = 44100 * 1000;
+  p->channels = 2;
+  p->play_state = SL_PLAYSTATE_STOPPED;
+  p->q_cap = nsnk;
+  reset_resampler(p);
+  player_regain(p);
+
+  // open a decoder now so a dead or full sceAudiodec means a refused player.
+  // it gets reopened for the real layout on the first frame
+  if (!dec_open(d, 44100, 2)) {
+    why = "sceAudiodecCreateDecoder failed (see above)";
+    goto fail;
+  }
+  d->sema = sceKernelCreateSema("sl_aac", 0, 0, 1, NULL);
+  if (d->sema < 0) {
+    L("opensles: AAC: sema create failed 0x%08X", d->sema);
+    why = "no semaphore";
+    goto fail;
+  }
+  pthread_attr_t a;
+  pthread_t th;
+  pthread_attr_init(&a);
+  pthread_attr_setstacksize(&a, DEC_STACK);
+  pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+  int r = pthread_create(&th, &a, dec_main, p);
+  pthread_attr_destroy(&a);
+  if (r != 0) {
+    L("opensles: AAC: decoder thread failed to start (%d)", r);
+    why = "no thread";
+    goto fail;
+  }
+
+  L("opensles: AAC decoder player #%u up: %u source / %u sink buffers, fed %s, read-ahead %u",
+    __sync_add_and_fetch(&created, 1), nsrc, nsnk, d->raw ? "raw (aac_raw=1)" : "as ADTS", d->readahead);
+  *pPlayer = (SLObjectItf)&p->obj.itf;
+  return SL_RESULT_SUCCESS;
+
+fail:
+  if (d) {
+    dec_close(d);
+    if (d->sema >= 0) sceKernelDeleteSema(d->sema);
+    free(d->es);
+    free(d->pcm);
+    free(d);
+  }
+  free(p);
+refuse: {
+  unsigned n = __sync_add_and_fetch(&refused, 1);
+  if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
+    L("opensles: refusing decoder player #%u (mime '%s', container %u, sink 0x%X): %s. that voice stays silent", n,
+      mime ? mime : "?", m ? m->containerType : 0, sink, why);
+  return SL_RESULT_CONTENT_UNSUPPORTED;
+}
+}
+
+// ---------------------------------------------------------------------------
 // SLEngineItf
 
 static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer, SLDataSource *pAudioSrc,
@@ -913,13 +1745,15 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer, SL
                                       const SLInterfaceID *pInterfaceIds,
                                       const SLboolean *pInterfaceRequired) {
   (void)self;
-  static unsigned refused_decoders;
 
   if (!pPlayer) return SL_RESULT_PARAMETER_INVALID;
   *pPlayer = NULL; // game only looks at this, never at our return code
   if (!pAudioSrc || !pAudioSrc->pLocator || !pAudioSnk || !pAudioSnk->pLocator)
     return SL_RESULT_PARAMETER_INVALID;
   if (numInterfaces && !pInterfaceIds) return SL_RESULT_PARAMETER_INVALID;
+
+  SLuint32 loc = *(const SLuint32 *)pAudioSrc->pLocator;
+  int is_dec = loc == SL_DATALOCATOR_ANDROIDBUFFERQUEUE;
 
   // interfaces: log everything, only fail on something required we can't fake
   int want_abq = 0;
@@ -938,8 +1772,11 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer, SL
       log_iid(WHO_PLAYER_CREATE, ix, pInterfaceIds[i], req, "accepted, GetInterface says unsupported");
       break;
     case IX_ABQSOURCE:
-      // decoder players get their own louder refusal below
-      log_iid(WHO_PLAYER_CREATE, ix, pInterfaceIds[i], req, req ? "no decoder, refusing player" : "ignored");
+      if (is_dec) {
+        log_iid(WHO_PLAYER_CREATE, ix, pInterfaceIds[i], req, "ok (decoder player)");
+        break;
+      }
+      log_iid(WHO_PLAYER_CREATE, ix, pInterfaceIds[i], req, req ? "on a PCM player, refusing" : "ignored");
       if (req) want_abq = 1;
       break;
     default:
@@ -949,19 +1786,8 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer, SL
     }
   }
 
-  SLuint32 loc = *(const SLuint32 *)pAudioSrc->pLocator;
-
-  if (loc == SL_DATALOCATOR_ANDROIDBUFFERQUEUE) {
-    // the AAC decode-to-PCM trick. would need an ADTS decoder (SceAudiodec)
-    const SLDataFormat_MIME *m = pAudioSrc->pFormat;
-    unsigned n = __sync_add_and_fetch(&refused_decoders, 1);
-    if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
-      L("opensles: refusing decoder player #%u (ANDROIDBUFFERQUEUE src, mime '%s', container %u). "
-        "no AAC decode yet, that voice stays silent",
-        n, m && m->formatType == SL_DATAFORMAT_MIME && m->mimeType ? (const char *)m->mimeType : "?",
-        m ? m->containerType : 0);
-    return SL_RESULT_CONTENT_UNSUPPORTED;
-  }
+  // the AAC decode-to-PCM trick
+  if (is_dec) return create_decoder(pPlayer, pAudioSrc, pAudioSnk);
 
   if (loc != SL_DATALOCATOR_BUFFERQUEUE && loc != SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE) {
     L("opensles: CreateAudioPlayer with source locator 0x%X, only buffer queues are done", loc);
