@@ -227,139 +227,6 @@ typedef struct {
 #define CACHE_MAGIC 0x50584E4E  // "NNXP"
 #define CACHE_VER   1
 
-// ---- shadercache pack (pack.bin) ----
-// all cache files (.gxp/.g2c) can sit in one file instead of ~600 loose
-// files, which is kinder to the slow vita card io (sceIoOpen + reads of 16
-// tiny files per program are milliseconds each there). built by
-// tools/shaderpack.py, opened once at boot, everything after is sceIoPread.
-// a miss falls back to the loose file, and new shaders still get written
-// loose, so the next pack run just picks them up.
-//
-// layout (little endian, packed structs):
-//   header:  u32 magic 'NPK1', u32 version, u32 count, u32 index_size
-//   index:   count * { u32 name_len, char name[name_len], u64 offset, u32 size }
-//   data:    raw contents of each original file
-// the index is strcmp-sorted by name so lookups can bisect. names are the
-// cache file names with the dir stripped: "v<hash>.gxp", "f<hash>.gxp",
-// "t<hash>.g2c".
-#define PACK_MAGIC   0x314B504Eu  // "NPK1"
-#define PACK_VERSION 1
-
-#pragma pack(push, 1)
-typedef struct {
-  uint32_t magic, version, count, index_size;
-} pack_hdr;
-typedef struct {
-  uint32_t name_len;
-  uint64_t offset;
-  uint32_t size;
-  // char name[name_len] follows
-} pack_entry;
-#pragma pack(pop)
-#define PACK_NAME_MAX 80
-
-static SceUID pack_fd = -1;           // pack.bin, opened once at boot
-static uint8_t *pack_index;           // packed index bytes
-static const pack_entry **pack_ents;  // pointers into the index, name-sorted
-static uint32_t pack_count, pack_index_size;
-
-// names inside the pack are the cache file names with the directory stripped
-static void pack_name(char *out, int n, const char *cache_path)
-{
-  const char *slash = strrchr(cache_path, '/');
-  snprintf(out, n, "%s", slash ? slash + 1 : cache_path);
-}
-
-// fetches a whole cache file out of the pack into a malloc'd buffer.
-// returns 1 = pack is live (check *out: NULL = not in the pack), 0 = no pack
-static int pack_read(const char *cache_path, uint8_t **out, uint32_t *size)
-{
-  *out = NULL;
-  *size = 0;
-  if (pack_fd < 0) return 0;
-  char name[PACK_NAME_MAX];
-  pack_name(name, sizeof(name), cache_path);
-  size_t nlen = strlen(name);
-
-  // bisect the name-sorted index
-  uint32_t lo = 0, hi = pack_count;
-  const pack_entry *found = NULL;
-  while (lo < hi) {
-    uint32_t mid = lo + (hi - lo) / 2;
-    const pack_entry *e = pack_ents[mid];
-    const char *en = (const char *)(const void *)(e + 1);
-    int c = strncmp(en, name, nlen);
-    if (c == 0 && en[nlen] == 0) { found = e; break; }
-    if (c < 0 || (c == 0 && en[nlen] != 0)) lo = mid + 1; else hi = mid;
-  }
-  if (!found) return 1;
-
-  uint32_t n = found->size;
-  uint8_t *buf = malloc(n ? n : 1);
-  if (!buf) return 1;  // oom, not absence
-  if (sceIoPread(pack_fd, buf, n, (SceOff)found->offset) != (SceSSize)n) {
-    L_ONCE("shader: pack read failed for %s", name);
-    free(buf);
-    return 1;
-  }
-  *out = buf;
-  *size = n;
-  return 1;
-}
-
-// opens pack.bin and loads its index. called once from shader_init, before
-// anything can hit the cache
-static void pack_init(void)
-{
-  char path[128];
-  snprintf(path, sizeof(path), "%s/pack.bin", SHADER_CACHE);
-  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-  if (fd < 0) return;  // no pack, loose files as usual
-  pack_hdr hd;
-  if (sceIoRead(fd, &hd, sizeof(hd)) == sizeof(hd) && hd.magic == PACK_MAGIC &&
-      hd.version == PACK_VERSION && hd.count > 0 && hd.count < 64 * 1024 &&
-      hd.index_size > 0 && hd.index_size < 8 * 1024 * 1024) {
-    uint8_t *idx = malloc(hd.index_size);
-    const pack_entry **ents = malloc(hd.count * sizeof(*ents));
-    SceIoStat st;
-    if (idx && ents && sceIoGetstat(path, &st) >= 0 &&
-        sceIoRead(fd, idx, hd.index_size) == (SceSSize)hd.index_size) {
-      // sanity: the index terminates exactly, entries are name-sorted with
-      // sane names, and every blob ends inside the file
-      uint32_t off = 0, ok = 1;
-      uint64_t fsize = (uint64_t)st.st_size;
-      const char *prev = NULL;
-      for (uint32_t i = 0; i < hd.count && ok; i++) {
-        if (off + sizeof(pack_entry) > hd.index_size) { ok = 0; break; }
-        const pack_entry *e = (const pack_entry *)(idx + off);
-        const char *en = (const char *)(const void *)(e + 1);
-        uint32_t total = off + sizeof(pack_entry) + e->name_len;
-        if (e->name_len == 0 || e->name_len > PACK_NAME_MAX || total > hd.index_size ||
-            (prev && strcmp(prev, en) >= 0) ||
-            (uint64_t)e->offset + e->size > fsize) { ok = 0; break; }
-        ents[i] = e;
-        prev = en;
-        off = total;
-      }
-      if (ok && off == hd.index_size) {
-        pack_fd = fd;
-        pack_index = idx;
-        pack_ents = ents;
-        pack_count = hd.count;
-        pack_index_size = hd.index_size;
-        L("shader: shadercache pack up (%u entries)", pack_count);
-        return;
-      }
-      L("shader: bad pack index in %s, using loose files", path);
-    }
-    free(idx);
-    free(ents);
-  } else {
-    L("shader: bad pack header in %s, using loose files", path);
-  }
-  sceIoClose(fd);
-}
-
 static uint64_t hash64(const char *s, size_t n)
 {
   uint64_t h = 1469598103934665603ull;
@@ -372,57 +239,10 @@ static void cache_path(char *out, int n, uint64_t h, int frag)
   snprintf(out, n, "%s/%c%016llx.gxp", SHADER_CACHE, frag ? 'f' : 'v', (unsigned long long)h);
 }
 
-// read through a stack buffer: once the heap is full our buffers can live in
-// cdram/gpu pool memory, and sceIoRead into that just fails (hw: shaders
-// "bad cache file" right as spilling started -> headless players)
-static int io_read_bounce(SceUID fd, void *dst, uint32_t n)
-{
-  uint8_t tmp[8192];
-  uint8_t *d = dst;
-  while (n) {
-    uint32_t k = n < sizeof(tmp) ? n : sizeof(tmp);
-    if (sceIoRead(fd, tmp, k) != (SceSSize)k) return -1;
-    memcpy(d, tmp, k);
-    d += k;
-    n -= k;
-  }
-  return 0;
-}
-
 // *oom gets set when the file was there but we had no memory to read it:
 // that's "try again later", not "compile it" (loading the compiler then is worse)
-// shared validation of a cached-gxp blob (file contents: cache_hdr + gxp)
-static SceGxmProgram *cache_parse(const uint8_t *buf, uint32_t n, uint32_t cg_len, uint32_t h2)
-{
-  if (n <= sizeof(cache_hdr) || n > sizeof(cache_hdr) + 4 * 1024 * 1024) return NULL;
-  cache_hdr hd;
-  memcpy(&hd, buf, sizeof(hd));  // pack data can be unaligned
-  if (hd.magic != CACHE_MAGIC || hd.version != CACHE_VER ||
-      hd.cg_len != cg_len || hd.cg_hash2 != h2 ||
-      hd.gxp_size == 0 || hd.gxp_size != n - sizeof(cache_hdr)) return NULL;
-  SceGxmProgram *p = malloc(hd.gxp_size);
-  if (!p) return p;
-  memcpy(p, buf + sizeof(cache_hdr), hd.gxp_size);
-  if (sceGxmProgramCheck(p) < 0) {
-    free(p);
-    return NULL;
-  }
-  return p;
-}
-
 static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2, int *oom)
 {
-  // pack first (one sceIoPread, no per-file open), loose file as fallback.
-  // *oom only gets set by the loose path: with the pack the blob either
-  // validates or we simply go to the compiler
-  uint8_t *buf;
-  uint32_t n;
-  if (pack_read(path, &buf, &n) && buf) {
-    SceGxmProgram *p = cache_parse(buf, n, cg_len, h2);
-    free(buf);
-    if (p) return p;
-  }
-
   SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
   if (fd < 0) return NULL;
   cache_hdr hd;
@@ -436,7 +256,7 @@ static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2,
       sceIoClose(fd);
       return NULL;
     }
-    if (io_read_bounce(fd, p, hd.gxp_size) < 0 || sceGxmProgramCheck(p) < 0) {
+    if (sceIoRead(fd, p, hd.gxp_size) != (SceSSize)hd.gxp_size || sceGxmProgramCheck(p) < 0) {
       L("shader: bad cache file %s, ignoring", path);
       free(p);
       p = NULL;
@@ -465,9 +285,7 @@ static void log_append(char **log, const char *fmt, ...)
   vsnprintf(tmp, sizeof(tmp), fmt, ap);
   va_end(ap);
   size_t old = *log ? strlen(*log) : 0, add = strlen(tmp);
-  char *np = realloc(*log, old + add + 2);
-  if (!np) { L_ONCE("shader: out of memory growing a link log, dropping it"); return; }
-  *log = np;
+  *log = realloc(*log, old + add + 2);
   memcpy(*log + old, tmp, add);
   (*log)[old + add] = '\n';
   (*log)[old + add + 1] = 0;
@@ -709,7 +527,6 @@ SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fm
   bi.colorSrc = bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
   bi.colorDst = bi.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
   fp_variant *v = calloc(1, sizeof(*v));
-  if (!v) { L_ONCE("shader: out of memory for a clear fragment program variant"); return NULL; }
   int r = sceGxmShaderPatcherCreateFragmentProgram(gxm_patcher, CLR.fid, fmt, ms,
                                                    &bi, CLR.vgxp, &v->fp);
   if (r < 0) {
@@ -731,7 +548,6 @@ void shader_init(void)
   sceIoMkdir(DATA_PATH, 0777);
   sceIoMkdir(SHADER_CACHE, 0777);
   sceIoMkdir(SHADERFAIL_DIR, 0777);
-  pack_init();  // shadercache/pack.bin, opened once at boot, reads all sceIoPread
   // no shacc_ready() here anymore, the compiler loads on the first cache miss
   if (gxm_ready()) run_on_big_stack(clear_init_job, NULL);
 }
@@ -756,9 +572,7 @@ void glShaderSource(GLuint sh, GLsizei count, const GLchar *const *str, const GL
   for (int i = 0; i < count; i++)
     total += (len && len[i] >= 0) ? (size_t)len[i] : strlen(str[i]);
   free(s->src);
-  s->src = NULL;
   s->src = malloc(total + 1);
-  if (!s->src) { L_ONCE("shader: out of memory copying a shader source, keeping none"); return; }
   size_t o = 0;
   for (int i = 0; i < count; i++) {
     size_t n = (len && len[i] >= 0) ? (size_t)len[i] : strlen(str[i]);
@@ -818,7 +632,6 @@ void glGetShaderInfoLog(GLuint sh, GLsizei max, GLsizei *len, GLchar *log)
 GLuint glCreateProgram(void)
 {
   gl_program *p = calloc(1, sizeof(*p));
-  if (!p) { GL_ERR(GL_OUT_OF_MEMORY); return 0; }   // 0 = "program not created" like on GL
   p->name = nt_gen(&g_progs);
   nt_set(&g_progs, p->name, p);
   return p->name;
@@ -1074,7 +887,6 @@ static void link_front(gl_program *p, const g2c_result *r)
 
   // ---- uniforms ----
   p->uniforms = calloc(r->n_uniforms ? r->n_uniforms : 1, sizeof(prog_uniform));
-  if (!p->uniforms) { GL_ERR(GL_OUT_OF_MEMORY); return; }   // uniform lookups fail, draws go on
   p->n_uniforms = r->n_uniforms;
   int nloc = 0;
   for (int i = 0; i < r->n_uniforms; i++) {
@@ -1094,7 +906,6 @@ static void link_front(gl_program *p, const g2c_result *r)
     u->in_vs = g->in_vs;
     u->in_fs = g->in_fs;
     u->data = calloc(u->slots * 4, sizeof(float));
-    if (!u->data) { GL_ERR(GL_OUT_OF_MEMORY); continue; }   // the set just doesn't stick
     u->loc_base = nloc;
     nloc += u->elems;
     if (!u->is_sampler && u->slots > 1 && g->vec4_slots != u->slots)
@@ -1102,7 +913,6 @@ static void link_front(gl_program *p, const g2c_result *r)
   }
   p->n_locs = nloc;
   p->loc_map = malloc((nloc ? nloc : 1) * sizeof(int16_t));
-  if (!p->loc_map) { GL_ERR(GL_OUT_OF_MEMORY); return; }
   for (int i = 0; i < r->n_uniforms; i++)
     for (int e = 0; e < p->uniforms[i].elems; e++)
       p->loc_map[p->uniforms[i].loc_base + e] = (int16_t)i;
@@ -1379,19 +1189,9 @@ static uint32_t tcache_check(const char *vs, const char *fs)
   return fnv1a(fs, strlen(fs), h);
 }
 
-// the stamp used to invalidate the translation cache: hash of glsl2cg.c +
-// glsl2cg.h, set up in CMakeLists.txt (G2C_BUILD). was __DATE__/__TIME__,
-// which made every rebuild drop the cache.
-#ifndef G2C_BUILD
-#define G2C_BUILD "no-stamp"
-#endif
 static uint32_t tcache_build(void)
 {
-  // G2C_BUILD: CMake-time SHA1 of glsl2cg.c + glsl2cg.h. __DATE__/__TIME__
-  // invalidated the whole translation cache on every rebuild for no reason
-  static uint32_t cached;
-  if (!cached) cached = fnv1a("G2C:" G2C_BUILD, sizeof("G2C:" G2C_BUILD) - 1, 2166136261u);
-  return cached;
+  return fnv1a(g2c_build_id, strlen(g2c_build_id), 2166136261u);
 }
 
 // 1 = r is filled in (vs_cg/fs_cg malloc'd, g2c_free works on it)
@@ -1399,45 +1199,6 @@ static int tcache_load(const char *vs, const char *fs, g2c_result *r)
 {
   char path[128];
   tcache_path(path, sizeof(path), vs, fs);
-
-  // pack first, loose file as fallback
-  {
-    uint8_t *buf;
-    uint32_t n;
-    if (pack_read(path, &buf, &n) && buf) {
-      tcache_hdr h;
-      int ok = 0;
-      memcpy(&h, buf, sizeof(h));  // pack data can be unaligned
-      if (h.magic == TCACHE_MAGIC && h.build == tcache_build() &&
-          h.src_hash2 == tcache_check(vs, fs) && h.res_size == sizeof(*r) &&
-          h.vs_len < 1024 * 1024 && h.fs_len < 1024 * 1024 &&
-          n == (uint32_t)(sizeof(tcache_hdr) + sizeof(g2c_result) + h.vs_len + h.fs_len)) {
-        // on disk the g2c_result's pointers are strcpy'd out right after it,
-        // same as the loose file: header, res struct, then both strings
-        char *v = malloc(h.vs_len + 1);
-        char *f = malloc(h.fs_len + 1);
-        const uint8_t *base = buf + sizeof(tcache_hdr);
-        if (v && f) {
-          memcpy(v, base + sizeof(g2c_result), h.vs_len);
-          memcpy(f, base + sizeof(g2c_result) + h.vs_len, h.fs_len);
-          v[h.vs_len] = 0;
-          f[h.fs_len] = 0;
-          // the stored g2c_result has stale pointers, only the counts matter;
-          // copy the scalar fields over r and hand it our strings
-          memcpy(r, base, sizeof(*r));
-          r->vs_cg = v;
-          r->fs_cg = f;
-          ok = 1;
-        } else {
-          free(v);
-          free(f);
-        }
-      }
-      free(buf);
-      if (ok) return 1;
-    }
-  }
-
   SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
   if (fd < 0) return 0;
   tcache_hdr h;
@@ -1446,10 +1207,10 @@ static int tcache_load(const char *vs, const char *fs, g2c_result *r)
   if (sceIoRead(fd, &h, sizeof(h)) == sizeof(h) && h.magic == TCACHE_MAGIC && h.build == tcache_build() &&
       h.src_hash2 == tcache_check(vs, fs) && h.res_size == sizeof(*r) &&
       h.vs_len < 1024 * 1024 && h.fs_len < 1024 * 1024 &&
-      io_read_bounce(fd, r, sizeof(*r)) == 0) {
+      sceIoRead(fd, r, sizeof(*r)) == sizeof(*r)) {
     v = malloc(h.vs_len + 1);
     f = malloc(h.fs_len + 1);
-    if (v && f && io_read_bounce(fd, v, h.vs_len) == 0 && io_read_bounce(fd, f, h.fs_len) == 0) {
+    if (v && f && sceIoRead(fd, v, h.vs_len) == (SceSSize)h.vs_len && sceIoRead(fd, f, h.fs_len) == (SceSSize)h.fs_len) {
       v[h.vs_len] = 0;
       f[h.fs_len] = 0;
       r->vs_cg = v;
