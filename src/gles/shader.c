@@ -1089,27 +1089,89 @@ int prog_try_finish(gl_program *p)
 
 typedef struct { gl_program *p; char *log; int ok; } link_job;
 
-static void link_job_fn(void *arg)
+// ---- translation cache ----
+// the game links its whole shader set during the intro, and translating
+// every pair again on each boot made the logo fade crawl (~45ms a link in
+// vita3k). so glsl2cg's output gets cached on disk next to the gxps, keyed
+// by the GLSL pair and the translator's build stamp.
+#define TCACHE_MAGIC 0x54433247u  // "G2CT"
+
+typedef struct {
+  uint32_t magic, build, src_hash2, vs_len, fs_len, res_size;
+} tcache_hdr;
+
+static void tcache_path(char *out, int n, const char *vs, const char *fs)
 {
-  link_job *lj = arg;
-  gl_program *p = lj->p;
-  char **log = &lj->log;
-  lj->ok = 0;
+  uint64_t h = hash64(vs, strlen(vs)) * 31 + hash64(fs, strlen(fs));
+  snprintf(out, n, "%s/t%016llx.g2c", SHADER_CACHE, (unsigned long long)h);
+}
 
-  gl_shader *vs = sh_get(p->vs), *fs = sh_get(p->fs);
-  if (!vs || !fs || !vs->src || !fs->src) { log_append(log, "missing vertex or fragment shader"); return; }
-  if (!gxm_ready()) { log_append(log, "gxm not initialized"); return; }
+static uint32_t tcache_check(const char *vs, const char *fs)
+{
+  uint32_t h = fnv1a(vs, strlen(vs), 2166136261u);
+  return fnv1a(fs, strlen(fs), h);
+}
 
-  // ~12KB, keep it off the game thread's stack
-  g2c_result *r = calloc(1, sizeof(*r));
-  if (!r) { log_append(log, "out of memory"); return; }
-  if (g2c_translate(vs->src, fs->src, r) != 0) {
-    log_append(log, "glsl2cg: %s", r->error);
-    dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, r->error);
-    g2c_free(r);
-    free(r);
-    return;
+static uint32_t tcache_build(void)
+{
+  return fnv1a(g2c_build_id, strlen(g2c_build_id), 2166136261u);
+}
+
+// 1 = r is filled in (vs_cg/fs_cg malloc'd, g2c_free works on it)
+static int tcache_load(const char *vs, const char *fs, g2c_result *r)
+{
+  char path[128];
+  tcache_path(path, sizeof(path), vs, fs);
+  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+  if (fd < 0) return 0;
+  tcache_hdr h;
+  int ok = 0;
+  char *v = NULL, *f = NULL;
+  if (sceIoRead(fd, &h, sizeof(h)) == sizeof(h) && h.magic == TCACHE_MAGIC && h.build == tcache_build() &&
+      h.src_hash2 == tcache_check(vs, fs) && h.res_size == sizeof(*r) &&
+      h.vs_len < 1024 * 1024 && h.fs_len < 1024 * 1024 &&
+      sceIoRead(fd, r, sizeof(*r)) == sizeof(*r)) {
+    v = malloc(h.vs_len + 1);
+    f = malloc(h.fs_len + 1);
+    if (v && f && sceIoRead(fd, v, h.vs_len) == (SceSSize)h.vs_len && sceIoRead(fd, f, h.fs_len) == (SceSSize)h.fs_len) {
+      v[h.vs_len] = 0;
+      f[h.fs_len] = 0;
+      r->vs_cg = v;
+      r->fs_cg = f;
+      ok = 1;
+    }
   }
+  sceIoClose(fd);
+  if (!ok) {
+    free(v);
+    free(f);
+    memset(r, 0, sizeof(*r));
+  }
+  return ok;
+}
+
+static void tcache_store(const char *vs, const char *fs, const g2c_result *r)
+{
+  char path[128];
+  tcache_path(path, sizeof(path), vs, fs);
+  SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+  if (fd < 0) return;
+  g2c_result copy = *r;
+  copy.vs_cg = copy.fs_cg = NULL;  // pointers mean nothing on disk
+  tcache_hdr h = { TCACHE_MAGIC, tcache_build(), tcache_check(vs, fs),
+                   (uint32_t)strlen(r->vs_cg), (uint32_t)strlen(r->fs_cg), sizeof(*r) };
+  sceIoWrite(fd, &h, sizeof(h));
+  sceIoWrite(fd, &copy, sizeof(copy));
+  sceIoWrite(fd, r->vs_cg, h.vs_len);
+  sceIoWrite(fd, r->fs_cg, h.fs_len);
+  sceIoClose(fd);
+}
+
+// everything after translation. small stack use unless it has to compile
+// inline (async off), so the cached path can run right on the game's thread
+static void link_with(link_job *lj, gl_program *p, gl_shader *vs, gl_shader *fs, g2c_result *r)
+{
+  char **log = &lj->log;
   link_front(p, r);
 
   SceGxmProgram *vg = shacc_lookup(r->vs_cg, 0);
@@ -1136,6 +1198,32 @@ static void link_job_fn(void *arg)
     if (!p->vgxp || !p->fgxp) dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, *log);
     else lj->ok = link_back(p, log);
   }
+}
+
+// slow path, on the big stack: translate (and cache it), then link
+static void link_job_fn(void *arg)
+{
+  link_job *lj = arg;
+  gl_program *p = lj->p;
+  char **log = &lj->log;
+  lj->ok = 0;
+
+  gl_shader *vs = sh_get(p->vs), *fs = sh_get(p->fs);
+  if (!vs || !fs || !vs->src || !fs->src) { log_append(log, "missing vertex or fragment shader"); return; }
+  if (!gxm_ready()) { log_append(log, "gxm not initialized"); return; }
+
+  // ~12KB, keep it off the game thread's stack
+  g2c_result *r = calloc(1, sizeof(*r));
+  if (!r) { log_append(log, "out of memory"); return; }
+  if (g2c_translate(vs->src, fs->src, r) != 0) {
+    log_append(log, "glsl2cg: %s", r->error);
+    dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, r->error);
+    g2c_free(r);
+    free(r);
+    return;
+  }
+  tcache_store(vs->src, fs->src, r);
+  link_with(lj, p, vs, fs, r);
   g2c_free(r);
   free(r);
 }
@@ -1147,7 +1235,22 @@ void glLinkProgram(GLuint prog)
   prog_reset(p);
   link_job j = { p, NULL, 0 };
   p->link_tried = 1;
-  run_on_big_stack(link_job_fn, &j);
+
+  // fast path: translation cached and compiles go to the worker, so nothing
+  // here needs the big stack or a fresh thread
+  int done = 0;
+  gl_shader *vs = sh_get(p->vs), *fs = sh_get(p->fs);
+  if (vs && fs && vs->src && fs->src && gxm_ready() && async_ready()) {
+    g2c_result *r = calloc(1, sizeof(*r));
+    if (r && tcache_load(vs->src, fs->src, r)) {
+      link_with(&j, p, vs, fs, r);
+      g2c_free(r);
+      done = 1;
+    }
+    free(r);
+  }
+  if (!done) run_on_big_stack(link_job_fn, &j);
+
   char *log = j.log;
   p->linked = j.ok;
   p->log = log;

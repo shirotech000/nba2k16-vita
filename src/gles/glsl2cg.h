@@ -72,3 +72,6 @@ typedef struct {
 int g2c_translate(const char *vs_glsl, const char *fs_glsl, g2c_result *out);
 int g2c_translate_ex(const char *vs_glsl, const char *fs_glsl, unsigned flags, g2c_result *out);
 void g2c_free(g2c_result *r);
+
+// build stamp of the translator, part of the translation cache key
+extern const char g2c_build_id[];

@@ -2793,6 +2793,10 @@ int g2c_translate(const char *vs_glsl, const char *fs_glsl, g2c_result *out) {
   return g2c_translate_ex(vs_glsl, fs_glsl, 0, out);
 }
 
+// changes every time this file gets rebuilt, so cached translations (shader.c)
+// never outlive a translator change
+const char g2c_build_id[] = __DATE__ " " __TIME__;
+
 void g2c_free(g2c_result *r) {
   if (!r) return;
   free(r->vs_cg);
