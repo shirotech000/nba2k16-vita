@@ -1209,7 +1209,7 @@ static void glTexImage2D_impl(GLenum target, GLint level, GLint ifmt, GLsizei w,
   static int raw_bc = -1;
   if (raw_bc < 0) {
     extern int config_int(const char *key, int def);
-    raw_bc = config_int("tex_bc_raw", 1) != 0;
+    raw_bc = config_int("tex_bc_raw", 0) != 0;  // 200-400ms per big menu texture on hw
   }
   unsigned rbpp = raw_src_bpp(fmt, type);
   if (raw_bc && bc_enabled() && face < 0 && data && rbpp) {
