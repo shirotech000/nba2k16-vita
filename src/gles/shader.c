@@ -894,9 +894,56 @@ static void link_front(gl_program *p, const g2c_result *r)
   p->uses_iid = r->uses_instance_id;
 }
 
+// vita3k workaround (green player skin). the Cg compiler writes "x * 1" as a
+// VMUL whose src1 is the immediate bank with a constant-1 swizzle channel.
+// vita3k's loader only looks at swizzle channel 0 when the dest mask is a
+// single component, so with a .y/.z/.w-only mask it reads 0 instead of 1 and
+// the product dies (skin lost its red that way). copying the constant into
+// channel 0 changes nothing on hardware (x isn't written), and makes vita3k
+// read the right value. v3k_gxp_fix=0 in config.txt turns it off.
+extern int config_int(const char *key, int def);
+static int gxp_fix_imm_swizzle(SceGxmProgram *gxp)
+{
+  uint8_t *d = (uint8_t *)gxp;
+  uint32_t size, cnt[2], off[2];
+  memcpy(&size, d + 8, 4);
+  memcpy(&cnt[0], d + 0x3C, 4); memcpy(&off[0], d + 0x40, 4); off[0] += 0x40;  // primary
+  memcpy(&cnt[1], d + 0x44, 4); memcpy(&off[1], d + 0x48, 4); off[1] += 0x48;  // secondary
+  int fixed = 0;
+  for (int k = 0; k < 2; k++) {
+    if (off[k] > size || cnt[k] > (size - off[k]) / 8) continue;
+    for (uint32_t i = 0; i < cnt[k]; i++) {
+      uint64_t v;
+      memcpy(&v, d + off[k] + i * 8, 8);
+      unsigned op = (unsigned)(v >> 59);
+      if (op != 1 && op != 2) continue;                        // VNMAD32 / VNMAD16
+      if (!((v >> 49) & 1) || ((v >> 30) & 3) != 2) continue;  // src1 = immediate bank
+      unsigned mask = (unsigned)(v >> 39) & 15;
+      if (mask != 2 && mask != 4 && mask != 8) continue;       // one component, not x
+      // src1 swizzle, 3 bits a channel, scattered over the word
+      unsigned ch = mask == 2 ? (unsigned)(v >> 18) & 7
+                  : mask == 4 ? (unsigned)(((v >> 21) & 1) | (((v >> 34) & 3) << 1))
+                              : (unsigned)(((v >> 50) & 1) | (((v >> 53) & 3) << 1));
+      if (ch < 4 || ((v >> 15) & 7) == ch) continue;           // 4..7 = constants 0, 1, 2, 0.5
+      v = (v & ~((uint64_t)7 << 15)) | ((uint64_t)ch << 15);
+      memcpy(d + off[k] + i * 8, &v, 8);
+      fixed++;
+    }
+  }
+  return fixed;
+}
+
 // p->vgxp / p->fgxp are set. patcher + gxp lookups, render thread only
 static int link_back(gl_program *p, char **log)
 {
+  static int v3k_fix = -1;
+  if (v3k_fix < 0) v3k_fix = emu_is_vita3k() && config_int("v3k_gxp_fix", 1);
+  if (v3k_fix) {
+    int n = gxp_fix_imm_swizzle(p->vgxp) + gxp_fix_imm_swizzle(p->fgxp);
+    static int total, logged;
+    total += n;
+    if (n && logged++ < 4) L("shader: vita3k immediate-swizzle fix: %d instr in prog %u (%d so far)", n, p->name, total);
+  }
   int e1 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->vgxp, &p->vid);
   int e2 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->fgxp, &p->fid);
   if (e1 < 0 || e2 < 0) {
