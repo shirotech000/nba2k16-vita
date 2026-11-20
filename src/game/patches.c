@@ -87,10 +87,47 @@ static void patch_heap_grow(so_module *game) {
     L("patch: VCHEAP2 grow step 4MB -> %dMB", mb);
 }
 
+// the game's video settings (crowd / crowd2d / stadium / player / shadow /
+// sideline / frontend / reflection / presentation lighting LOD) live in one
+// global struct and default low on this build. the crowd renderer only draws
+// its full 3d sections at crowd lod 3 (it literally checks for 3), so a low
+// default means an empty arena. force every LOD getter to its max (3 = HIGH,
+// the only LOD word in the game's strings). quality_max=0 puts them back
+static int quality_lod_max(void) { return 3; }
+
+static void patch_video_lods(so_module *game) {
+  if (!config_int("quality_max", 1)) return;
+  static const struct { uint32_t off, w0, w1; const char *name; } lods[] = {
+    { 0x81EF80, 0xE59F3004, 0xE59F0003, "crowd" },
+    { 0x81EFA4, 0xE59F3008, 0xE08F3003, "player" },
+    { 0x81EFCC, 0xE59F3008, 0xE08F3003, "reflection" },
+    { 0x81EFF4, 0xE59F3008, 0xE08F3003, "sideline" },
+    { 0x81F01C, 0xE59F3008, 0xE08F3003, "shadow" },
+    { 0x81F044, 0xE59F3008, 0xE08F3003, "stadium" },
+    { 0x81F06C, 0xE59F3008, 0xE08F3003, "frontend" },
+    { 0x81F094, 0xE59F3008, 0xE08F3003, "crowd2d" },
+    { 0x81F0BC, 0xE59F3008, 0xE08F3003, "presentation lighting" },
+  };
+  int n = 0;
+  for (unsigned i = 0; i < sizeof(lods) / sizeof(lods[0]); i++) {
+    uint32_t *p = (uint32_t *)(game->base + lods[i].off);
+    if (p[0] != lods[i].w0 || p[1] != lods[i].w1) {
+      L("patch: %s lod getter skipped, +0x%X is %08X %08X (different game version?)",
+        lods[i].name, lods[i].off, p[0], p[1]);
+      continue;
+    }
+    p[0] = 0xE51FF004;   // ldr pc, [pc, #-4]
+    p[1] = (uint32_t)(uintptr_t)quality_lod_max;
+    n++;
+  }
+  if (n) L("patch: %d video LOD getters -> max (3)", n);
+}
+
 void patches_apply(so_module *game) {
   patch_global_heap(game);
   patch_delete_retries(game);
   patch_heap_grow(game);
+  patch_video_lods(game);
   extern void textinput_install(so_module *game);
   textinput_install(game);
 }
