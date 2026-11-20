@@ -90,26 +90,29 @@ static void patch_heap_grow(so_module *game) {
 // the game's video settings (crowd / crowd2d / stadium / player / shadow /
 // sideline / frontend / reflection / presentation lighting LOD) live in one
 // global struct and default low on this build. the crowd renderer only draws
-// its full 3d sections at crowd lod 3 (it literally checks for 3), so a low
-// default means an empty arena. force every LOD getter to its max (3 = HIGH,
-// the only LOD word in the game's strings). quality_max=0 puts them back
+// its full 3d sections at crowd lod 3 (it literally checks for 3). forcing
+// ALL of them to max blew the memory budget ~35MB over and the match load
+// died at 76% (hw29), so the default only forces the arena set; quality_max=0
+// disables, quality_max_all=1 forces every getter for testing
 static int quality_lod_max(void) { return 3; }
 
 static void patch_video_lods(so_module *game) {
+  int all = config_int("quality_max_all", 0);
   if (!config_int("quality_max", 1)) return;
-  static const struct { uint32_t off, w0, w1; const char *name; } lods[] = {
-    { 0x81EF80, 0xE59F3004, 0xE59F0003, "crowd" },
-    { 0x81EFA4, 0xE59F3008, 0xE08F3003, "player" },
-    { 0x81EFCC, 0xE59F3008, 0xE08F3003, "reflection" },
-    { 0x81EFF4, 0xE59F3008, 0xE08F3003, "sideline" },
-    { 0x81F01C, 0xE59F3008, 0xE08F3003, "shadow" },
-    { 0x81F044, 0xE59F3008, 0xE08F3003, "stadium" },
-    { 0x81F06C, 0xE59F3008, 0xE08F3003, "frontend" },
-    { 0x81F094, 0xE59F3008, 0xE08F3003, "crowd2d" },
-    { 0x81F0BC, 0xE59F3008, 0xE08F3003, "presentation lighting" },
+  static const struct { uint32_t off, w0, w1; const char *name; int arena; } lods[] = {
+    { 0x81EF80, 0xE59F3004, 0xE79F0003, "crowd", 1 },
+    { 0x81EFA4, 0xE59F3008, 0xE08F3003, "player", 0 },
+    { 0x81EFCC, 0xE59F3008, 0xE08F3003, "reflection", 0 },
+    { 0x81EFF4, 0xE59F3008, 0xE08F3003, "sideline", 0 },
+    { 0x81F01C, 0xE59F3008, 0xE08F3003, "shadow", 0 },
+    { 0x81F044, 0xE59F3008, 0xE08F3003, "stadium", 1 },
+    { 0x81F06C, 0xE59F3008, 0xE08F3003, "frontend", 0 },
+    { 0x81F094, 0xE59F3008, 0xE08F3003, "crowd2d", 1 },
+    { 0x81F0BC, 0xE59F3008, 0xE08F3003, "presentation lighting", 0 },
   };
   int n = 0;
   for (unsigned i = 0; i < sizeof(lods) / sizeof(lods[0]); i++) {
+    if (!lods[i].arena && !all) continue;
     uint32_t *p = (uint32_t *)(game->base + lods[i].off);
     if (p[0] != lods[i].w0 || p[1] != lods[i].w1) {
       L("patch: %s lod getter skipped, +0x%X is %08X %08X (different game version?)",
@@ -120,7 +123,7 @@ static void patch_video_lods(so_module *game) {
     p[1] = (uint32_t)(uintptr_t)quality_lod_max;
     n++;
   }
-  if (n) L("patch: %d video LOD getters -> max (3)", n);
+  if (n) L("patch: %d video LOD getters -> max (3)%s", n, all ? " (all)" : "");
 }
 
 void patches_apply(so_module *game) {
