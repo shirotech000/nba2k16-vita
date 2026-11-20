@@ -70,9 +70,27 @@ static void patch_delete_retries(so_module *game) {
     L("patch: DeleteFile_LowLevel retries 33 -> 1");
 }
 
+// VCHEAP2 grows in steps of at least 4MB (mov r2,#0x400000 in VCHEAP2::Init,
+// read by GrowMemory as max(request + overhead, floor)). late in a load no
+// 4MB hole is left anywhere and the game crashes on the NULL (career mode,
+// match loads). 1MB steps fit the smaller gaps that are still around.
+// heap_grow_mb=4 puts the original back.
+static void patch_heap_grow(so_module *game) {
+  int mb = config_int("heap_grow_mb", 1);
+  uint32_t enc;
+  switch (mb) {
+    case 1: enc = 0xE3A02601; break;   // mov r2, #0x100000
+    case 2: enc = 0xE3A02602; break;   // mov r2, #0x200000
+    default: return;                   // 4 = leave it alone
+  }
+  if (!patch_word(game, 0x132AA08, 0xE3A02501, enc, "VCHEAP2 grow step"))
+    L("patch: VCHEAP2 grow step 4MB -> %dMB", mb);
+}
+
 void patches_apply(so_module *game) {
   patch_global_heap(game);
   patch_delete_retries(game);
+  patch_heap_grow(game);
 }
 
 // --- heap monitor: is the game's own heap actually full? ---
