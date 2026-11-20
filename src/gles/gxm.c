@@ -933,9 +933,9 @@ SceGxmMultisampleMode gxm_msaa_setting(void)
 {
   static int v = -1;
   if (v < 0) {
-    // off by default until texture memory gets smaller: its 8MB depth twin
-    // was the difference between a match loading or not (msaa=4 to turn on)
-    v = config_int("msaa", 0);
+    // on by default now that textures fit (bc + mapped vbos + mip fallback).
+    // its 8MB depth twin once broke match loads. msaa=0 turns it off
+    v = config_int("msaa", 4);
     L("gxm: msaa %dx (msaa=0/2/4 in config.txt)", v == 4 || v == 2 ? v : 0);
   }
   return v == 4 ? SCE_GXM_MULTISAMPLE_4X : v == 2 ? SCE_GXM_MULTISAMPLE_2X : SCE_GXM_MULTISAMPLE_NONE;
