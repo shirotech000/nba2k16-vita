@@ -1,10 +1,14 @@
 // sceGxm device: memory, rings, scenes, display. written straight against
 // sony's gxm api, see gxm.h for the overview.
 #include "gles/gxm.h"
+#include "util/paths.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <psp2/display.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
@@ -815,10 +819,57 @@ void gxm_display_target(gxm_target *out)
 void *gxm_back_buffer(void) { return g_disp_mb[g_back].base; }
 void *gxm_front_buffer(void) { return g_disp_mb[g_front].base; }
 
+// screenshots: drop an (empty) ux0:data/nba2k16/shot.flag and the next frame
+// lands in shots/ as a bmp. only ever captures our own frames, works the
+// same in vita3k and on hw. checked every 30 frames so it costs nothing.
+static void maybe_screenshot(void)
+{
+  if (g_frame % 30) return;
+  SceIoStat st;
+  if (sceIoGetstat(DATA_PATH "/shot.flag", &st) < 0) return;
+  sceIoRemove(DATA_PATH "/shot.flag");
+  sceGxmFinish(gxm_ctx);  // back buffer has to be done before we read it
+
+  static const int W = SCREEN_W, H = SCREEN_H, ROW = SCREEN_W * 3;
+  uint8_t *row = malloc(ROW);
+  if (!row) return;
+  char path[96];
+  sceIoMkdir(DATA_PATH "/shots", 0777);
+  snprintf(path, sizeof(path), DATA_PATH "/shots/frame%06u.bmp", (unsigned)g_frame);
+  SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+  if (fd < 0) { free(row); return; }
+
+  uint8_t hdr[54] = { 'B', 'M' };
+  uint32_t img = ROW * H, v;
+  v = 54 + img; memcpy(hdr + 2, &v, 4);
+  v = 54;       memcpy(hdr + 10, &v, 4);
+  v = 40;       memcpy(hdr + 14, &v, 4);
+  v = W;        memcpy(hdr + 18, &v, 4);
+  v = H;        memcpy(hdr + 22, &v, 4);  // positive = bottom-up rows
+  hdr[26] = 1; hdr[28] = 24;
+  memcpy(hdr + 34, &img, 4);
+  sceIoWrite(fd, hdr, sizeof(hdr));
+
+  const uint8_t *fb = g_disp_mb[g_back].base;  // A8B8G8R8 = bytes r,g,b,a
+  for (int y = H - 1; y >= 0; y--) {
+    const uint8_t *s = fb + (size_t)y * DISPLAY_STRIDE * 4;
+    for (int x = 0; x < W; x++) {
+      row[x * 3 + 0] = s[x * 4 + 2];
+      row[x * 3 + 1] = s[x * 4 + 1];
+      row[x * 3 + 2] = s[x * 4 + 0];
+    }
+    sceIoWrite(fd, row, ROW);
+  }
+  sceIoClose(fd);
+  free(row);
+  L("gxm: screenshot -> %s", path);
+}
+
 void gxm_swap(void)
 {
   if (!g_ready) return;
   gxm_end_scene();
+  if (!g_dry_run) maybe_screenshot();
 
   if (g_dry_run) {
     // no flip, just keep the game's frame pacing roughly where vsync had it
