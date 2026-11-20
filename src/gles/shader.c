@@ -170,6 +170,18 @@ static void shacc_free(void *p) {
   free(p);
 }
 
+static SceUID g_shacc_mod = -1;
+
+// boot precompile is done: hand the compiler's 3.4MB back before the game
+// starts. a later cache miss just loads it again
+void shacc_unload(void)
+{
+  if (g_shacc != 1 || g_shacc_mod < 0) return;
+  int r = sceKernelStopUnloadModule(g_shacc_mod, 0, NULL, 0, NULL, NULL);
+  L("shader: libshacccg unloaded after the boot precompile (0x%08X)", r);
+  if (r >= 0) { g_shacc = 0; g_shacc_mod = -1; }
+}
+
 int shacc_ready(void)
 {
   if (g_shacc) return g_shacc > 0;
@@ -180,6 +192,7 @@ int shacc_ready(void)
   while (__sync_lock_test_and_set(&busy, 1)) sceKernelDelayThread(1000);
   if (g_shacc) { __sync_lock_release(&busy); return g_shacc > 0; }
   SceUID id = sceKernelLoadStartModule(SHACCCG_PATH, 0, NULL, 0, NULL, NULL);
+  g_shacc_mod = id;
   if (id < 0) {
     g_shacc = -1;
     __sync_lock_release(&busy);
@@ -1262,6 +1275,128 @@ static void tcache_store(const char *vs, const char *fs, const g2c_result *r)
   sceIoClose(fd);
 }
 
+// ---- shader manifest + boot precompile ----
+// every glsl pair the game links gets recorded (the user's own data, on
+// their vita, never shipped). next boot, bootscreen.c compiles whatever the
+// cache is missing behind a progress screen, while memory is still free.
+// manifest.bin = records {magic, vs_len, fs_len, vs, fs}, manifest.idx = one
+// u64 hash per record (dedupe without reading the sources), manifest.done =
+// u32 count of records the boot pass already went through.
+#define MAN_BIN  SHADER_CACHE "/manifest.bin"
+#define MAN_IDX  SHADER_CACHE "/manifest.idx"
+#define MAN_DONE SHADER_CACHE "/manifest.done"
+#define MAN_MAGIC 0x31464D4Eu  // "NMF1"
+
+static uint64_t *man_set;
+static uint32_t man_cap, man_n;
+static int man_ready;
+static SceKernelLwMutexWork man_lock;
+
+static uint64_t man_hash(const char *vs, const char *fs)
+{
+  uint64_t h = hash64(vs, strlen(vs)) * 31 + hash64(fs, strlen(fs));
+  return h ? h : 1;
+}
+
+static int man_has(uint64_t h)
+{
+  if (!man_cap) return 0;
+  for (uint32_t i = (uint32_t)h & (man_cap - 1);; i = (i + 1) & (man_cap - 1)) {
+    if (!man_set[i]) return 0;
+    if (man_set[i] == h) return 1;
+  }
+}
+
+static int man_insert(uint64_t h)
+{
+  if ((man_n + 1) * 2 > man_cap) {
+    uint32_t nc = man_cap ? man_cap * 2 : 1024;
+    uint64_t *ns = calloc(nc, sizeof(uint64_t));
+    if (!ns) return -1;
+    for (uint32_t i = 0; i < man_cap; i++) {
+      if (!man_set[i]) continue;
+      uint32_t j = (uint32_t)man_set[i] & (nc - 1);
+      while (ns[j]) j = (j + 1) & (nc - 1);
+      ns[j] = man_set[i];
+    }
+    free(man_set);
+    man_set = ns;
+    man_cap = nc;
+  }
+  uint32_t i = (uint32_t)h & (man_cap - 1);
+  while (man_set[i]) i = (i + 1) & (man_cap - 1);
+  man_set[i] = h;
+  man_n++;
+  return 0;
+}
+
+void shader_manifest_load(void)
+{
+  if (man_ready) return;
+  sceKernelCreateLwMutex(&man_lock, "manifest", 0, 0, NULL);
+  SceUID fd = sceIoOpen(MAN_IDX, SCE_O_RDONLY, 0);
+  if (fd >= 0) {
+    uint64_t buf[256];
+    SceSSize n;
+    while ((n = sceIoRead(fd, buf, sizeof(buf))) > 0)
+      for (int i = 0; i < n / 8; i++) if (!man_has(buf[i])) man_insert(buf[i]);
+    sceIoClose(fd);
+  }
+  man_ready = 1;
+  L("shader: manifest has %u recorded pairs", man_n);
+}
+
+uint32_t shader_manifest_count(void) { return man_n; }
+
+static void man_record(const char *vs, const char *fs)
+{
+  if (!man_ready || !vs || !fs) return;
+  uint64_t h = man_hash(vs, fs);
+  sceKernelLockLwMutex(&man_lock, 1, NULL);
+  if (man_has(h) || man_insert(h) < 0) { sceKernelUnlockLwMutex(&man_lock, 1); return; }
+  uint32_t hdr[3] = { MAN_MAGIC, (uint32_t)strlen(vs), (uint32_t)strlen(fs) };
+  SceUID fd = sceIoOpen(MAN_BIN, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
+  if (fd >= 0) {
+    sceIoWrite(fd, hdr, sizeof(hdr));
+    sceIoWrite(fd, vs, hdr[1]);
+    sceIoWrite(fd, fs, hdr[2]);
+    sceIoClose(fd);
+    fd = sceIoOpen(MAN_IDX, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
+    if (fd >= 0) { sceIoWrite(fd, &h, 8); sceIoClose(fd); }
+  }
+  sceKernelUnlockLwMutex(&man_lock, 1);
+}
+
+typedef struct { const char *vs, *fs; int ok; } pre_job;
+
+static void pre_fn(void *arg)
+{
+  pre_job *pj = arg;
+  g2c_result *r = calloc(1, sizeof(*r));
+  if (!r) return;
+  if (!tcache_load(pj->vs, pj->fs, r)) {
+    if (g2c_translate(pj->vs, pj->fs, r) != 0) { g2c_free(r); free(r); return; }
+    tcache_store(pj->vs, pj->fs, r);
+  }
+  char *log = NULL;
+  SceGxmProgram *v = shacc_compile(r->vs_cg, 0, &log);
+  SceGxmProgram *f = v ? shacc_compile(r->fs_cg, 1, &log) : NULL;
+  pj->ok = v && f;
+  free(v);
+  free(f);
+  free(log);
+  g2c_free(r);
+  free(r);
+}
+
+// translate (cached) + compile both stages into the gxp cache. 0 ok
+int shader_precompile(const char *vs, const char *fs)
+{
+  pre_job pj = { vs, fs, 0 };
+  run_on_big_stack(pre_fn, &pj);
+  return pj.ok ? 0 : -1;
+}
+
 // everything after translation. small stack use unless it has to compile
 // inline (async off), so the cached path can run right on the game's thread
 static void link_with(link_job *lj, gl_program *p, gl_shader *vs, gl_shader *fs, g2c_result *r)
@@ -1358,6 +1493,10 @@ void glLinkProgram(GLuint prog)
 
   char *log = j.log;
   p->linked = j.ok;
+  if (j.ok) {
+    gl_shader *mvs = sh_get(p->vs), *mfs = sh_get(p->fs);
+    if (mvs && mfs) man_record(mvs->src, mfs->src);
+  }
   p->log = log;
   if (!p->linked) {
     L("!!!! shader: LINK FAILED for program %u (vs %u fs %u):\n%s", prog, p->vs, p->fs, log ? log : "?");

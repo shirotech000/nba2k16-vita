@@ -135,6 +135,8 @@ int main(void) {
 
   log_free_mem("before gfx_init");
   if (gfx_init) gfx_init();
+  extern void bootscreen_run(void) __attribute__((weak));
+  if (bootscreen_run) bootscreen_run();   // "preparing for first launch" if shaders are missing
 
   int (*jni_onload)(void *vm, void *reserved) = (void *)so_symbol(&game_mod, "JNI_OnLoad");
   void *on_create = (void *)so_symbol(&game_mod, "ANativeActivity_onCreate");

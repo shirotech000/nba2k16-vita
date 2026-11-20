@@ -23,6 +23,9 @@ void gfx_init(void)
   shader_init();
 }
 
+static void ensure_init(void);
+void gl_boot_ensure(void) { ensure_init(); }
+
 static void ensure_init(void)
 {
   if (!gxm_ready()) gfx_init();
