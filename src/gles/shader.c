@@ -1188,6 +1188,8 @@ typedef struct compile_job {
   struct compile_job *next;
 } compile_job;
 
+static void queue_job(compile_job *j);
+
 static SceKernelLwMutexWork q_lock;
 static SceUID q_sema = -1;
 static compile_job *q_head, *q_tail;
@@ -1217,6 +1219,29 @@ static int compile_worker(SceSize args, void *argp)
 
     SceUInt64 now = sceKernelGetProcessTimeWide();
     if (j->not_before > now) sceKernelDelayThread((SceUInt32)(j->not_before - now));
+    // don't feed the compiler while the system is at its floors: its
+    // allocator hooks hand it whatever malloc returns and it derefs NULL
+    // (hw34/38: data aborts inside SceShaccCg at the load's peak). the game
+    // skips draws with pending programs anyway, so waiting costs a few
+    // skipped frames instead of a dead loader thread. requeued at the tail
+    // so other pending jobs still get their turn
+    {
+      SceKernelFreeMemorySizeInfo fi;
+      memset(&fi, 0, sizeof(fi));
+      fi.size = sizeof(fi);
+      sceKernelGetFreeMemorySize(&fi);
+      if ((int)fi.size_user < 4 * 1024 * 1024 && (int)fi.size_cdram < 2 * 1024 * 1024) {
+        static int deferred;
+        if (deferred++ < 8 || !(deferred & 63))
+          L("shader: deferring a compile, memory is at the floors (user %uK cdram %uK)",
+            (unsigned)(fi.size_user >> 10), (unsigned)(fi.size_cdram >> 10));
+        __sync_sub_and_fetch(&q_pending, 1);
+        j->not_before = now + 1000000;
+        j->next = NULL;
+        queue_job(j);
+        continue;
+      }
+    }
     j->attempts++;
     if (!j->vgxp) j->vgxp = shacc_compile(j->vcg, 0, &j->log);
     if (j->vgxp && !j->fgxp) j->fgxp = shacc_compile(j->fcg, 1, &j->log);

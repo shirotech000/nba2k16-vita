@@ -779,12 +779,11 @@ static void hint_check(gl_texture *nt)
 
 // budget mode: when the pool runs low, big new chains go straight to a
 // reduced size instead of eating the last mb and forcing every texture
-// after them into the white dummy (hw: the career load lost 43 textures
-// and the heads + crowd with them). returns the skip level, 0 = store full.
-// tex_half=1 (default): every mipped chain big enough to matter starts at
-// half resolution - stage, character, crowd textures - freeing the pool so
-// the crowd sections fit (owner: "compromise on all stage/character
-// textures"). ui art has no mips and stays full. tex_half=0 puts it back
+// after them into the white dummy. returns the skip level, 0 = store full.
+// the unconditional version mangled the title splash (hw38: stored at half
+// on a guess, no mip ever arrived, white screen), so level 0 always stores
+// full - the tex_half halving now happens in the chain-growth path where a
+// mip level proves it belongs to a mipmapped texture
 static unsigned budget_skip(unsigned w, unsigned h, const shape *full, uint32_t *kb_out)
 {
   static int on = -1;
@@ -794,18 +793,10 @@ static unsigned budget_skip(unsigned w, unsigned h, const shape *full, uint32_t 
   }
   if (!on) return 0;
   if (shape_bytes(full) < 128 * 1024) return 0;   // small ones aren't the problem
-  static int half = -1;
-  if (half < 0) {
-    extern int config_int(const char *key, int def);
-    half = config_int("tex_half", 1);
-  }
   extern uint32_t gxm_pool_free_kb(void);
   uint32_t kb = gxm_pool_free_kb();
   if (kb_out) *kb_out = kb;
-  unsigned sk = half ? 1 : 0;
-  if (kb < 2 * 1024) { if (sk < 3) sk = 3; }
-  else if (kb < 4 * 1024) { if (sk < 2) sk = 2; }
-  else if (kb < 9 * 1024) { if (sk < 1) sk = 1; }
+  unsigned sk = kb < 2 * 1024 ? 3 : kb < 4 * 1024 ? 2 : kb < 9 * 1024 ? 1 : 0;
   if (!sk) return 0;
   unsigned hw = w >> sk, hh = h >> sk;
   if (hw < 8 || hh < 8) return 0;
@@ -894,12 +885,32 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
       L_ONCE("tex: level %u is %ux%u, doesn't fit level 0 %ux%u, dropped", level, w, h, t->w, t->h);
       return -1;
     }
-    // budget mode: don't grow the chain while the pool is low. level 0
-    // stays sharp and the mips just don't come, better than the pressure
-    // this growth would put on everything still to load
+    // budget mode + tex_half: the arriving mip level proves this texture
+    // belongs to a mipmapped one. re-store the chain at a reduced size and
+    // the arriving level fills the new level 0 - the full-res block goes
+    // back, a quarter of the memory. textures that never send mips (title
+    // splash art, hw38's white screen) never reach this path and keep
+    // their full level 0
     {
       shape fs = make_shape(t->w, t->h, t->bpp, 0, n, fmt_bc(t->fmt) != 0);
-      if (budget_skip(t->w, t->h, &fs, NULL)) {
+      static int half = -1;
+      if (half < 0) {
+        extern int config_int(const char *key, int def);
+        half = config_int("tex_half", 1);
+      }
+      unsigned sk = t->skip ? 0 : budget_skip(t->w, t->h, &fs, NULL);
+      if (!sk && half && !t->skip) sk = 1;
+      if (sk && (t->w >> sk) >= 8 && (t->h >> sk) >= 8) {
+        unsigned hw = t->w >> sk, hh = t->h >> sk;
+        shape hs = make_shape(hw, hh, t->bpp, 0, chain_len(hw, hh), fmt_bc(t->fmt) != 0);
+        if (tex_realloc(t, &hs, NULL, 0, -1, -1) == 0) {
+          t->skip = sk;
+          static unsigned n_half;
+          if (n_half++ < 16 || (n_half & 63) == 0)
+            L("tex: %ux%u texture %u halved to %ux%u (budget)", t->w, t->h, t->name, hw, hh);
+          return 0;   // the arriving level lands in the new level 0 through skip
+        }
+        // even the smaller store failed: the pool is truly out. don't grow
         static unsigned n_grow;
         if (n_grow++ < 16 || (n_grow & 63) == 0)
           L("tex: mip growth of texture %u skipped (budget)", t->name);
