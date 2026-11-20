@@ -173,11 +173,12 @@ static void *bigmem_alloc_inner(size_t n, int urgent, int no_release) {
         sceKernelUnlockLwMutex(&lock, 1);
         return bp;
       }
-      // a big ask with nowhere to go: hand the gl pool's empty chunks back
+      // an ask with nowhere to go: hand the gl pool's empty chunks back
       // and run the deferred gpu frees (the match scene's already-freed
       // blocks waiting on the gpu), then try the whole chain again once.
-      // the career exit died on exactly this (hw26/28/29)
-      if (n >= 4 * 1024 * 1024 && !no_release) {
+      // >=1MB: the load's tail dies on ~2MB asks (hw35: 1.9MB at the floors
+      // with every pool fragmented below that size)
+      if (n >= 1024 * 1024 && !no_release) {
         extern uint32_t gxm_pool_release_empty(void);
         extern uint32_t gxm_defer_drain(void);
         uint32_t got = gxm_pool_release_empty();
