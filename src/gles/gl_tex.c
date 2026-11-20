@@ -777,6 +777,30 @@ static void hint_check(gl_texture *nt)
   }
 }
 
+// budget mode: when the pool runs low, big new chains go straight to a
+// reduced size instead of eating the last mb and forcing every texture
+// after them into the white dummy (hw: the career load lost 43 textures
+// and the heads + crowd with them). returns the skip level, 0 = store full.
+// tex_budget=0 turns it off
+static unsigned budget_skip(unsigned w, unsigned h, const shape *full, uint32_t *kb_out)
+{
+  static int on = -1;
+  if (on < 0) {
+    extern int config_int(const char *key, int def);
+    on = config_int("tex_budget", 1);
+  }
+  if (!on) return 0;
+  if (shape_bytes(full) < 128 * 1024) return 0;   // small ones aren't the problem
+  extern uint32_t gxm_pool_free_kb(void);
+  uint32_t kb = gxm_pool_free_kb();
+  if (kb_out) *kb_out = kb;
+  unsigned sk = kb < 2 * 1024 ? 3 : kb < 4 * 1024 ? 2 : kb < 9 * 1024 ? 1 : 0;
+  if (!sk) return 0;
+  unsigned hw = w >> sk, hh = h >> sk;
+  if (hw < 8 || hh < 8) return 0;
+  return sk;
+}
+
 // get 2d storage ready for (level, w, h). 0 ok, -1 upload dropped, -2 oom
 static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const fmt_info *fi, int has_data)
 {
@@ -791,6 +815,25 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
     if (pow2 && (keep || (has_data && g_mip_hint && is_mip_filter(t->min_filter))))
       levels = chain_len(w, h);
     shape ns = make_shape(w, h, fi->bpp, 0, levels, fi->bc != 0);
+    // low pool: store it reduced right away instead of trying full size and
+    // risking whatever loads after it. only with mips coming (levels > 1),
+    // skip mode drops level 0 and waits for the smaller ones
+    if (pow2 && has_data && levels > 1) {
+      uint32_t kb = 0;
+      unsigned sk = budget_skip(w, h, &ns, &kb);
+      if (sk) {
+        unsigned hw = w >> sk, hh = h >> sk;
+        shape hs = make_shape(hw, hh, fi->bpp, 0, chain_len(hw, hh), fi->bc != 0);
+        if (tex_realloc(t, &hs, fi, 0, 0, 0) == 0) {
+          t->skip = sk;
+          t->chain_guess = 0;
+          static unsigned n_bud;
+          if (n_bud++ < 16 || (n_bud & 63) == 0)
+            L("tex: %ux%u texture %u stored at %ux%u (budget, %uK left)", w, h, t->name, hw, hh, kb);
+          return -3;
+        }
+      }
+    }
     if (tex_realloc(t, &ns, fi, keep, 0, 0) < 0) {
       // near the limit: level 0 alone beats the white dummy
       ns = make_shape(w, h, fi->bpp, 0, 1, fi->bc != 0);
@@ -839,6 +882,18 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
     if (lvl_dim(t->w, level) != w || lvl_dim(t->h, level) != h) {
       L_ONCE("tex: level %u is %ux%u, doesn't fit level 0 %ux%u, dropped", level, w, h, t->w, t->h);
       return -1;
+    }
+    // budget mode: don't grow the chain while the pool is low. level 0
+    // stays sharp and the mips just don't come, better than the pressure
+    // this growth would put on everything still to load
+    {
+      shape fs = make_shape(t->w, t->h, t->bpp, 0, n, fmt_bc(t->fmt) != 0);
+      if (budget_skip(t->w, t->h, &fs, NULL)) {
+        static unsigned n_grow;
+        if (n_grow++ < 16 || (n_grow & 63) == 0)
+          L("tex: mip growth of texture %u skipped (budget)", t->name);
+        return -1;
+      }
     }
     shape ns = make_shape(t->w, t->h, t->bpp, 0, n, fmt_bc(t->fmt) != 0);
     return tex_realloc(t, &ns, NULL, 1, -1, -1) < 0 ? -2 : 0;
