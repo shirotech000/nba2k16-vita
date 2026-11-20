@@ -171,9 +171,16 @@ static void shacc_free(void *p) {
 int shacc_ready(void)
 {
   if (g_shacc) return g_shacc > 0;
+  // loaded on the first cache miss, not at boot: with a warm cache the
+  // compiler (3.4MB module) never has to sit in memory. the worker and the
+  // render thread can both land here, one loads and the other waits
+  static volatile int busy;
+  while (__sync_lock_test_and_set(&busy, 1)) sceKernelDelayThread(1000);
+  if (g_shacc) { __sync_lock_release(&busy); return g_shacc > 0; }
   SceUID id = sceKernelLoadStartModule(SHACCCG_PATH, 0, NULL, 0, NULL, NULL);
   if (id < 0) {
     g_shacc = -1;
+    __sync_lock_release(&busy);
     L("=====================================================================");
     L("shader: can't load %s (0x%08X)", SHACCCG_PATH, id);
     L("shader: put libshacccg.suprx in ur0:data/ (dump it from your vita),");
@@ -183,7 +190,8 @@ int shacc_ready(void)
   }
   sceShaccCgSetDefaultAllocator(shacc_malloc, shacc_free);
   g_shacc = 1;
-  L("shader: libshacccg loaded (%s)", sceShaccCgGetVersionString());
+  __sync_lock_release(&busy);
+  L("shader: libshacccg loaded on a cache miss (%s)", sceShaccCgGetVersionString());
   return 1;
 }
 
@@ -521,7 +529,7 @@ void shader_init(void)
   sceIoMkdir(DATA_PATH, 0777);
   sceIoMkdir(SHADER_CACHE, 0777);
   sceIoMkdir(SHADERFAIL_DIR, 0777);
-  shacc_ready();
+  // no shacc_ready() here anymore, the compiler loads on the first cache miss
   if (gxm_ready()) run_on_big_stack(clear_init_job, NULL);
 }
 

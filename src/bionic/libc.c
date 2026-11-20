@@ -21,6 +21,7 @@
 #include "bionic/bionic.h"
 #include "util/cpu.h"
 #include "bionic/bigmem.h"
+#include "bionic/spill.h"
 
 // --- malloc with stats, memory is THE question for this port ---
 static volatile int mem_live, mem_peak, mem_biggest, mem_fails, mem_count;
@@ -58,6 +59,7 @@ static void mem_add(void *p, size_t req) {
 
 // usable size of any pointer we handed out, newlib or cdram
 static size_t usable(void *p) {
+  if (spill_owns(p)) return spill_usable(p);
   size_t s = bigmem_size(p);
   return s ? s : malloc_usable_size(p);
 }
@@ -107,7 +109,7 @@ static void *alloc_any(size_t n) {
   if (p) return p;
   if (n < BIG_MIN) {
     // small ones don't wait, but a NULL still crashes the game
-    return n >= 16 * 1024 ? bigmem_alloc_ex(n, 1) : NULL;
+    return n < FALLBACK_MIN ? spill_alloc(n) : bigmem_alloc_ex(n, 1);
   }
   // everything's at its reserve. loading is bursty and other threads drop
   // their temp buffers all the time, so give it a couple seconds before
@@ -130,7 +132,8 @@ static void *alloc_any(size_t n) {
 }
 
 static void free_any(void *p) {
-  if (bigmem_owns(p)) bigmem_free(p);
+  if (spill_owns(p)) spill_free(p);
+  else if (bigmem_owns(p)) bigmem_free(p);
   else free(p);
 }
 
@@ -148,7 +151,7 @@ static void *b_realloc(void *p, size_t n) {
   if (!n) { b_free(p); return NULL; }
   size_t old = usable(p);
   void *q = NULL;
-  if (!bigmem_owns(p)) q = realloc(p, n);
+  if (!bigmem_owns(p) && !spill_owns(p)) q = realloc(p, n);
   if (!q) {
     // cdram block, or newlib couldn't grow it: allocate fresh and copy
     q = alloc_any(n);
@@ -164,7 +167,8 @@ static void *b_realloc(void *p, size_t n) {
 static void *b_memalign(size_t a, size_t n) {
   // cdram blocks are 256K aligned, so big aligned requests can go there too
   void *p = memalign(a, n);
-  if (!p && n >= FALLBACK_MIN && a <= 256 * 1024) p = bigmem_alloc(n);
+  if (!p && n >= FALLBACK_MIN && a <= 256 * 1024) p = bigmem_alloc_ex(n, 1);
+  if (!p && n < FALLBACK_MIN && a <= 16) p = spill_alloc(n);
   mem_add(p, n);
   return p;
 }
