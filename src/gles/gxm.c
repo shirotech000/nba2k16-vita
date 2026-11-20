@@ -1,6 +1,7 @@
 // sceGxm device: memory, rings, scenes, display. written straight against
 // sony's gxm api, see gxm.h for the overview.
 #include <kubridge.h>
+#include <psp2/common_dialog.h>
 #include "gles/gxm.h"
 #include "util/paths.h"
 
@@ -1123,6 +1124,25 @@ static void maybe_screenshot(void)
   L("gxm: screenshot -> %s", path);
 }
 
+// a system common dialog (the ime keyboard) is up: it draws itself into our
+// back buffer when we hand it over every frame, after our scene, before the flip
+volatile int g_cdlg_active;
+
+static void common_dialog_update(void)
+{
+  SceCommonDialogUpdateParam up;
+  memset(&up, 0, sizeof(up));
+  up.renderTarget.colorFormat = SCE_GXM_COLOR_FORMAT_A8B8G8R8;
+  up.renderTarget.surfaceType = SCE_GXM_COLOR_SURFACE_LINEAR;
+  up.renderTarget.width = SCREEN_W;
+  up.renderTarget.height = SCREEN_H;
+  up.renderTarget.strideInPixels = DISPLAY_STRIDE;
+  up.renderTarget.colorSurfaceData = g_disp_mb[g_back].base;
+  up.renderTarget.depthSurfaceData = g_depth_mem ? g_depth_mem->ptr : NULL;
+  up.displaySyncObject = g_disp_sync[g_back];
+  sceCommonDialogUpdate(&up);
+}
+
 void gxm_swap(void)
 {
   if (!g_ready) return;
@@ -1142,6 +1162,7 @@ void gxm_swap(void)
     g_ring_used = g_ring_pending = g_ring_head = 0;  // the gpu never reads it
     g_mark_count = 0;
   } else {
+    if (g_cdlg_active) common_dialog_update();
     sceGxmPadHeartbeat(&g_disp_surf[g_back], g_disp_sync[g_back]);
     flip_data d = { g_disp_mb[g_back].base };
     SceUInt64 q0 = sceKernelGetProcessTimeWide();

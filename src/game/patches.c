@@ -91,6 +91,8 @@ void patches_apply(so_module *game) {
   patch_global_heap(game);
   patch_delete_retries(game);
   patch_heap_grow(game);
+  extern void textinput_install(so_module *game);
+  textinput_install(game);
 }
 
 // --- heap monitor: is the game's own heap actually full? ---
