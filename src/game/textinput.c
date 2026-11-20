@@ -2,16 +2,13 @@
 // "hardware keyboard" (VCKEYBOARD), on android that only worked with a real
 // keyboard plugged in. we replace VCKeyboard_IsConnected and
 // VCKeyboard_GetNextCharAndCode: "connected" only while a text field has
-// focus, and then the vita's own ime dialog pops up. on OK its text comes
+// focus, and then our on-screen keyboard (gles/osk.c) pops up. on OK its text comes
 // back as backspaces (clear the old name), the characters, then enter.
 // contract from the vckeyboard analysis: returns 1 if a char is there,
 // wchar_t (32 bit) char, int code, u8 modifier, last arg 1 = peek.
 // enter = 0xFE, backspace = 0xFD.
 #include <stdint.h>
 #include <string.h>
-#include <psp2/ime_dialog.h>
-#include <psp2/common_dialog.h>
-#include <psp2/apputil.h>
 
 #include "loader/so_loader.h"
 #include "util/log.h"
@@ -19,18 +16,16 @@
 #define KEY_ENTER 0xFE
 #define KEY_BACKSPACE 0xFD
 #define QN 256
+#define MAXTEXT 24
 
-extern volatile int g_cdlg_active;   // gxm.c draws common dialogs while set
 
 static int (*g_textedit_active)(void);   // TextEdit_IsActive @ +0x98a098
 static uint32_t q[QN];
 static int qh, qt;
 static int ime_state;                    // 0 idle, 1 dialog up, 2 done for this focus
-static SceWChar16 ime_buf[SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1];
-static SceWChar16 ime_title[16];
-static SceWChar16 ime_empty[1];
+static char ime_buf[MAXTEXT + 1];
 static int jni_mode;          // the game is reading this ime session through jni
-static char jni_text[4 * SCE_IME_DIALOG_MAX_TEXT_LENGTH + 1];
+static char jni_text[MAXTEXT + 1];
 
 static void q_push(uint32_t c)
 {
@@ -40,70 +35,37 @@ static void q_push(uint32_t c)
   qt = n;
 }
 
+// our own on-screen keyboard (gles/osk.c). the system ime dialog started
+// fine but never showed up over our frames on hw
+void osk_open(void);
+int osk_poll(int *ok, char *out, int max);
+
 static void ime_open(void)
 {
-  static int apputil;
-  if (!apputil) {
-    SceAppUtilInitParam ip;
-    SceAppUtilBootParam bp;
-    memset(&ip, 0, sizeof(ip));
-    memset(&bp, 0, sizeof(bp));
-    sceAppUtilInit(&ip, &bp);
-    apputil = 1;
-  }
-  const char *t = "Enter text";
-  for (int i = 0; t[i] && i < 15; i++) ime_title[i] = (SceWChar16)t[i];
   memset(ime_buf, 0, sizeof(ime_buf));
-  SceImeDialogParam p;
-  sceImeDialogParamInit(&p);
-  p.supportedLanguages = 0x0001FFFF;
-  p.languagesForced = SCE_FALSE;
-  p.type = SCE_IME_TYPE_DEFAULT;
-  p.option = 0;
-  p.textBoxMode = SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT;
-  p.title = ime_title;
-  p.maxTextLength = 24;
-  p.initialText = ime_empty;
-  p.inputTextBuffer = ime_buf;
-  int r = sceImeDialogInit(&p);
-  if (r < 0) {
-    L("textinput: sceImeDialogInit failed 0x%08X", r);
-    ime_state = 2;   // don't retry every frame
-    return;
-  }
-  g_cdlg_active = 1;
+  osk_open();
   ime_state = 1;
-  L("textinput: text field focused, ime up");
+  L("textinput: text field focused, keyboard up");
 }
 
 static void ime_poll(void)
 {
-  if (sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) return;
-  SceImeDialogResult res;
-  memset(&res, 0, sizeof(res));
-  sceImeDialogGetResult(&res);
-  if (res.button == SCE_IME_DIALOG_BUTTON_ENTER) {
-    // utf-16 -> utf-8 for getInputText
-    int o = 0, n = 0;
-    for (; ime_buf[n] && n < SCE_IME_DIALOG_MAX_TEXT_LENGTH; n++) {
-      unsigned c = ime_buf[n];
-      if (c < 0x80) jni_text[o++] = (char)c;
-      else if (c < 0x800) { jni_text[o++] = (char)(0xC0 | c >> 6); jni_text[o++] = (char)(0x80 | (c & 63)); }
-      else { jni_text[o++] = (char)(0xE0 | c >> 12); jni_text[o++] = (char)(0x80 | (c >> 6 & 63)); jni_text[o++] = (char)(0x80 | (c & 63)); }
-    }
-    jni_text[o] = 0;
+  int ok = 0;
+  char out[MAXTEXT + 1];
+  if (!osk_poll(&ok, out, sizeof(out))) return;
+  if (ok) {
+    int n = (int)strlen(out);
+    memcpy(jni_text, out, n + 1);   // ascii, already utf-8
     if (!jni_mode) {
       // native text field: feed it as key presses
       for (int i = 0; i < 40; i++) q_push(KEY_BACKSPACE);   // clear what the field had
-      for (int i = 0; i < n; i++) q_push(ime_buf[i]);
+      for (int i = 0; i < n; i++) q_push((unsigned char)out[i]);
       q_push(KEY_ENTER);
     }
-    L("textinput: ime returned %d chars (%s)", n, jni_mode ? "jni" : "keys");
+    L("textinput: keyboard returned %d chars (%s)", n, jni_mode ? "jni" : "keys");
   } else {
-    L("textinput: ime cancelled");
+    L("textinput: keyboard cancelled");
   }
-  sceImeDialogTerm();
-  g_cdlg_active = 0;
   ime_state = 2;
 }
 

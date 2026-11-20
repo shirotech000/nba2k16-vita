@@ -169,6 +169,41 @@ void input_poll(void) {
   memset(&pad, 0, sizeof(pad));
   sceCtrlPeekBufferPositive(0, &pad, 1);
 
+  // on-screen keyboard up: it gets every button and tap, the game nothing.
+  // whatever the game saw held gets released once so nothing sticks
+  extern int osk_active(void);
+  extern void osk_input(unsigned pressed, int tap, int tx, int ty);
+  static int osk_was;
+  if (osk_active()) {
+    if (!osk_was) {
+      for (unsigned i = 0; i < ARRAY_LEN(keymap); i++) {
+        if (!(prev_btn & keymap[i].btn)) continue;
+        vevent e = { 0 };
+        e.type = AINPUT_EVENT_TYPE_KEY;
+        e.source = SRC_GAMEPAD;
+        e.keycode = keymap[i].key;
+        e.action = KEY_UP;
+        push(&e);
+      }
+      osk_was = 1;
+    }
+    SceTouchData ot;
+    memset(&ot, 0, sizeof(ot));
+    sceTouchPeek(SCE_TOUCH_PORT_FRONT, &ot, 1);
+    int on = ot.reportNum > 0;
+    int tap = on && prev_touch_n == 0;
+    osk_input(pad.buttons & ~prev_btn, tap, tap ? ot.report[0].x / 2 : 0, tap ? ot.report[0].y / 2 : 0);
+    prev_btn = pad.buttons;
+    prev_touch_n = on;
+    return;
+  }
+  if (osk_was) {
+    // keys still held when it closed shouldn't show up as fresh presses
+    osk_was = 0;
+    prev_btn = pad.buttons;
+    prev_touch_n = 0;
+  }
+
   // buttons
   unsigned changed = pad.buttons ^ prev_btn;
   for (unsigned i = 0; i < ARRAY_LEN(keymap); i++) {
