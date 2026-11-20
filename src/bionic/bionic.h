@@ -65,6 +65,9 @@ typedef struct {
 // stdio.c: game FILE* -> real FILE*
 FILE *b_file(FILE *f);
 
+// io.c: FILE* on top of one of our sceIo-backed fds
+FILE *b_fdopen_fd(int fd, const char *mode);
+
 // io.c: our fake pipes (for the native app glue's looper)
 int vpipe_is(int fd);
 int vpipe_available(int fd);

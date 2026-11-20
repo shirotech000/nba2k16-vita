@@ -52,7 +52,7 @@ static FILE *b_fopen(const char *path, const char *mode) {
   return f;
 }
 
-static FILE *b_fdopen(int fd, const char *mode) { return fdopen(fd, mode); }
+static FILE *b_fdopen(int fd, const char *mode) { return b_fdopen_fd(fd, mode); }
 static int b_fclose(FILE *f) { return std_index(f) >= 0 ? 0 : fclose(f); }
 
 static size_t b_fread(void *p, size_t sz, size_t n, FILE *f) { return fread(p, sz, n, b_file(f)); }

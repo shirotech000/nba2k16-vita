@@ -31,7 +31,16 @@ if ($GameFiles) {
         Copy-Item (Join-Path $GameFiles $so) $dataDir -Force
     }
 }
-if ($Obb) { Copy-Item (Join-Path $Obb '*.obb') (Join-Path $dataDir 'obb') -Force }
+if ($Obb) {
+    # it's 2GB, only copy when it actually changed
+    foreach ($f in Get-ChildItem (Join-Path $Obb '*.obb')) {
+        $dst = Join-Path (Join-Path $dataDir 'obb') $f.Name
+        if (-not (Test-Path $dst) -or (Get-Item $dst).Length -ne $f.Length) {
+            Write-Host "copying $($f.Name)..."
+            Copy-Item $f.FullName $dst -Force
+        }
+    }
+}
 if ((Test-Path $Shacccg) -and -not (Test-Path (Join-Path $pref 'ur0\data\libshacccg.suprx'))) {
     Copy-Item $Shacccg (Join-Path $pref 'ur0\data\libshacccg.suprx')
 }

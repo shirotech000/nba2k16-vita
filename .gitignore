@@ -24,3 +24,4 @@ dumps/
 *.log
 *.dmp
 __pycache__/
+*.zip

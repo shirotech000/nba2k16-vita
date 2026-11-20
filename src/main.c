@@ -2,6 +2,7 @@
 // around them, then let the game run.
 #include <stdio.h>
 #include <string.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
@@ -37,6 +38,26 @@ static void need_file(const char *p, const char *what) {
   if (!file_exists(p)) fatal("missing %s: %s (see README)", what, p);
 }
 
+// the game reads /proc/cpuinfo (maps to DATA_PATH/proc/cpuinfo), give it a
+// plausible one: 3 usable cortex-a9 cores with neon
+static void write_fake_cpuinfo(void) {
+  static const char info[] =
+    "Processor\t: ARMv7 Processor rev 0 (v7l)\n"
+    "processor\t: 0\nBogoMIPS\t: 888.00\n\n"
+    "processor\t: 1\nBogoMIPS\t: 888.00\n\n"
+    "processor\t: 2\nBogoMIPS\t: 888.00\n\n"
+    "Features\t: swp half thumb fastmult vfp edsp neon vfpv3 tls\n"
+    "CPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x4\n"
+    "CPU part\t: 0xc09\nCPU revision\t: 0\n\n"
+    "Hardware\t: PS Vita\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n";
+  sceIoMkdir(DATA_PATH "/proc", 0777);
+  SceUID fd = sceIoOpen(DATA_PATH "/proc/cpuinfo", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+  if (fd >= 0) {
+    sceIoWrite(fd, info, sizeof(info) - 1);
+    sceIoClose(fd);
+  }
+}
+
 int main(void) {
   log_init();
   L("nba2k16 vita loader, built " __DATE__ " " __TIME__);
@@ -50,6 +71,7 @@ int main(void) {
   sceIoMkdir(CACHE_DIR, 0777);
   sceIoMkdir(OBB_DIR, 0777);
   sceIoMkdir(SHADER_CACHE, 0777);
+  write_fake_cpuinfo();
 
   crash_init();
   libc_init();

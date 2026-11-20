@@ -10,6 +10,8 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/rtc.h>
+#include <time.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include "bionic/bionic.h"
@@ -100,31 +102,72 @@ static int pipe_write(vpipe *p, const void *src, size_t n) {
 }
 
 // --- open & friends ---
-static int fix_flags(int f) {
-  int o = 0;
-  switch (f & 3) {
-    case 0: o = O_RDONLY; break;
-    case 1: o = O_WRONLY; break;
-    default: o = O_RDWR; break;
+// regular files go straight to sceIo. newlib's off_t is 32-bit here and
+// the obb is probably >2GB, so newlib's lseek/stat would wrap.
+#define FD_BASE 3
+#define MAX_FDS 256
+
+static SceUID fds[MAX_FDS];      // 0 = free, else SceUID + 1
+static SceKernelLwMutexWork fd_lock;
+static int fd_lock_ok;
+
+static void fd_lock_init(void) {
+  if (!fd_lock_ok) {
+    sceKernelCreateLwMutex(&fd_lock, "fds", 0, 0, NULL);
+    fd_lock_ok = 1;
   }
-  if (f & B_O_CREAT) o |= O_CREAT;
-  if (f & B_O_EXCL) o |= O_EXCL;
-  if (f & B_O_TRUNC) o |= O_TRUNC;
-  if (f & B_O_APPEND) o |= O_APPEND;
+}
+
+static int fd_alloc(SceUID uid) {
+  fd_lock_init();
+  sceKernelLockLwMutex(&fd_lock, 1, NULL);
+  int fd = -1;
+  for (int i = 0; i < MAX_FDS; i++) {
+    if (!fds[i]) {
+      fds[i] = uid + 1;
+      fd = FD_BASE + i;
+      break;
+    }
+  }
+  sceKernelUnlockLwMutex(&fd_lock, 1);
+  return fd;
+}
+
+static SceUID fd_uid(int fd) {
+  int i = fd - FD_BASE;
+  if (i < 0 || i >= MAX_FDS || !fds[i]) return -1;
+  return fds[i] - 1;
+}
+
+// sce errors are 0x8001xxxx with a regular errno in the low byte
+static int sce_fail(int r) {
+  errno = r & 0xFF;
+  return -1;
+}
+
+static int sce_flags(int f) {
+  int o;
+  switch (f & 3) {
+    case 0: o = SCE_O_RDONLY; break;
+    case 1: o = SCE_O_WRONLY; break;
+    default: o = SCE_O_RDWR; break;
+  }
+  if (f & B_O_CREAT) o |= SCE_O_CREAT;
+  if (f & B_O_EXCL) o |= SCE_O_EXCL;
+  if (f & B_O_TRUNC) o |= SCE_O_TRUNC;
+  if (f & B_O_APPEND) o |= SCE_O_APPEND;
   return o;
 }
 
 static int b_open(const char *path, int flags, ...) {
-  int mode = 0;
-  if (flags & B_O_CREAT) {
-    va_list ap;
-    va_start(ap, flags);
-    mode = va_arg(ap, int);
-    va_end(ap);
-  }
   char fixed[512];
   path_fix(path, fixed, sizeof(fixed));
-  int fd = open(fixed, fix_flags(flags), mode);
+  SceUID uid = sceIoOpen(fixed, sce_flags(flags), 0666);
+  int fd = uid < 0 ? sce_fail(uid) : fd_alloc(uid);
+  if (uid >= 0 && fd < 0) {
+    sceIoClose(uid);
+    errno = EMFILE;
+  }
   L("open(%s, 0x%X) -> %d", fixed, flags, fd);
   return fd;
 }
@@ -132,7 +175,10 @@ static int b_open(const char *path, int flags, ...) {
 static int b_read(int fd, void *buf, size_t n) {
   vpipe *p = pipe_of(fd);
   if (p) return pipe_read(p, buf, n);
-  return read(fd, buf, n);
+  SceUID uid = fd_uid(fd);
+  if (uid < 0) { errno = EBADF; return -1; }
+  int r = sceIoRead(uid, buf, n);
+  return r < 0 ? sce_fail(r) : r;
 }
 
 static int b_write(int fd, const void *buf, size_t n) {
@@ -142,7 +188,10 @@ static int b_write(int fd, const void *buf, size_t n) {
     L("[fd%d] %.*s", fd, (int)n, (const char *)buf);
     return n;
   }
-  return write(fd, buf, n);
+  SceUID uid = fd_uid(fd);
+  if (uid < 0) { errno = EBADF; return -1; }
+  int r = sceIoWrite(uid, buf, n);
+  return r < 0 ? sce_fail(r) : r;
 }
 
 typedef struct { void *base; size_t len; } b_iovec;
@@ -166,34 +215,61 @@ static int b_close(int fd) {
     }
     return 0;
   }
-  return close(fd);
+  SceUID uid = fd_uid(fd);
+  if (uid < 0) { errno = EBADF; return -1; }
+  fds[fd - FD_BASE] = 0;
+  sceIoClose(uid);
+  return 0;
 }
 
-static long b_lseek(int fd, long off, int whence) { return lseek(fd, off, whence); }
 static long long b_lseek64(int fd, long long off, int whence) {
-  return lseek(fd, (off_t)off, whence);
+  SceUID uid = fd_uid(fd);
+  if (uid < 0) { errno = EBADF; return -1; }
+  SceOff r = sceIoLseek(uid, off, whence);  // SEEK_* values match
+  return r < 0 ? sce_fail((int)r) : r;
 }
 
-static void to_bstat(const struct stat *s, b_stat *b) {
+static long b_lseek(int fd, long off, int whence) {
+  long long r = b_lseek64(fd, off, whence);
+  if (r > 0x7FFFFFFF) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return (long)r;
+}
+
+static long sce_time(const SceDateTime *t) {
+  struct tm tm = { 0 };
+  tm.tm_year = t->year - 1900;
+  tm.tm_mon = t->month - 1;
+  tm.tm_mday = t->day;
+  tm.tm_hour = t->hour;
+  tm.tm_min = t->minute;
+  tm.tm_sec = t->second;
+  return (long)mktime(&tm);
+}
+
+static void sce_to_bstat(const SceIoStat *s, b_stat *b) {
   memset(b, 0, sizeof(*b));
-  b->st_mode = s->st_mode;  // S_IF* bits are the same octal values
+  b->st_mode = SCE_S_ISDIR(s->st_mode) ? (0040000 | 0777) : (0100000 | 0666);
   b->st_nlink = 1;
   b->st_size = s->st_size;
   b->st_blksize = 4096;
   b->st_blocks = (s->st_size + 511) / 512;
-  b->st_atime_ = s->st_atime;
-  b->st_mtime_ = s->st_mtime;
-  b->st_ctime_ = s->st_ctime;
+  b->st_atime_ = sce_time(&s->st_atime);
+  b->st_mtime_ = sce_time(&s->st_mtime);
+  b->st_ctime_ = sce_time(&s->st_ctime);
 }
 
 static int b_stat_fn(const char *path, b_stat *b) {
   char fixed[512];
-  struct stat s;
+  SceIoStat s;
   path_fix(path, fixed, sizeof(fixed));
-  int r = stat(fixed, &s);
-  if (r == 0) to_bstat(&s, b);
-  L("stat(%s) -> %d", fixed, r);
-  return r;
+  int r = sceIoGetstat(fixed, &s);
+  L("stat(%s) -> 0x%X", fixed, r < 0 ? r : 0);
+  if (r < 0) return sce_fail(r);
+  sce_to_bstat(&s, b);
+  return 0;
 }
 
 static int b_fstat(int fd, b_stat *b) {
@@ -202,10 +278,24 @@ static int b_fstat(int fd, b_stat *b) {
     b->st_mode = 0010000 | 0600;  // fifo
     return 0;
   }
-  struct stat s;
-  int r = fstat(fd, &s);
-  if (r == 0) to_bstat(&s, b);
-  return r;
+  SceUID uid = fd_uid(fd);
+  if (uid < 0) { errno = EBADF; return -1; }
+  SceIoStat s;
+  int r = sceIoGetstatByFd(uid, &s);
+  if (r < 0) return sce_fail(r);
+  sce_to_bstat(&s, b);
+  return 0;
+}
+
+// gnustl wants a FILE* on top of one of our fds now and then
+static int fd_fn_read(void *c, char *buf, int n) { return b_read((int)c, buf, n); }
+static int fd_fn_write(void *c, const char *buf, int n) { return b_write((int)c, buf, n); }
+static fpos_t fd_fn_seek(void *c, fpos_t off, int whence) { return (fpos_t)b_lseek((int)c, off, whence); }
+static int fd_fn_close(void *c) { return b_close((int)c); }
+
+FILE *b_fdopen_fd(int fd, const char *mode) {
+  (void)mode;
+  return funopen((void *)fd, fd_fn_read, fd_fn_write, fd_fn_seek, fd_fn_close);
 }
 
 typedef struct {
