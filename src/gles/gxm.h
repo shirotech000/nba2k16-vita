@@ -65,6 +65,7 @@ typedef struct gxm_target {
   const SceGxmDepthStencilSurface *depth; // NULL -> no depth/stencil
   unsigned w, h;
   SceGxmSyncObject *sync;                 // display sync or NULL
+  SceGxmMultisampleMode msaa;             // NONE unless the target asked for msaa
 } gxm_target;
 
 extern SceGxmContext *gxm_ctx;
@@ -88,3 +89,14 @@ void *gxm_front_buffer(void);
 // helpers for fbo surfaces
 uint32_t gxm_depth_surface_size(unsigned w, unsigned h);
 int gxm_depth_surface_init(SceGxmDepthStencilSurface *ds, unsigned w, unsigned h, void *mem);
+
+// msaa (same idea as the user's mbaavita/vita2d setup): the render target and
+// every fragment program run at the sample mode, the color surface downscales
+// on store so the texture/display stays 1x, depth holds all the samples
+// (4x: 2x wide + 2x tall, 2x: 2x tall).
+SceGxmMultisampleMode gxm_msaa_setting(void);          // config msaa=0/2/4, default 4
+int gxm_msaa_display(void);                            // config msaa_display=1
+SceGxmMultisampleMode gxm_scene_msaa(void);            // mode of the open scene
+uint32_t gxm_depth_surface_size_ms(unsigned w, unsigned h, SceGxmMultisampleMode ms);
+int gxm_depth_surface_init_ms(SceGxmDepthStencilSurface *ds, unsigned w, unsigned h, void *mem,
+                              SceGxmMultisampleMode ms);

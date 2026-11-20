@@ -180,11 +180,12 @@ static SceGxmFragmentProgram *get_fp(gl_program *p)
   if (!T.has_color) bi.colorMask = SCE_GXM_COLOR_MASK_NONE;
   uint32_t b;
   memcpy(&b, &bi, 4);
-  uint64_t key = b | ((uint64_t)T.out_fmt << 32);
+  // a fragment program's sample mode has to match the target's
+  uint64_t key = b | ((uint64_t)T.out_fmt << 32) | ((uint64_t)T.msaa << 48);
   for (fp_variant *v = p->fps; v; v = v->next)
     if (v->key == key) return v->fp;
   SceGxmFragmentProgram *fp = NULL;
-  int r = sceGxmShaderPatcherCreateFragmentProgram(gxm_patcher, p->fid, T.out_fmt, SCE_GXM_MULTISAMPLE_NONE,
+  int r = sceGxmShaderPatcherCreateFragmentProgram(gxm_patcher, p->fid, T.out_fmt, T.msaa,
                                                    &bi, p->vgxp, &fp);
   if (r < 0) {
     L("gl: sceGxmShaderPatcherCreateFragmentProgram failed 0x%08X (prog %u, outfmt %d)", r, p->name, T.out_fmt);

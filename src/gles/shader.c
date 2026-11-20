@@ -488,7 +488,8 @@ static void clear_init_job(void *unused)
 
 SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fmt)
 {
-  uint64_t key = cmask | ((uint64_t)fmt << 8);
+  SceGxmMultisampleMode ms = gxm_scene_msaa();
+  uint64_t key = cmask | ((uint64_t)fmt << 8) | ((uint64_t)ms << 40);
   for (fp_variant *v = CLR.fps; v; v = v->next)
     if (v->key == key) return v->fp;
   SceGxmBlendInfo bi;
@@ -499,7 +500,7 @@ SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fm
   bi.colorSrc = bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
   bi.colorDst = bi.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
   fp_variant *v = calloc(1, sizeof(*v));
-  int r = sceGxmShaderPatcherCreateFragmentProgram(gxm_patcher, CLR.fid, fmt, SCE_GXM_MULTISAMPLE_NONE,
+  int r = sceGxmShaderPatcherCreateFragmentProgram(gxm_patcher, CLR.fid, fmt, ms,
                                                    &bi, CLR.vgxp, &v->fp);
   if (r < 0) {
     L("shader: clear fragment program (mask %x fmt %d) failed 0x%08X", cmask, fmt, r);

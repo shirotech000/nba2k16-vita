@@ -248,6 +248,32 @@ static SceGxmDepthStencilSurface *scratch_depth_for(unsigned w, unsigned h)
 
 static SceGxmColorSurface g_fb_cs;
 
+// msaa goes on the game's main 3d target: color 960 wide or more, with a depth
+// rb. it draws the 3d scene off screen and composites it to the display, so
+// that's where the edges are (display msaa alone would only smooth the ui).
+// the depth rb gets a sample-sized twin, the color surface downscales into
+// the texture on store. any failure -> plain 1x like before.
+static SceGxmDepthStencilSurface *msaa_depth_for(gl_renderbuffer *rb, SceGxmMultisampleMode ms)
+{
+  if (rb->ms_mem && rb->ms_mode == ms) return &rb->ms_ds;
+  if (rb->ms_mem) { gpu_free_deferred(rb->ms_mem); rb->ms_mem = NULL; }
+  static int failed;
+  if (failed) return NULL;
+  rb->ms_mem = gpu_alloc(gxm_depth_surface_size_ms(rb->w, rb->h, ms), SCE_GXM_DEPTHSTENCIL_SURFACE_ALIGNMENT,
+                         GPU_PREF_CDRAM);
+  if (!rb->ms_mem || gxm_depth_surface_init_ms(&rb->ms_ds, rb->w, rb->h, rb->ms_mem->ptr, ms) < 0) {
+    L("fbo: no memory for the %ux%u msaa depth (%u KiB), staying 1x", rb->w, rb->h,
+      gxm_depth_surface_size_ms(rb->w, rb->h, ms) >> 10);
+    if (rb->ms_mem) { gpu_free(rb->ms_mem); rb->ms_mem = NULL; }
+    failed = 1;
+    return NULL;
+  }
+  rb->ms_mode = ms;
+  L("fbo: %ux%u target gets %dx msaa (+%u KiB depth)", rb->w, rb->h, ms == SCE_GXM_MULTISAMPLE_4X ? 4 : 2,
+    gxm_depth_surface_size_ms(rb->w, rb->h, ms) >> 10);
+  return &rb->ms_ds;
+}
+
 void fbo_target_size(unsigned *w, unsigned *h)
 {
   *w = T.w;
@@ -267,6 +293,7 @@ int gl_ensure_scene(int full_ds_clear)
 
   if (!f) {
     gxm_display_target(&t);
+    T.msaa = t.msaa;
     T.w = SCREEN_W;
     T.h = SCREEN_H;
     T.flip = 1;
@@ -277,6 +304,7 @@ int gl_ensure_scene(int full_ds_clear)
     T.fbo = 0;
   } else {
     unsigned w = 0, h = 0;
+    T.msaa = SCE_GXM_MULTISAMPLE_NONE;
     T.flip = 0;
     T.has_color = 0;
     T.has_depth = 0;
@@ -358,6 +386,28 @@ int gl_ensure_scene(int full_ds_clear)
     if (!w || !h) {
       L_ONCE("fbo: framebuffer %u has nothing usable attached, draws skipped", f->name);
       return -1;
+    }
+    // main 3d target -> msaa, see msaa_depth_for
+    SceGxmMultisampleMode ms = gxm_msaa_setting();
+    if (ms != SCE_GXM_MULTISAMPLE_NONE && T.has_color && zrb && t.depth == &zrb->ds && w >= 960) {
+      SceGxmDepthStencilSurface *mds = msaa_depth_for(zrb, ms);
+      SceGxmColorSurface cs;
+      int r = -1;
+      if (mds && ctex)
+        r = sceGxmColorSurfaceInit(&cs, ctex->color_fmt, SCE_GXM_COLOR_SURFACE_LINEAR,
+                                   SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE, ctex->out_size,
+                                   ctex->w, ctex->h, ctex->stride / ctex->bpp, ctex->mem->ptr);
+      else if (mds && crb)
+        r = sceGxmColorSurfaceInit(&cs, crb->color_fmt, SCE_GXM_COLOR_SURFACE_LINEAR,
+                                   SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
+                                   crb->w, crb->h, crb->stride_px, crb->mem->ptr);
+      if (r >= 0 && mds) {
+        g_fb_cs = cs;
+        t.depth = mds;
+        t.msaa = T.msaa = ms;
+      } else if (mds) {
+        L_ONCE("fbo: msaa color surface init failed 0x%08X, staying 1x", r);
+      }
     }
     t.color = T.has_color ? &g_fb_cs : NULL;
     t.w = T.w = w;

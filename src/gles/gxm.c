@@ -650,6 +650,7 @@ typedef struct {
   uint32_t last_frame;
   uint32_t scenes_this_frame, peak_scenes;
   unsigned drv_mem;
+  SceGxmMultisampleMode msaa;
 } rt_entry;
 
 #define MAX_RTS 24
@@ -660,10 +661,10 @@ static uint32_t g_scenes_frame, g_scenes_peak;
 
 static void rt_destroy_cb(void *p) { sceGxmDestroyRenderTarget(p); }
 
-static rt_entry *rt_get(unsigned w, unsigned h)
+static rt_entry *rt_get(unsigned w, unsigned h, SceGxmMultisampleMode ms)
 {
   for (int i = 0; i < g_n_rts; i++)
-    if (g_rts[i].w == w && g_rts[i].h == h) return &g_rts[i];
+    if (g_rts[i].w == w && g_rts[i].h == h && g_rts[i].msaa == ms) return &g_rts[i];
 
   rt_entry *e;
   if (g_n_rts < MAX_RTS) {
@@ -684,7 +685,7 @@ static rt_entry *rt_get(unsigned w, unsigned h)
   p.width = w;
   p.height = h;
   p.scenesPerFrame = GXM_SCENES_PER_FRAME;
-  p.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
+  p.multisampleMode = ms;
   p.multisampleLocations = 0;
   p.driverMemBlock = -1;
   sceGxmGetRenderTargetMemSize(&p, &e->drv_mem);
@@ -693,10 +694,13 @@ static rt_entry *rt_get(unsigned w, unsigned h)
     L("gxm: sceGxmCreateRenderTarget %ux%u failed 0x%08X", w, h, r);
     e->rt = NULL;
   } else {
-    L("gxm: render target %ux%u, driver mem %u KiB", w, h, e->drv_mem >> 10);
+    L("gxm: render target %ux%u%s, driver mem %u KiB", w, h,
+      ms == SCE_GXM_MULTISAMPLE_4X ? " 4x msaa" : ms == SCE_GXM_MULTISAMPLE_2X ? " 2x msaa" : "",
+      e->drv_mem >> 10);
   }
   e->w = w;
   e->h = h;
+  e->msaa = ms;
   return e;
 }
 
@@ -705,6 +709,28 @@ static rt_entry *rt_get(unsigned w, unsigned h)
 static SceGxmColorSurface g_sc_color;
 static SceGxmDepthStencilSurface g_sc_depth;
 static int g_begin_fail_logs;
+static SceGxmMultisampleMode g_scene_ms;
+
+SceGxmMultisampleMode gxm_scene_msaa(void) { return g_scene_ms; }
+
+extern int config_int(const char *key, int def);
+
+SceGxmMultisampleMode gxm_msaa_setting(void)
+{
+  static int v = -1;
+  if (v < 0) {
+    v = config_int("msaa", 4);
+    L("gxm: msaa %dx (msaa=0/2/4 in config.txt)", v == 4 || v == 2 ? v : 0);
+  }
+  return v == 4 ? SCE_GXM_MULTISAMPLE_4X : v == 2 ? SCE_GXM_MULTISAMPLE_2X : SCE_GXM_MULTISAMPLE_NONE;
+}
+
+int gxm_msaa_display(void)
+{
+  static int v = -1;
+  if (v < 0) v = config_int("msaa_display", 0);
+  return v && gxm_msaa_setting() != SCE_GXM_MULTISAMPLE_NONE;
+}
 
 int gxm_in_scene(void) { return g_in_scene; }
 int gxm_ready(void) { return g_ready; }
@@ -717,8 +743,9 @@ void gxm_begin_scene(const gxm_target *t, int load_depth)
   // dry run: never open one, gl_ensure_scene then skips the draw/clear
   if (g_dry_run) return;
 
-  rt_entry *e = rt_get(t->w, t->h);
+  rt_entry *e = rt_get(t->w, t->h, t->msaa);
   if (!e->rt) return;
+  g_scene_ms = t->msaa;
   e->last_frame = g_frame;
   if (++e->scenes_this_frame > e->peak_scenes) {
     e->peak_scenes = e->scenes_this_frame;
@@ -814,6 +841,7 @@ void gxm_display_target(gxm_target *out)
   out->w = SCREEN_W;
   out->h = SCREEN_H;
   out->sync = g_disp_sync[g_back];
+  out->msaa = gxm_msaa_display() ? gxm_msaa_setting() : SCE_GXM_MULTISAMPLE_NONE;
 }
 
 void *gxm_back_buffer(void) { return g_disp_mb[g_back].base; }
@@ -906,6 +934,25 @@ void gxm_swap(void)
 uint32_t gxm_depth_surface_size(unsigned w, unsigned h)
 {
   return ALIGN_UP(w, SCE_GXM_TILE_SIZEX) * ALIGN_UP(h, SCE_GXM_TILE_SIZEY) * 4;
+}
+
+// depth for a multisampled target keeps every sample: 4x doubles both axes,
+// 2x doubles the rows
+uint32_t gxm_depth_surface_size_ms(unsigned w, unsigned h, SceGxmMultisampleMode ms)
+{
+  uint32_t n = gxm_depth_surface_size(w, h);
+  return ms == SCE_GXM_MULTISAMPLE_4X ? n * 4 : ms == SCE_GXM_MULTISAMPLE_2X ? n * 2 : n;
+}
+
+int gxm_depth_surface_init_ms(SceGxmDepthStencilSurface *ds, unsigned w, unsigned h, void *mem,
+                              SceGxmMultisampleMode ms)
+{
+  unsigned stride = ALIGN_UP(w, SCE_GXM_TILE_SIZEX);
+  if (ms == SCE_GXM_MULTISAMPLE_4X) stride *= 2;
+  int r = sceGxmDepthStencilSurfaceInit(ds, SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24,
+      SCE_GXM_DEPTH_STENCIL_SURFACE_TILED, stride, mem, NULL);
+  if (r < 0) L("gxm: msaa depth surface init %ux%u (mode %d) failed 0x%08X", w, h, ms, r);
+  return r;
 }
 
 int gxm_depth_surface_init(SceGxmDepthStencilSurface *ds, unsigned w, unsigned h, void *mem)
@@ -1020,7 +1067,7 @@ int gxm_init(void)
       fatal("gxm: can't allocate display buffer %d", i);
     memset(g_disp_mb[i].base, 0, sz);
     r = sceGxmColorSurfaceInit(&g_disp_surf[i], SCE_GXM_COLOR_FORMAT_A8B8G8R8,
-        SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+        SCE_GXM_COLOR_SURFACE_LINEAR, (gxm_msaa_display() ? SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE : SCE_GXM_COLOR_SURFACE_SCALE_NONE),
         SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, SCREEN_W, SCREEN_H, DISPLAY_STRIDE,
         g_disp_mb[i].base);
     if (r < 0) fatal("display color surface init failed 0x%08X", r);
@@ -1028,10 +1075,11 @@ int gxm_init(void)
     if (r < 0) fatal("sceGxmSyncObjectCreate failed 0x%08X", r);
   }
 
-  g_depth_mem = gpu_alloc(gxm_depth_surface_size(SCREEN_W, SCREEN_H),
+  g_depth_mem = gpu_alloc(gxm_depth_surface_size_ms(SCREEN_W, SCREEN_H, gxm_msaa_display() ? gxm_msaa_setting() : SCE_GXM_MULTISAMPLE_NONE),
                           SCE_GXM_DEPTHSTENCIL_SURFACE_ALIGNMENT, GPU_PREF_CDRAM);
   if (!g_depth_mem) fatal("gxm: no memory for the depth buffer");
-  if (gxm_depth_surface_init(&g_disp_depth, SCREEN_W, SCREEN_H, g_depth_mem->ptr) < 0)
+  if (gxm_depth_surface_init_ms(&g_disp_depth, SCREEN_W, SCREEN_H, g_depth_mem->ptr,
+                                gxm_msaa_display() ? gxm_msaa_setting() : SCE_GXM_MULTISAMPLE_NONE) < 0)
     fatal("gxm: display depth surface init failed");
 
   if (blk_alloc(&g_ring_mb, GXM_TRANSIENT_RING_SIZE, 0, MAP_GPU, NULL) < 0)
@@ -1047,7 +1095,7 @@ int gxm_init(void)
   display_cb(&d);
   g_vsync = vs;
 
-  rt_get(SCREEN_W, SCREEN_H);
+  rt_get(SCREEN_W, SCREEN_H, gxm_msaa_display() ? gxm_msaa_setting() : SCE_GXM_MULTISAMPLE_NONE);
   g_dry_run = config_int("gpu_dry_run", 0);
   if (g_dry_run) L("gxm: gpu_dry_run=1, no scenes/draws/clears/flips get submitted");
   g_ready = 1;

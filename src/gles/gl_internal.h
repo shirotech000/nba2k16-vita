@@ -94,6 +94,10 @@ typedef struct gl_renderbuffer {
   SceGxmOutputRegisterFormat out_fmt;
   unsigned stride_px;
   uint32_t last_use;
+  // msaa twin of a depth rb: same contents role, sample-sized (lazily made)
+  gpu_block *ms_mem;
+  SceGxmDepthStencilSurface ms_ds;
+  SceGxmMultisampleMode ms_mode;
 } gl_renderbuffer;
 
 typedef struct gl_framebuffer {
@@ -113,6 +117,7 @@ typedef struct {
   // GL has a stencil buffer here. gxm surfaces are always d24s8, but a D16/D24
   // fbo has no stencil in GL, so the stencil test must act as always-pass there
   int has_stencil;
+  SceGxmMultisampleMode msaa;   // sample mode of this target's scene
 } gl_cur_target;
 
 extern gl_cur_target T;
