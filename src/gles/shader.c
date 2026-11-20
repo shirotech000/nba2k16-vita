@@ -234,6 +234,13 @@ static const char *cb_abs(const char *name, const SceShaccCgSourceLocation *from
 static void cb_release_name(const char *name, const SceShaccCgCompileOptions *opt) { (void)name; (void)opt; }
 
 // ---- disk cache ----
+// loose files first, pack second (shaderpack.c): warm boots and menu
+// transitions read everything out of pack.bin with one open + preads
+void pack_init(void);
+void pack_maybe_build(void);
+void pack_mark_dirty(void);
+void *pack_read(const char *cache_path, uint32_t *size);
+
 typedef struct {
   uint32_t magic, version, cg_len, cg_hash2, gxp_size;
 } cache_hdr;
@@ -273,6 +280,24 @@ static int io_read_bounce(SceUID fd, void *dst, uint32_t n)
 // that's "try again later", not "compile it" (loading the compiler then is worse)
 static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2, int *oom)
 {
+  // the pack first: one pread beats a card open + reads by a mile
+  {
+    uint32_t n = 0;
+    uint8_t *buf = pack_read(path, &n);
+    if (buf) {
+      cache_hdr hd;
+      if (n > sizeof(hd)) memcpy(&hd, buf, sizeof(hd));
+      else hd.magic = 0;
+      if (hd.magic == CACHE_MAGIC && hd.version == CACHE_VER && hd.cg_len == cg_len &&
+          hd.cg_hash2 == h2 && hd.gxp_size > 0 && hd.gxp_size < 4 * 1024 * 1024 &&
+          n == sizeof(hd) + hd.gxp_size) {
+        SceGxmProgram *p = (SceGxmProgram *)(buf + sizeof(hd));
+        if (sceGxmProgramCheck(p) >= 0) return p;
+        L("shader: bad pack entry %s, falling back", path);
+      }
+      free(buf);
+    }
+  }
   SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
   if (fd < 0) return NULL;
   cache_hdr hd;
@@ -304,6 +329,7 @@ static void cache_store(const char *path, const SceGxmProgram *p, uint32_t size,
   sceIoWrite(fd, &hd, sizeof(hd));
   sceIoWrite(fd, p, size);
   sceIoClose(fd);
+  pack_mark_dirty();   // next boot folds it into pack.bin
 }
 
 static void log_append(char **log, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -571,6 +597,12 @@ SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fm
   return v->fp;
 }
 
+// a new translator stamp (any glsl2cg.c/.h change) invalidates every cached
+// translation. this resets the boot pass counter so the "preparing for
+// first launch" screen recompiles them behind its progress bar, instead of
+// the game retranslating each pair lazily mid-match
+static void stamp_check(void);
+
 void shader_init(void)
 {
   static int done;
@@ -579,6 +611,8 @@ void shader_init(void)
   sceIoMkdir(DATA_PATH, 0777);
   sceIoMkdir(SHADER_CACHE, 0777);
   sceIoMkdir(SHADERFAIL_DIR, 0777);
+  pack_init();   // warm boots + menu links read through the pack
+  stamp_check();
   // no shacc_ready() here anymore, the compiler loads on the first cache miss
   if (gxm_ready()) run_on_big_stack(clear_init_job, NULL);
 }
@@ -1230,6 +1264,40 @@ static int tcache_load(const char *vs, const char *fs, g2c_result *r)
 {
   char path[128];
   tcache_path(path, sizeof(path), vs, fs);
+  // the pack first: one pread instead of a card open + reads
+  {
+    uint32_t n = 0;
+    uint8_t *buf = pack_read(path, &n);
+    if (buf) {
+      tcache_hdr h;
+      int ok = 0;
+      char *v = NULL, *f = NULL;
+      if (n > sizeof(h)) memcpy(&h, buf, sizeof(h));
+      else h.magic = 0;
+      if (h.magic == TCACHE_MAGIC && h.build == tcache_build() &&
+          h.src_hash2 == tcache_check(vs, fs) && h.res_size == sizeof(*r) &&
+          h.vs_len < 1024 * 1024 && h.fs_len < 1024 * 1024 &&
+          n == sizeof(h) + sizeof(*r) + h.vs_len + h.fs_len) {
+        memcpy(r, buf + sizeof(h), sizeof(*r));
+        v = malloc(h.vs_len + 1);
+        f = malloc(h.fs_len + 1);
+        if (v && f) {
+          memcpy(v, buf + sizeof(h) + sizeof(*r), h.vs_len);
+          memcpy(f, buf + sizeof(h) + sizeof(*r) + h.vs_len, h.fs_len);
+          v[h.vs_len] = 0;
+          f[h.fs_len] = 0;
+          r->vs_cg = v;
+          r->fs_cg = f;
+          ok = 1;
+        }
+      }
+      free(buf);
+      if (ok) return 1;
+      free(v);
+      free(f);
+      memset(r, 0, sizeof(*r));
+    }
+  }
   SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
   if (fd < 0) return 0;
   tcache_hdr h;
@@ -1273,6 +1341,7 @@ static void tcache_store(const char *vs, const char *fs, const g2c_result *r)
   sceIoWrite(fd, r->vs_cg, h.vs_len);
   sceIoWrite(fd, r->fs_cg, h.fs_len);
   sceIoClose(fd);
+  pack_mark_dirty();   // next boot folds it into pack.bin
 }
 
 // ---- shader manifest + boot precompile ----
@@ -1286,6 +1355,7 @@ static void tcache_store(const char *vs, const char *fs, const g2c_result *r)
 #define MAN_IDX  SHADER_CACHE "/manifest.idx"
 #define MAN_DONE SHADER_CACHE "/manifest.done"
 #define MAN_MAGIC 0x31464D4Eu  // "NMF1"
+#define G2C_STAMP SHADER_CACHE "/g2cstamp"
 
 static uint64_t *man_set;
 static uint32_t man_cap, man_n;
@@ -1347,6 +1417,24 @@ void shader_manifest_load(void)
 }
 
 uint32_t shader_manifest_count(void) { return man_n; }
+
+// see the prototype up at shader_init
+static void stamp_check(void)
+{
+  uint32_t want = tcache_build();
+  uint32_t have = 0;
+  SceUID fd = sceIoOpen(G2C_STAMP, SCE_O_RDONLY, 0);
+  if (fd >= 0) {
+    if (sceIoRead(fd, &have, 4) != 4) have = 0;
+    sceIoClose(fd);
+  }
+  if (have == want) return;
+  fd = sceIoOpen(G2C_STAMP, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+  if (fd >= 0) { sceIoWrite(fd, &want, 4); sceIoClose(fd); }
+  sceIoRemove(MAN_DONE);
+  pack_mark_dirty();   // the pack still holds the stale blobs
+  L("shader: translator stamp changed, the boot pass refreshes the cache");
+}
 
 static void man_record(const char *vs, const char *fs)
 {

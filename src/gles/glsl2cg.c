@@ -2793,9 +2793,13 @@ int g2c_translate(const char *vs_glsl, const char *fs_glsl, g2c_result *out) {
   return g2c_translate_ex(vs_glsl, fs_glsl, 0, out);
 }
 
-// changes every time this file gets rebuilt, so cached translations (shader.c)
-// never outlive a translator change
-const char g2c_build_id[] = __DATE__ " " __TIME__;
+// cache stamp for shader.c: sha1 of this file + glsl2cg.h, set by cmake.
+// was __DATE__ " " __TIME__, which wiped the whole translation cache on
+// every rebuild even with no translator change
+#ifndef G2C_BUILD
+#define G2C_BUILD "no-stamp"
+#endif
+const char g2c_build_id[] = G2C_BUILD;
 
 void g2c_free(g2c_result *r) {
   if (!r) return;

@@ -32,6 +32,13 @@ if(NBA_TRACE_GL)
   add_compile_definitions(NBA_TRACE_GL=1)
 endif()
 
+# the translator's cache stamp: hash of the translator sources instead of
+# __DATE__ __TIME__, so rebuilding the eboot doesn't invalidate every
+# cached translation and force a slow re-link of all ~380 programs
+file(SHA1 src/gles/glsl2cg.c G2C_C_HASH)
+file(SHA1 src/gles/glsl2cg.h G2C_H_HASH)
+add_compile_definitions(G2C_BUILD="${G2C_C_HASH}${G2C_H_HASH}")
+
 include_directories(src)
 
 file(GLOB_RECURSE PORT_SOURCES CONFIGURE_DEPENDS
