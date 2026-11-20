@@ -83,6 +83,24 @@ uint32_t tu_cube_face_size(unsigned size, unsigned bpp)
   return (bytes + a - 1) & ~(a - 1);
 }
 
+unsigned tu_bc_dim(unsigned px, unsigned level)
+{
+  unsigned d = tu_pow2_ceil(px) >> level;
+  return d < 4 ? 1 : d / 4;
+}
+
+uint32_t tu_bc_level_size(unsigned w, unsigned h, unsigned level, unsigned block_bytes)
+{
+  return tu_bc_dim(w, level) * tu_bc_dim(h, level) * block_bytes;
+}
+
+uint32_t tu_bc_level_off(unsigned w, unsigned h, unsigned level, unsigned block_bytes)
+{
+  uint32_t o = 0;
+  for (unsigned l = 0; l < level; l++) o += tu_bc_level_size(w, h, l, block_bytes);
+  return o;
+}
+
 // ---------------------------------------------------------------- box filter
 
 typedef struct { uint8_t shift, bits; } field;

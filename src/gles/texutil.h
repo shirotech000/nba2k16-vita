@@ -21,6 +21,15 @@ void tu_unswizzle(const uint8_t *level, unsigned lw, unsigned lh, unsigned bpp,
 uint32_t tu_linear_level_size(unsigned w, unsigned h, unsigned bpp);
 // one cube face incl. its whole chain down to 1x1, padded to gxm's face alignment
 uint32_t tu_cube_face_size(unsigned size, unsigned bpp);
+// block compressed (bc1/bc3) levels. gxm wants them swizzled: 4x4 blocks in
+// tu_morton order over the level's block grid. the grid is the pow2-rounded
+// size / 4, at least 1 block per axis (so 2x2 and 1x1 levels are one block),
+// levels back to back. npot textures (SWIZZLED_ARBITRARY) use the same grid,
+// it's just not full. that's also how vita3k walks them.
+unsigned tu_bc_dim(unsigned px, unsigned level);   // blocks along one axis, px = level 0 size
+uint32_t tu_bc_level_size(unsigned w, unsigned h, unsigned level, unsigned block_bytes);
+uint32_t tu_bc_level_off(unsigned w, unsigned h, unsigned level, unsigned block_bytes);
+
 unsigned tu_log2(unsigned v);          // floor
 unsigned tu_pow2_ceil(unsigned v);
 static inline int tu_is_pow2(unsigned v) { return v && !(v & (v - 1)); }

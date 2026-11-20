@@ -1,7 +1,8 @@
 // textures. 2d ones are linear gxm textures: level 0 sits at mem->ptr with the
 // stride the fbo code renders into, mips are packed right after it. cube maps
 // are gxm CUBE textures (swizzled, pow2). pixels get converted on the cpu when
-// the GL format has no direct gxm match (etc gets decoded).
+// the GL format has no direct gxm match. etc rgb / rgba gets transcoded to
+// bc1 / bc3 (bcenc.c) instead of decoded to rgba8: 1/8 resp. 1/4 of the size.
 //
 // layout, checked against what vita3k's texture decoder reads:
 // - linear level n: rows padded to 8 pixels, levels back to back. only pow2
@@ -11,6 +12,13 @@
 //   1x1 (reserved even if fewer levels are used), each level morton swizzled
 //   (texutil.c), padded to 2 KiB once it's big enough. always init cubes with
 //   mipCount >= 1: 0 means a packed layout without the chain.
+// - bc1/bc3 (2d only): gxm SWIZZLED, 4x4 blocks in morton order over the
+//   level's block grid (tu_bc_dim: pow2 size / 4, min 1 block), levels back
+//   to back. swizzled because that's the layout every retail dxt .gxt uses,
+//   linear dxt is something we only know vita3k to accept. npot ones are
+//   SWIZZLED_ARBITRARY, same memory on the pow2-rounded grid. vita3k reads
+//   both like this (it unswizzles whole blocks with the same morton order).
+//   no mips on npot here either.
 // - cube faces: gl and gxm use the same order (+x -x +y -y +z -z, gxm face i
 //   = GL_TEXTURE_CUBE_MAP_POSITIVE_X + i) and the same per-face orientation
 //   (row 0 of the data = row 0 in memory = t 0 of the face). the direction
@@ -21,6 +29,7 @@
 #include "gles/gl_internal.h"
 #include "gles/gl_api.h"
 #include "gles/texutil.h"
+#include "gles/bcenc.h"
 
 #ifndef GL_UNSIGNED_INT_10F_11F_11F_REV
 #define GL_UNSIGNED_INT_10F_11F_11F_REV 0x8C3B
@@ -52,7 +61,18 @@ typedef struct {
   SceGxmOutputRegisterFormat out_fmt;
   SceGxmOutputRegisterSize out_size;
   int is_depth;
+  unsigned bc;   // block compressed: bytes per 4x4 block (bpp holds the same), else 0
 } fmt_info;
+
+// 8 for bc1, 16 for bc3, 0 for everything else
+static unsigned fmt_bc(SceGxmTextureFormat f)
+{
+  switch ((uint32_t)f & 0x9F000000u) {
+  case SCE_GXM_TEXTURE_BASE_FORMAT_UBC1: return 8;
+  case SCE_GXM_TEXTURE_BASE_FORMAT_UBC3: return 16;
+  default: return 0;
+  }
+}
 
 static void log_format_once(GLint ifmt, GLenum fmt, GLenum type, const char *what)
 {
@@ -202,8 +222,22 @@ static int pick_format(GLint ifmt, GLenum fmt, GLenum type, fmt_info *fi)
   return 1;
 }
 
-// etc/eac decode targets
-static int etc_format(GLenum ifmt, fmt_info *fi)
+// tex_bc=0 in config.txt: decode etc to rgba8 like before (4-8x the memory)
+static int bc_enabled(void)
+{
+  static int on = -1;
+  if (on < 0) {
+    extern int config_int(const char *key, int def);
+    on = config_int("tex_bc", 1) != 0;
+    L("tex: etc textures get %s", on ? "transcoded to bc1/bc3 (tex_bc=0 turns it off)"
+                                     : "decoded to rgba8 (tex_bc=0)");
+  }
+  return on;
+}
+
+// etc/eac targets. bc = transcode to bc1/bc3 if the format has one, else
+// (and for r11/rg11) cpu decode to plain pixels
+static int etc_format(GLenum ifmt, fmt_info *fi, int bc)
 {
   memset(fi, 0, sizeof(*fi));
   fi->conv = CV_COPY;
@@ -223,6 +257,17 @@ static int etc_format(GLenum ifmt, fmt_info *fi)
     if (!etc_block_bytes(ifmt)) {
       log_format_once(ifmt, 0, 0, "compressed UNSUPPORTED");
       return 0;
+    }
+    if (bc && bc_bytes_for_etc(ifmt)) {
+      // bc1 blocks without transparent texels read the same with and without
+      // dxt1 alpha, so plain UBC1 does for rgb too
+      fi->bc = bc_bytes_for_etc(ifmt);
+      fi->fmt = fi->bc == 16 ? SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR : SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR;
+      fi->bpp = fi->src_bpp = fi->bc;
+      log_format_once(ifmt, 0, 1, fi->bc == 16 ? "compressed ETC2 rgba, transcoded to UBC3 (bc3)"
+                                  : etc_has_alpha(ifmt) ? "compressed ETC2 punch-through, transcoded to UBC1 (bc1, 1 bit alpha)"
+                                                        : "compressed ETC rgb, transcoded to UBC1 (bc1)");
+      return 1;
     }
     fi->fmt = etc_has_alpha(ifmt) ? SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR : SCE_GXM_TEXTURE_FORMAT_X8U8U8U8_1BGR;
     fi->renderable = 1;
@@ -280,6 +325,7 @@ typedef struct {
   unsigned w, h, bpp, levels;
   int cube;
   uint32_t face_size;
+  int bc;   // swizzled bc blocks, bpp = bytes per block
 } shape;
 
 static unsigned lvl_dim(unsigned d, unsigned l) { d >>= l; return d ? d : 1; }
@@ -287,6 +333,7 @@ static unsigned lvl_dim(unsigned d, unsigned l) { d >>= l; return d ? d : 1; }
 static uint32_t lvl_size(const shape *s, unsigned l)
 {
   unsigned w = lvl_dim(s->w, l), h = lvl_dim(s->h, l);
+  if (s->bc) return tu_bc_level_size(s->w, s->h, l, s->bpp);
   return s->cube ? w * h * s->bpp : tu_linear_level_size(w, h, s->bpp);
 }
 
@@ -300,6 +347,7 @@ static uint32_t lvl_off(const shape *s, unsigned face, unsigned l)
 static unsigned lvl_stride(const shape *s, unsigned l)
 {
   unsigned w = lvl_dim(s->w, l);
+  if (s->bc) return tu_bc_dim(s->w, l) * s->bpp;   // a row of blocks, nothing uses it as a stride
   return s->cube ? w * s->bpp : ALIGN_UP(w, 8) * s->bpp;
 }
 
@@ -315,9 +363,9 @@ static unsigned chain_len(unsigned w, unsigned h)
   return n > 13 ? 13 : n;
 }
 
-static shape make_shape(unsigned w, unsigned h, unsigned bpp, int cube, unsigned levels)
+static shape make_shape(unsigned w, unsigned h, unsigned bpp, int cube, unsigned levels, int bc)
 {
-  shape s = { w, h, bpp, levels, cube, 0 };
+  shape s = { w, h, bpp, levels, cube, 0, bc };
   if (cube) {
     s.levels = chain_len(w, h);
     s.face_size = tu_cube_face_size(w, bpp);
@@ -327,7 +375,7 @@ static shape make_shape(unsigned w, unsigned h, unsigned bpp, int cube, unsigned
 
 static shape shape_of(const gl_texture *t)
 {
-  shape s = { t->w, t->h, t->bpp, t->levels, t->is_cube, t->face_size };
+  shape s = { t->w, t->h, t->bpp, t->levels, t->is_cube, t->face_size, fmt_bc(t->fmt) != 0 };
   return s;
 }
 
@@ -405,11 +453,25 @@ static void tex_desc(gl_texture *t)
   unsigned cnt = is_mip_filter(t->min_filter) ? n : 1;
   void *p = (uint8_t *)t->mem->ptr + lvl_off(&s, 0, base);
   unsigned w = lvl_dim(t->w, base), h = lvl_dim(t->h, base);
-  int r = t->is_cube ? sceGxmTextureInitCube(&t->gxm, p, t->fmt, w, h, cnt)
-                     : sceGxmTextureInitLinear(&t->gxm, p, t->fmt, w, h, t->levels > 1 ? cnt : 0);
+  int r;
+  const char *kind = t->is_cube ? "cube" : "linear";
+  if (s.bc) {
+    // always a real mip count here: 0 is the linear-only "no chain" marker
+    if (tu_is_pow2(w) && tu_is_pow2(h)) {
+      kind = "swizzled bc";
+      r = sceGxmTextureInitSwizzled(&t->gxm, p, t->fmt, w, h, cnt);
+    } else {
+      kind = "swizzled arbitrary bc";
+      L_ONCE("tex: npot bc texture %u (%ux%u) uses SWIZZLED_ARBITRARY, the least tested layout here", t->name, w, h);
+      r = sceGxmTextureInitSwizzledArbitrary(&t->gxm, p, t->fmt, w, h, cnt);
+    }
+  } else if (t->is_cube) {
+    r = sceGxmTextureInitCube(&t->gxm, p, t->fmt, w, h, cnt);
+  } else {
+    r = sceGxmTextureInitLinear(&t->gxm, p, t->fmt, w, h, t->levels > 1 ? cnt : 0);
+  }
   if (r < 0) {
-    L("tex: gxm %s init %ux%u fmt 0x%08X levels %u failed 0x%08X", t->is_cube ? "cube" : "linear",
-      w, h, t->fmt, cnt, r);
+    L("tex: gxm %s init %ux%u fmt 0x%08X levels %u failed 0x%08X", kind, w, h, t->fmt, cnt, r);
     return;
   }
   t->mips_used = cnt;
@@ -483,6 +545,26 @@ const SceGxmTexture *tex_for_unit(int unit, int cube, uint32_t scene)
 
 static uint64_t g_tex_bytes;
 
+// memory the bc textures alive right now save against rgba8 storage
+static int64_t g_bc_saved;
+
+// what t saves by being bc: the same levels as linear rgba8 minus what it has
+static int64_t bc_saving(const gl_texture *t)
+{
+  if (!t->mem || !fmt_bc(t->fmt)) return 0;
+  shape r = make_shape(t->w, t->h, 4, 0, t->levels, 0);
+  return (int64_t)shape_bytes(&r) - (int64_t)t->mem->size;
+}
+
+static void bc_saved_log(void)
+{
+  static int64_t last;
+  int64_t d = g_bc_saved - last;
+  if (d < (8 << 20) && d > -(8 << 20)) return;
+  last = g_bc_saved;
+  L("tex: bc saves %d KiB right now (all textures %u KiB)", (int)(g_bc_saved >> 10), (unsigned)(g_tex_bytes >> 10));
+}
+
 static gl_texture *tex_make(GLuint name)
 {
   gl_texture *t = calloc(1, sizeof(*t));
@@ -498,9 +580,11 @@ static gl_texture *tex_make(GLuint name)
 static void tex_release(gl_texture *t)
 {
   if (t->mem) {
+    g_bc_saved -= bc_saving(t);
     g_tex_bytes -= t->mem->size;
     gpu_free_deferred(t->mem);
     t->mem = NULL;
+    bc_saved_log();
   }
   memset(t->defined, 0, sizeof(t->defined));
   t->valid = 0;
@@ -624,6 +708,7 @@ static int tex_realloc(gl_texture *t, const shape *ns, const fmt_info *fi, int k
         nd[f] |= (uint16_t)(1u << l);
       }
   }
+  g_bc_saved -= bc_saving(t);
   if (nb != t->mem) {
     if (t->mem) {
       g_tex_bytes -= t->mem->size;
@@ -653,6 +738,8 @@ static int tex_realloc(gl_texture *t, const shape *ns, const fmt_info *fi, int k
   memcpy(t->defined, nd, sizeof(nd));
   t->chain_guess = 0;
   t->valid = 0;   // caller rebuilds the descriptor
+  g_bc_saved += bc_saving(t);
+  bc_saved_log();
   return 0;
 }
 
@@ -684,7 +771,7 @@ static void hint_check(gl_texture *nt)
   o->chain_guess = 0;
   g_mip_hint = 0;
   if (o->mem && !o->is_cube && !(o->defined[0] & ~1u)) {
-    shape ns = make_shape(o->w, o->h, o->bpp, 0, 1);
+    shape ns = make_shape(o->w, o->h, o->bpp, 0, 1, fmt_bc(o->fmt) != 0);
     if (tex_realloc(o, &ns, NULL, 1, -1, -1) == 0) tex_desc(o);
   }
 }
@@ -702,10 +789,10 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
     unsigned levels = 1;
     if (pow2 && (keep || (has_data && g_mip_hint && is_mip_filter(t->min_filter))))
       levels = chain_len(w, h);
-    shape ns = make_shape(w, h, fi->bpp, 0, levels);
+    shape ns = make_shape(w, h, fi->bpp, 0, levels, fi->bc != 0);
     if (tex_realloc(t, &ns, fi, keep, 0, 0) < 0) {
       // near the limit: level 0 alone beats the white dummy
-      ns = make_shape(w, h, fi->bpp, 0, 1);
+      ns = make_shape(w, h, fi->bpp, 0, 1, fi->bc != 0);
       levels = 1;
       if (tex_realloc(t, &ns, fi, 0, 0, 0) < 0) {
         tex_release(t);
@@ -733,7 +820,7 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
       L_ONCE("tex: level %u is %ux%u, doesn't fit level 0 %ux%u, dropped", level, w, h, t->w, t->h);
       return -1;
     }
-    shape ns = make_shape(t->w, t->h, t->bpp, 0, n);
+    shape ns = make_shape(t->w, t->h, t->bpp, 0, n, fmt_bc(t->fmt) != 0);
     return tex_realloc(t, &ns, NULL, 1, -1, -1) < 0 ? -2 : 0;
   }
   // no level 0 yet (mips first): guess level 0 from this one. a 1 pixel wide
@@ -744,7 +831,7 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
     L_ONCE("tex: level %u (%ux%u) uploaded before level 0 and can't be placed, dropped", level, w, h);
     return -1;
   }
-  shape ns = make_shape(bw, bh, fi->bpp, 0, chain_len(bw, bh));
+  shape ns = make_shape(bw, bh, fi->bpp, 0, chain_len(bw, bh), fi->bc != 0);
   if (level >= ns.levels) return -1;
   return tex_realloc(t, &ns, fi, same_fmt, -1, -1) < 0 ? -2 : 0;
 }
@@ -758,7 +845,7 @@ static int prep_cube(gl_texture *t, unsigned face, unsigned level, unsigned w, u
   if (w != h || s != w) L_ONCE("tex: cube face %ux%u isn't pow2 square, resampled to %u (nearest)", w, h, s);
   if (level == 0) {
     if (same_fmt && t->w == s) return make_writable(t, (int)face, 0, 1) < 0 ? -2 : 0;
-    shape ns = make_shape(s, s, fi->bpp, 1, 0);
+    shape ns = make_shape(s, s, fi->bpp, 1, 0, 0);
     if (tex_realloc(t, &ns, fi, same_fmt, (int)face, 0) < 0) {
       tex_release(t);
       return -2;
@@ -776,7 +863,7 @@ static int prep_cube(gl_texture *t, unsigned face, unsigned level, unsigned w, u
   // no level 0 on any face yet: guess the size from this level
   unsigned bs = s << level;
   if (bs > 4096) return -1;
-  shape ns = make_shape(bs, bs, fi->bpp, 1, 0);
+  shape ns = make_shape(bs, bs, fi->bpp, 1, 0, 0);
   return tex_realloc(t, &ns, fi, 0, -1, -1) < 0 ? -2 : 0;
 }
 
@@ -869,6 +956,18 @@ static uint8_t g_strip[64 * 1024] __attribute__((aligned(16)));
 static void write_src(gl_texture *t, unsigned face, unsigned l, unsigned x0, unsigned y0, const src_t *s)
 {
   unsigned lw = lvl_dim(t->w, l), lh = lvl_dim(t->h, l), bpp = t->bpp;
+  if (fmt_bc(t->fmt)) {
+    // etc blocks -> bc blocks, straight into the swizzled level. x0/y0 are
+    // multiples of 4. a 4096 wide row of decoded blocks just fits the strip.
+    if (!s->etc || !s->data) return;   // callers never get here with anything else
+    shape sh = shape_of(t);
+    uint8_t *base = (uint8_t *)t->mem->ptr + lvl_off(&sh, 0, l);
+    // npot: the grid is bigger than the texture, don't leave junk in the rest
+    if (!x0 && !y0 && s->w == lw && s->h == lh && (!tu_is_pow2(t->w) || !tu_is_pow2(t->h)))
+      memset(base, 0, lvl_size(&sh, l));
+    bc_from_etc(s->etc, s->data, s->w, s->h, base, tu_bc_dim(t->w, l), tu_bc_dim(t->h, l), x0 / 4, y0 / 4, g_strip);
+    return;
+  }
   if (t->is_cube && (s->w != lw || s->h != lh)) {
     // npot cube face: whole face, nearest resampled to the level size
     uint8_t *a = malloc(s->w * s->h * bpp), *b = malloc(lw * lh * bpp);
@@ -904,6 +1003,53 @@ static void write_src(gl_texture *t, unsigned face, unsigned l, unsigned x0, uns
   free(heap);
 }
 
+// turn a bc texture back into the rgba8 one tex_bc=0 would have made. for the
+// things bc storage can't take: pixel sub images and mip generation. reads
+// the blocks back from gpu memory, slow, but nothing the game does hits it.
+static int tex_unbc(gl_texture *t, const char *why)
+{
+  unsigned bs = fmt_bc(t->fmt);
+  if (!bs || !t->mem) return 0;
+  L("tex: %s on bc texture %u (%ux%u, %u levels), falling back to rgba8 for it", why, t->name, t->w, t->h, t->levels);
+  shape os = shape_of(t);
+  shape ns = make_shape(t->w, t->h, 4, 0, t->levels, 0);
+  gpu_block *nb = gpu_alloc(shape_bytes(&ns), 256, GPU_PREF_CDRAM);
+  uint8_t *tmp = malloc(t->w * t->h * 4);
+  if (!nb || !tmp) {
+    L("tex: OOM turning bc texture %u into rgba8 (%u bytes)", t->name, shape_bytes(&ns));
+    if (nb) gpu_free(nb);
+    free(tmp);
+    return -1;
+  }
+  for (unsigned l = 0; l < t->levels; l++) {
+    if (!(t->defined[0] >> l & 1)) continue;
+    unsigned lw = lvl_dim(t->w, l), lh = lvl_dim(t->h, l), st = lvl_stride(&ns, l);
+    bc_level_to_rgba(bs, (const uint8_t *)t->mem->ptr + lvl_off(&os, 0, l), tu_bc_dim(t->w, l), tu_bc_dim(t->h, l),
+                     lw, lh, tmp, lw * 4);
+    uint8_t *d = (uint8_t *)nb->ptr + lvl_off(&ns, 0, l);
+    for (unsigned y = 0; y < lh; y++) memcpy(d + y * st, tmp + y * lw * 4, lw * 4);
+  }
+  free(tmp);
+  g_bc_saved -= bc_saving(t);
+  g_tex_bytes -= t->mem->size;
+  gpu_free_deferred(t->mem);   // queued draws keep sampling the bc copy
+  t->mem = nb;
+  g_tex_bytes += nb->size;
+  t->last_use = 0;
+  t->bpp = 4;
+  t->stride = lvl_stride(&ns, 0);
+  t->fmt = bs == 16 || etc_has_alpha(t->ifmt) ? SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR
+                                              : SCE_GXM_TEXTURE_FORMAT_X8U8U8U8_1BGR;
+  t->renderable = 1;
+  t->color_fmt = SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR;
+  t->out_fmt = SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4;
+  t->out_size = SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT;
+  t->srgb = is_srgb_ifmt(t->ifmt);
+  bc_saved_log();
+  tex_desc(t);
+  return 0;
+}
+
 // shared by glTexImage2D / glCompressedTexImage2D: specify a whole level
 static void tex_image(gl_texture *t, int face, unsigned level, GLenum ifmt, const fmt_info *fi,
                       const src_t *s, int has_data)
@@ -917,7 +1063,8 @@ static void tex_image(gl_texture *t, int face, unsigned level, GLenum ifmt, cons
     t->ifmt = ifmt;
     int want = is_srgb_ifmt(ifmt);
     // fbo writes don't gamma encode, so an srgb render target must not decode
-    t->srgb = want && has_data && gamma_ok(fi->fmt);
+    // bc only gets here with tex_bc_srgb=1, then gxm gets to say if it can
+    t->srgb = want && has_data && (gamma_ok(fi->fmt) || fi->bc);
     if (want && !has_data)
       L_ONCE("tex: sRGB texture %u specified without data (render target?), sampled without gamma", t->name);
   }
@@ -963,6 +1110,9 @@ void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GL
     return;
   }
   if (!w || !h || !data) return;
+  // pixels can't go into bc blocks (GL doesn't allow this on a compressed
+  // texture anyway)
+  if (fmt_bc(t->fmt) && tex_unbc(t, "glTexSubImage2D") < 0) { GL_ERR(GL_OUT_OF_MEMORY); return; }
   fmt_info fi;
   pick_format(t->ifmt, fmt, type, &fi);
   if (fi.bpp != t->bpp || fi.fmt != t->fmt) {
@@ -985,8 +1135,23 @@ void glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, 
   gl_texture *t = target_tex(target, &face);
   if (!t) { GL_ERR(GL_INVALID_OPERATION); return; }
   if (level < 0 || level > 12 || w <= 0 || h <= 0 || w > 4096 || h > 4096) { GL_ERR(GL_INVALID_VALUE); return; }
+  // bc for 2d textures. cubes stay rgba8 (few, and bc cube faces have their
+  // own padding rules). srgb stays rgba8 too, that's the one format gxm is
+  // known to gamma decode; tex_bc_srgb=1 tries bc + gamma anyway.
+  // tex_bc_npot=0 keeps npot ones on rgba8 (they need SWIZZLED_ARBITRARY, the
+  // layout we have the least proof for), to tell that apart from the rest.
+  static int bc_srgb = -1, bc_npot;
+  if (bc_srgb < 0) {
+    extern int config_int(const char *key, int def);
+    bc_srgb = config_int("tex_bc_srgb", 0) != 0;
+    bc_npot = config_int("tex_bc_npot", 1) != 0;
+  }
+  int bc = bc_enabled() && face < 0 && (bc_srgb || !is_srgb_ifmt(ifmt));
+  if (bc && !bc_npot && (!tu_is_pow2((unsigned)w) || !tu_is_pow2((unsigned)h))) bc = 0;
+  // mips go where the texture already is, a format change would drop them
+  if (level > 0 && face < 0 && t->mem && !t->is_cube && t->defined[0]) bc = fmt_bc(t->fmt) != 0;
   fmt_info fi;
-  if (!etc_format(ifmt, &fi)) {
+  if (!etc_format(ifmt, &fi, bc)) {
     L_ONCE("tex: glCompressedTexImage2D ifmt 0x%X not handled", ifmt);
     return;
   }
@@ -996,11 +1161,49 @@ void glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, 
   src_t s = { &fi, data, (unsigned)w, (unsigned)h, 0, ifmt };
   tex_image(t, face, (unsigned)level, ifmt, &fi, &s, 1);
   etc_in += size;
-  etc_out += (uint64_t)w * h * fi.bpp;
+  etc_out += fi.bc ? (uint64_t)need : (uint64_t)w * h * fi.bpp;
   static unsigned n;
   if ((n++ & 255) == 0)
-    L("tex: etc decoded so far: %u KiB compressed -> %u KiB (all textures now %u KiB)",
-      (unsigned)(etc_in >> 10), (unsigned)(etc_out >> 10), (unsigned)(g_tex_bytes >> 10));
+    L("tex: etc uploads so far: %u KiB compressed -> %u KiB stored (all textures now %u KiB, bc saves %d KiB)",
+      (unsigned)(etc_in >> 10), (unsigned)(etc_out >> 10), (unsigned)(g_tex_bytes >> 10), (int)(g_bc_saved >> 10));
+}
+
+// the game doesn't import this one, so it isn't in gl_api.h / the export table
+// yet. whole blocks only, like GL wants. works on bc and on rgba8 storage.
+void glCompressedTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                               GLenum fmt, GLsizei size, const void *data);
+void glCompressedTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                               GLenum fmt, GLsizei size, const void *data)
+{
+  int face;
+  gl_texture *t = target_tex(target, &face);
+  unsigned f = face < 0 ? 0 : (unsigned)face;
+  if (!t || !t->mem || level < 0 || (unsigned)level >= t->levels || !(t->defined[f] >> level & 1)) {
+    GL_ERR(GL_INVALID_OPERATION);
+    return;
+  }
+  unsigned lw = lvl_dim(t->w, level), lh = lvl_dim(t->h, level);
+  if (x < 0 || y < 0 || w < 0 || h < 0 || (unsigned)(x + w) > lw || (unsigned)(y + h) > lh) {
+    GL_ERR(GL_INVALID_VALUE);
+    return;
+  }
+  if ((x & 3) || (y & 3) || ((w & 3) && (unsigned)(x + w) != lw) || ((h & 3) && (unsigned)(y + h) != lh)) {
+    GL_ERR(GL_INVALID_OPERATION);
+    return;
+  }
+  if (!w || !h || !data) return;
+  fmt_info fi;
+  if (!etc_format(fmt, &fi, fmt_bc(t->fmt) != 0) || fi.fmt != t->fmt || fi.bpp != t->bpp) {
+    L_ONCE("tex: glCompressedTexSubImage2D format 0x%X doesn't match the texture, ignored", fmt);
+    GL_ERR(GL_INVALID_OPERATION);
+    return;
+  }
+  int need = ((w + 3) / 4) * ((h + 3) / 4) * etc_block_bytes(fmt);
+  if (size < need) { L("tex: compressed sub image size %d < expected %d", size, need); return; }
+  if (make_writable(t, face, level, 0) < 0) { GL_ERR(GL_OUT_OF_MEMORY); tex_desc(t); return; }
+  src_t s = { &fi, data, (unsigned)w, (unsigned)h, 0, fmt };
+  write_src(t, f, (unsigned)level, (unsigned)x, (unsigned)y, &s);
+  tex_desc(t);
 }
 
 // ============================================================ params
@@ -1059,6 +1262,8 @@ void glGenerateMipmap(GLenum target)
 {
   gl_texture *t = bound_tex(target);
   if (!t || !t->mem) { GL_ERR(GL_INVALID_OPERATION); return; }
+  // no box filter on bc blocks: needs the pixels back
+  if (fmt_bc(t->fmt) && tex_unbc(t, "glGenerateMipmap") < 0) { GL_ERR(GL_OUT_OF_MEMORY); return; }
   int kind = box_kind(t->fmt);
   if (!kind) {
     L_ONCE("tex: glGenerateMipmap on gxm format 0x%08X not supported", t->fmt);
@@ -1074,7 +1279,7 @@ void glGenerateMipmap(GLenum target)
   if (!t->is_cube) {
     unsigned n = chain_len(t->w, t->h);
     if (t->levels < n) {
-      shape ns = make_shape(t->w, t->h, t->bpp, 0, n);
+      shape ns = make_shape(t->w, t->h, t->bpp, 0, n, 0);
       if (tex_realloc(t, &ns, NULL, 1, -1, -1) < 0) { GL_ERR(GL_OUT_OF_MEMORY); tex_desc(t); return; }
     }
   }
