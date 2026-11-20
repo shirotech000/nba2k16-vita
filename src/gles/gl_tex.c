@@ -799,11 +799,12 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
         // for nearly all of these). its level 0 gets dropped and level 1
         // becomes ours, a quarter of the memory and a bit softer, instead of
         // the white dummy (hw: hair, crowd, hoops)
-        if (pow2 && w >= 8 && h >= 8 && is_mip_filter(t->min_filter)) {
-          unsigned hw = w >> 1, hh = h >> 1;
+        // half, then quarter, then eighth: blurry beats white
+        for (unsigned sk = 1; sk <= 3 && pow2 && (w >> sk) >= 8 && (h >> sk) >= 8 && is_mip_filter(t->min_filter); sk++) {
+          unsigned hw = w >> sk, hh = h >> sk;
           shape hs = make_shape(hw, hh, fi->bpp, 0, chain_len(hw, hh), fi->bc != 0);
           if (tex_realloc(t, &hs, fi, 0, 0, 0) == 0) {
-            t->skip = 1;
+            t->skip = sk;
             t->chain_guess = 0;
             static unsigned n_half;
             if (n_half++ < 16 || (n_half & 63) == 0)
