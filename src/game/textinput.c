@@ -94,17 +94,30 @@ static void ime_poll(void)
   ime_state = 2;
 }
 
+static unsigned n_polls;
+
 static void pump(void)
 {
+  n_polls++;
   if (ime_state == 1) { ime_poll(); return; }
   int active = g_textedit_active && g_textedit_active();
+  static int last_active = -1;
+  if (active != last_active) {
+    L("textinput: text field %s (%u keyboard polls so far)", active ? "focused" : "unfocused", n_polls);
+    last_active = active;
+  }
   if (!active) { if (ime_state == 2 && qh == qt) ime_state = 0; return; }
   if (ime_state == 0 && qh == qt) ime_open();
 }
 
+// always "connected": the game asks once at init too, and a "no" there
+// seems to switch keyboard text entry off for good (career save-name box
+// never asked for chars). the ime still only opens while a field has focus
 static int my_is_connected(void)
 {
-  return (g_textedit_active && g_textedit_active()) || ime_state == 1 || qh != qt;
+  static int logged;
+  if (!logged++) L("textinput: game asked if a keyboard is connected (yes)");
+  return 1;
 }
 
 static int my_get_next(uint32_t *ch, int *code, uint8_t *mod, int peek)
