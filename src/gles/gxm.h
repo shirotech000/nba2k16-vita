@@ -94,7 +94,7 @@ int gxm_depth_surface_init(SceGxmDepthStencilSurface *ds, unsigned w, unsigned h
 // every fragment program run at the sample mode, the color surface downscales
 // on store so the texture/display stays 1x, depth holds all the samples
 // (4x: 2x wide + 2x tall, 2x: 2x tall).
-SceGxmMultisampleMode gxm_msaa_setting(void);          // config msaa=0/2/4, default 4
+SceGxmMultisampleMode gxm_msaa_setting(void);          // config msaa=0/2/4, default 0 for now
 int gxm_msaa_display(void);                            // config msaa_display=1
 SceGxmMultisampleMode gxm_scene_msaa(void);            // mode of the open scene
 uint32_t gxm_depth_surface_size_ms(unsigned w, unsigned h, SceGxmMultisampleMode ms);

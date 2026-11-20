@@ -90,7 +90,7 @@ Every patch checks the original bytes first.
 - `no_audio=1`: never open an audio port. The OpenSL mixer runs on a silent clock.
 - `frame_log=1`: log draw/clear counts for every frame
 - `game_heap_mb=N`, `version_code=N`
-- `msaa=0/2/4` (default 4, main 3D target), `msaa_display=1`, `cube_dummy=1`, `async_shaders=0`
+- `msaa=0/2/4` (default 0 for now, main 3D target), `msaa_display=1`, `cube_dummy=1`, `async_shaders=0`
 - `fbo_cull_flip=0`, `stencil_swap=1`: winding/stencil checks
 - `capunlocker=0`: don't use core 3 even if CapUnlocker is loaded
 
@@ -150,7 +150,8 @@ The game wipes files in what it thinks are android's data dirs on boot. The firs
     - glsl2cg output is cached (`shadercache/t*.g2c`, keyed by the GLSL pair + the translator build stamp), so cached links run inline. That fixed the laggy intro logo fade (the game links ~200 programs there).
   - **Rendering:**
     - real cube maps, mip chains, sRGB, stencil only where the target has one;
-    - **4x MSAA on the main 3D target** (mbaavita-style: sample-mode fragment programs, downscale-on-store color, sample-sized depth twin, +8 MB CDRAM). `msaa=0/2/4`, `msaa_display=1`.
+    - **4x MSAA on the main 3D target** (mbaavita-style: sample-mode fragment programs, downscale-on-store color, sample-sized depth twin, +8 MB CDRAM). `msaa=0/2/4`, `msaa_display=1`. **Off by default for now**: with it on, the match load hung at 96% (`malloc(4194315) FAILED`, main + cdram both at their reserves). Turn it back on once textures shrink (ETC2→BC transcoding).
+    - bigmem now also takes 1 MB+ blocks from phycont (keeps 2 MB for gxm). The 96% hang had ~8 MB sitting idle in there.
   - **Open: player skin renders green** (only the skin shader; jerseys/court/UI fine). Bisect switch `cube_dummy=1`.
   - **Screenshots:** `shot.flag` dumps the back buffer, but Vita3K doesn't write rendered frames back to guest memory, so it comes out black there (works on hw). In Vita3K, PrintWindow on the Vita3K window works instead.
 - OpenSL: PCM buffer-queue players work. The game also wants an AAC-ADTS decoder player (probably music/commentary streams), which gets refused for now. sceAudiodec can do AAC, that's for later. Took ALC-off and core pinning from PSPMania's audio driver.

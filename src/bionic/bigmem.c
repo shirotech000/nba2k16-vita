@@ -19,6 +19,8 @@
 // overflow the game has made its threads, so these can stay small.
 #define GL_RESERVE   (6 * 1024 * 1024)
 #define MAIN_RESERVE (4 * 1024 * 1024)
+#define PC_GRAN      (1024 * 1024)       // phycont is 1 MiB granular
+#define PC_RESERVE   (2 * 1024 * 1024)   // gxm's lpddr chunks come from here too
 #define MAX_BLOCKS   2048
 
 typedef struct {
@@ -82,6 +84,14 @@ void *bigmem_alloc(size_t n) {
   // main memory first, it's normal cached ram
   if ((size_t)fi.size_user >= sz + MAIN_RESERVE)
     uid = sceKernelAllocMemBlock("nba_big", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, sz, NULL);
+
+  // phycont next: cached ram in its own 26MB pool, mostly gxm rings. the
+  // match load died with ~8MB sitting idle in there. 1MB+ blocks only,
+  // anything smaller would waste most of its 1MB granule
+  if (uid < 0 && n >= PC_GRAN && (size_t)fi.size_phycont >= ALIGN_UP(n, PC_GRAN) + PC_RESERVE) {
+    sz = ALIGN_UP(n, PC_GRAN);
+    uid = sceKernelAllocMemBlock("nba_big", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, sz, NULL);
+  }
 
   if (uid < 0) {
     sz = ALIGN_UP(n, CDRAM_GRAN);

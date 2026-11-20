@@ -719,7 +719,9 @@ SceGxmMultisampleMode gxm_msaa_setting(void)
 {
   static int v = -1;
   if (v < 0) {
-    v = config_int("msaa", 4);
+    // off by default until texture memory gets smaller: its 8MB depth twin
+    // was the difference between a match loading or not (msaa=4 to turn on)
+    v = config_int("msaa", 0);
     L("gxm: msaa %dx (msaa=0/2/4 in config.txt)", v == 4 || v == 2 ? v : 0);
   }
   return v == 4 ? SCE_GXM_MULTISAMPLE_4X : v == 2 ? SCE_GXM_MULTISAMPLE_2X : SCE_GXM_MULTISAMPLE_NONE;
