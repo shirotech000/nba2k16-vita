@@ -1114,6 +1114,9 @@ static void maybe_screenshot(void)
 void gxm_swap(void)
 {
   if (!g_ready) return;
+  // whoever swaps is the render thread: give it a core of its own once a
+  // few hundred frames in (past boot, all game threads exist by then)
+  if (g_frame == 300) { extern void cpu_pin_render_thread(void); cpu_pin_render_thread(); }
   gxm_end_scene();
   if (!g_dry_run) maybe_screenshot();
 

@@ -58,6 +58,7 @@ typedef struct gl_texture {
   SceGxmTexture gxm;
   int valid;
   int levels_dropped;
+  unsigned skip;            // game mip levels dropped to fit (stored level = game level - skip)
   GLenum min_filter, mag_filter, wrap_s, wrap_t;
   uint32_t last_use;
   // render-to-texture

@@ -795,6 +795,22 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
       ns = make_shape(w, h, fi->bpp, 0, 1, fi->bc != 0);
       levels = 1;
       if (tex_realloc(t, &ns, fi, 0, 0, 0) < 0) {
+        // still no room: keep it at half size if the game sends mips (it does
+        // for nearly all of these). its level 0 gets dropped and level 1
+        // becomes ours, a quarter of the memory and a bit softer, instead of
+        // the white dummy (hw: hair, crowd, hoops)
+        if (pow2 && w >= 8 && h >= 8 && is_mip_filter(t->min_filter)) {
+          unsigned hw = w >> 1, hh = h >> 1;
+          shape hs = make_shape(hw, hh, fi->bpp, 0, chain_len(hw, hh), fi->bc != 0);
+          if (tex_realloc(t, &hs, fi, 0, 0, 0) == 0) {
+            t->skip = 1;
+            t->chain_guess = 0;
+            static unsigned n_half;
+            if (n_half++ < 16 || (n_half & 63) == 0)
+              L("tex: %ux%u texture %u stored at %ux%u to fit (#%u)", w, h, t->name, hw, hh, n_half);
+            return -3;
+          }
+        }
         tex_release(t);
         return -2;
       }
@@ -1055,8 +1071,14 @@ static void tex_image(gl_texture *t, int face, unsigned level, GLenum ifmt, cons
                       const src_t *s, int has_data)
 {
   unsigned f = face < 0 ? 0 : (unsigned)face;
+  if (face < 0 && t->skip) {
+    if (level == 0) t->skip = 0;              // re-specified, try full size again
+    else if (level < t->skip) return;         // a level we dropped
+    else level -= t->skip;
+  }
   int r = face < 0 ? prep_2d(t, level, s->w, s->h, fi, has_data)
                    : prep_cube(t, f, level, s->w, s->h, fi);
+  if (r == -3) return;                        // stored smaller, level 0 skipped on purpose
   if (r == -2) { GL_ERR(GL_OUT_OF_MEMORY); tex_desc(t); return; }
   if (r < 0) { t->levels_dropped++; return; }
   if (level == 0) {
@@ -1100,6 +1122,10 @@ void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GL
   int face;
   gl_texture *t = target_tex(target, &face);
   unsigned f = face < 0 ? 0 : (unsigned)face;
+  if (t && face < 0 && t->skip && level >= 0) {
+    if ((unsigned)level < t->skip) return;   // that level isn't stored
+    level -= (GLint)t->skip;
+  }
   if (!t || !t->mem || level < 0 || (unsigned)level >= t->levels || !(t->defined[f] >> level & 1)) {
     GL_ERR(GL_INVALID_OPERATION);
     return;
