@@ -689,8 +689,8 @@ static int tex_realloc(gl_texture *t, const shape *ns, const fmt_info *fi, int k
   } else {
     nb = gpu_alloc(size, align, GPU_PREF_CDRAM);
     if (!nb) {
-      L("tex: OOM for %ux%u%s texture %u (%u bytes, %u levels)", ns->w, ns->h, ns->cube ? " cube" : "",
-        t->name, size, ns->levels);
+      L("tex: OOM for %ux%u%s texture %u (%u bytes, %u levels, gxm fmt 0x%08X)", ns->w, ns->h,
+        ns->cube ? " cube" : "", t->name, size, ns->levels, (unsigned)nfmt);
       return -1;
     }
   }
