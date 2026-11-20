@@ -13,11 +13,18 @@
 static SceUID log_fd = -1;
 static SceKernelLwMutexWork log_lock;
 static int log_ready;
+// sync mode: reopen the file after every line. slow, but vita3k buffers
+// host-side and loses the tail when it dies hard, which is exactly the
+// part you want. turn on with sync_log=1 in config.txt.
+static int log_sync;
+
+int config_int(const char *key, int def);
 
 void log_init(void) {
   sceIoMkdir(DATA_PATH, 0777);
   sceKernelCreateLwMutex(&log_lock, "log", 0, 0, NULL);
   log_fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+  log_sync = config_int("sync_log", 0);
   log_ready = 1;
 }
 
@@ -34,7 +41,13 @@ void log_vprintf(const char *fmt, va_list ap) {
   sceClibPrintf("%s", buf);
   if (!log_ready) return;
   sceKernelLockLwMutex(&log_lock, 1, NULL);
-  if (log_fd >= 0) sceIoWrite(log_fd, buf, n);
+  if (log_fd >= 0) {
+    sceIoWrite(log_fd, buf, n);
+    if (log_sync) {
+      sceIoClose(log_fd);
+      log_fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_APPEND, 0777);
+    }
+  }
   sceKernelUnlockLwMutex(&log_lock, 1);
 }
 

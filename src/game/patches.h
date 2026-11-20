@@ -8,3 +8,7 @@ void patches_apply(so_module *game);
 
 // ux0:data/nba2k16/config.txt, "key=value" lines, read once
 int config_int(const char *key, int def);
+
+// logs the game's own heap usage (+ our malloc stats) every 5s
+void game_monitor_init(so_module *game);
+void game_monitor_tick(void);

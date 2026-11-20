@@ -7,6 +7,7 @@
 
 #include "android/android.h"
 #include "android/jni.h"
+#include "game/patches.h"
 #include "loader/exports.h"
 #include "loader/so_loader.h"
 #include "util/log.h"
@@ -51,6 +52,7 @@ void activity_loop(void) {
   // the game runs in its own thread (android_main), we just feed it input
   for (;;) {
     input_poll();
+    game_monitor_tick();
     sceKernelDelayThread(8 * 1000);
   }
 }

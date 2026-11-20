@@ -18,7 +18,10 @@
 
 // newlib heap. the .so images, GPU memory and thread stacks live outside
 // of this, so it can't be the whole budget.
-int _newlib_heap_size_user = 240 * 1024 * 1024;
+#ifndef NBA_HEAP_MB
+#define NBA_HEAP_MB 288
+#endif
+int _newlib_heap_size_user = NBA_HEAP_MB * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 1024 * 1024;
 
 void libc_init(void);
@@ -94,6 +97,7 @@ int main(void) {
   so_run_init(&stl_mod);
   so_run_init(&game_mod);
   mem_report();
+  game_monitor_init(&game_mod);
 
   if (gfx_init) gfx_init();
 

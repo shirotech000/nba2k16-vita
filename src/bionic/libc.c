@@ -21,7 +21,7 @@
 #include "bionic/bionic.h"
 
 // --- malloc with stats, memory is THE question for this port ---
-static volatile int mem_live, mem_peak, mem_biggest, mem_fails;
+static volatile int mem_live, mem_peak, mem_biggest, mem_fails, mem_count;
 
 static void mem_add(void *p, size_t req) {
   if (!p) {
@@ -32,15 +32,28 @@ static void mem_add(void *p, size_t req) {
   }
   if (req >= 32 * 1024 * 1024) so_backtrace("huge alloc");
   int n = __sync_add_and_fetch(&mem_live, (int)malloc_usable_size(p));
-  if (n > mem_peak) mem_peak = n;
-  if ((int)req > mem_biggest) {
-    mem_biggest = req;
-    if (req >= 4 * 1024 * 1024) L("big alloc: %uK (live %uK)", (unsigned)(req / 1024), n / 1024);
+  if (n > mem_peak) {
+    // timeline: one line every 8MB of new peak
+    static volatile int last_mark;
+    int mark = n >> 23;
+    if (mark > last_mark) {
+      last_mark = mark;
+      L("mem: new peak %uK (%u allocs live)", (unsigned)(n / 1024), mem_count + 1);
+    }
+    mem_peak = n;
+  }
+  __sync_add_and_fetch(&mem_count, 1);
+  if ((int)req > mem_biggest) mem_biggest = req;
+  if (req >= 1024 * 1024) {
+    L("big alloc: %uK (live %uK)", (unsigned)(req / 1024), n / 1024);
+    if (req < 32 * 1024 * 1024) so_backtrace("big alloc");
   }
 }
 
 static void mem_sub(void *p) {
-  if (p) __sync_sub_and_fetch(&mem_live, (int)malloc_usable_size(p));
+  if (!p) return;
+  __sync_sub_and_fetch(&mem_live, (int)malloc_usable_size(p));
+  __sync_sub_and_fetch(&mem_count, 1);
 }
 
 void mem_report(void) {

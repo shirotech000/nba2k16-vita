@@ -2,7 +2,7 @@
 
 A PS Vita port of the Android version of NBA 2K16 (v0.0.29). It loads the game's ARM `.so` straight onto the Vita and fakes enough Android around it for the game to think it's on a phone.
 
-**Status: early WIP.** It doesn't boot to gameplay yet, see [docs/NOTES.md](docs/NOTES.md) for where things are at.
+**Status: early WIP.** In Vita3K it boots, loads the OBB, compiles the game's shaders and renders its first frames, then dies about 14 s in. It's nowhere near playable yet. Not tested on real hardware. See [docs/NOTES.md](docs/NOTES.md) for details.
 
 ## You need your own game files
 
