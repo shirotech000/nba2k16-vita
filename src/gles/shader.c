@@ -1468,7 +1468,16 @@ static void link_job_fn(void *arg)
   free(r);
 }
 
+static void glLinkProgram_impl(GLuint prog);
 void glLinkProgram(GLuint prog)
+{
+  SceUInt64 t0 = sceKernelGetProcessTimeWide();
+  glLinkProgram_impl(prog);
+  extern void gxm_prof_link(uint64_t us);
+  gxm_prof_link(sceKernelGetProcessTimeWide() - t0);
+}
+
+static void glLinkProgram_impl(GLuint prog)
 {
   gl_program *p = prog_get(prog);
   if (!p) { GL_ERR(GL_INVALID_VALUE); return; }

@@ -691,6 +691,13 @@ static uint32_t g_ring_peak;  // transient ring high water mark
 
 void gxm_prof_draws(uint32_t n, uint64_t us) { g_prof.draws += n; g_prof.draw_us += us; }
 
+// where menu hitches go: time inside texture uploads (incl. bc encode) and
+// program links, summed per 5s window
+static uint64_t g_tex_us, g_link_us;
+static uint32_t g_tex_n, g_link_n;
+void gxm_prof_tex(uint64_t us) { g_tex_us += us; g_tex_n++; }
+void gxm_prof_link(uint64_t us) { g_link_us += us; g_link_n++; }
+
 void gxm_wait_scene(uint32_t id)
 {
   if (!g_ready || gxm_scene_done(id)) return;
@@ -721,6 +728,11 @@ void gxm_prof_report(void)
     g_prof.draw_us ? dm / 1000 : 0, g_prof.draw_us ? dm % 1000 / 10 : 0,
     g_prof.scenes / f, g_prof.scenes * 10 / f % 10, (unsigned)(g_ring_peak >> 10));
   memset(&g_prof, 0, sizeof(g_prof));
+  if (g_tex_n || g_link_n)
+    L("gl cpu: texture uploads %u ms (%u calls), program links %u ms (%u)",
+      (unsigned)(g_tex_us / 1000), g_tex_n, (unsigned)(g_link_us / 1000), g_link_n);
+  g_tex_us = g_link_us = 0;
+  g_tex_n = g_link_n = 0;
 }
 
 typedef struct {

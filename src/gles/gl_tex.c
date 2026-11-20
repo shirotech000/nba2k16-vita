@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <psp2/kernel/processmgr.h>
 #include "gles/gl_internal.h"
 #include "gles/gl_api.h"
 #include "gles/texutil.h"
@@ -1184,7 +1185,18 @@ static void tex_image(gl_texture *t, int face, unsigned level, GLenum ifmt, cons
   tex_desc(t);
 }
 
+static void glTexImage2D_impl(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border,
+                  GLenum fmt, GLenum type, const void *data);
 void glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border,
+                  GLenum fmt, GLenum type, const void *data)
+{
+  SceUInt64 t0 = sceKernelGetProcessTimeWide();
+  glTexImage2D_impl(target, level, ifmt, w, h, border, fmt, type, data);
+  extern void gxm_prof_tex(uint64_t us);
+  gxm_prof_tex(sceKernelGetProcessTimeWide() - t0);
+}
+
+static void glTexImage2D_impl(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border,
                   GLenum fmt, GLenum type, const void *data)
 {
   (void)border;
@@ -1267,7 +1279,18 @@ void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GL
   tex_desc(t);
 }
 
+static void glCompressedTexImage2D_impl(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h,
+                            GLint border, GLsizei size, const void *data);
 void glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h,
+                            GLint border, GLsizei size, const void *data)
+{
+  SceUInt64 t0 = sceKernelGetProcessTimeWide();
+  glCompressedTexImage2D_impl(target, level, ifmt, w, h, border, size, data);
+  extern void gxm_prof_tex(uint64_t us);
+  gxm_prof_tex(sceKernelGetProcessTimeWide() - t0);
+}
+
+static void glCompressedTexImage2D_impl(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h,
                             GLint border, GLsizei size, const void *data)
 {
   (void)border;
