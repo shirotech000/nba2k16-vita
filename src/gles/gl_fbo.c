@@ -295,6 +295,18 @@ int gl_ensure_scene(int full_ds_clear)
           w = ctex->w; h = ctex->h;
           T.has_color = 1;
           T.out_fmt = ctex->out_fmt;
+          // once per format/size: which textures the game renders into
+          static uint32_t seen[16];
+          static int nseen;
+          uint32_t key = (uint32_t)ctex->color_fmt ^ (ctex->w << 20) ^ (ctex->h << 8) ^ ctex->bpp;
+          int known = 0;
+          for (int i = 0; i < nseen; i++) known |= seen[i] == key;
+          if (!known && nseen < 16) {
+            seen[nseen++] = key;
+            L("fbo: rendering into texture %u %ux%u color fmt 0x%08X bpp %u stride %u levels %u%s",
+              ctex->name, ctex->w, ctex->h, (unsigned)ctex->color_fmt, ctex->bpp, ctex->stride,
+              ctex->levels, ctex->is_cube ? " (cube!)" : "");
+          }
         }
       } else if (ctex && ctex->valid) {
         L_ONCE("fbo: texture %u format isn't renderable, color writes dropped", ctex->name);

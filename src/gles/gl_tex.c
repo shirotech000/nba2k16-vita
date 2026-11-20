@@ -456,7 +456,15 @@ const SceGxmTexture *tex_for_unit(int unit, int cube, uint32_t scene)
 {
   make_dummies();
   if (cube) {
-    gl_texture *t = tex_get(G.texcube[unit]);
+    // cube_dummy=1 in config.txt: every cube samples black, for bisecting
+    // whether a rendering problem comes from our cube maps
+    static int dbg_cube = -1;
+    if (dbg_cube < 0) {
+      extern int config_int(const char *key, int def);
+      dbg_cube = config_int("cube_dummy", 0);
+      if (dbg_cube) L("tex: cube_dummy set, all cube maps sample black");
+    }
+    gl_texture *t = dbg_cube ? NULL : tex_get(G.texcube[unit]);
     if (t && t->valid && t->is_cube) {
       t->last_use = scene;
       return &t->gxm;
