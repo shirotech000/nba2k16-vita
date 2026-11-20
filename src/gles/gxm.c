@@ -506,6 +506,7 @@ static struct {
   uint32_t waits, frames, scenes, draws;
 } g_prof;
 static SceUInt64 g_last_swap;
+static uint32_t g_ring_peak;  // transient ring high water mark
 
 void gxm_prof_draws(uint32_t n, uint64_t us) { g_prof.draws += n; g_prof.draw_us += us; }
 
@@ -533,11 +534,11 @@ void gxm_prof_report(void)
   unsigned fm = (unsigned)(g_prof.frame_us / f), wm = (unsigned)(g_prof.wait_us / f),
            qm = (unsigned)(g_prof.queue_us / f), dm = (unsigned)(g_prof.draw_us / f);
   L("frame: %u.%02ums avg | cpu stalls %u.%02ums (%u.%u/frame) | display queue %u.%02ums | "
-    "draws %u/frame%s%u.%02ums | %u.%u scenes/frame",
+    "draws %u/frame%s%u.%02ums | %u.%u scenes/frame | ring peak %u KiB",
     fm / 1000, fm % 1000 / 10, wm / 1000, wm % 1000 / 10, g_prof.waits / f, g_prof.waits * 10 / f % 10,
     qm / 1000, qm % 1000 / 10, g_prof.draws / f, g_prof.draw_us ? " in " : " ",
     g_prof.draw_us ? dm / 1000 : 0, g_prof.draw_us ? dm % 1000 / 10 : 0,
-    g_prof.scenes / f, g_prof.scenes * 10 / f % 10);
+    g_prof.scenes / f, g_prof.scenes * 10 / f % 10, (unsigned)(g_ring_peak >> 10));
   memset(&g_prof, 0, sizeof(g_prof));
 }
 
@@ -593,6 +594,7 @@ static void process_deferred(void)
 static memblk g_ring_mb;
 static uint8_t *g_ring;
 static uint32_t g_ring_head, g_ring_used, g_ring_pending;
+uint32_t g_ring_size = 4 * 1024 * 1024;
 
 typedef struct { uint32_t scene, bytes; } ring_mark_t;
 #define RING_MARKS 1024
@@ -652,6 +654,7 @@ void *ring_alloc(uint32_t size, uint32_t align)
     ring_retire();
     if (g_ring_used + need <= GXM_TRANSIENT_RING_SIZE) {
       g_ring_used += need;
+      if (g_ring_used > g_ring_peak) g_ring_peak = g_ring_used;
       g_ring_pending += need;
       g_ring_head = start + size;
       return g_ring + start;
@@ -1050,7 +1053,15 @@ int gxm_init(void)
   ip.displayQueueMaxPendingCount = DISPLAY_BUFFERS - 1;
   ip.displayQueueCallback = display_cb;
   ip.displayQueueCallbackDataSize = sizeof(flip_data);
-  ip.parameterBufferSize = GXM_PARAM_BUF_SIZE;
+  int pb_mb = config_int("pb_mb", GXM_PARAM_BUF_MB_DEFAULT);
+  if (pb_mb < 4) pb_mb = 4;
+  if (pb_mb > 16) pb_mb = 16;
+  ip.parameterBufferSize = (uint32_t)pb_mb * 1024 * 1024;
+  int ring_mb = config_int("ring_mb", 4);
+  if (ring_mb < 2) ring_mb = 2;
+  if (ring_mb > 16) ring_mb = 16;
+  g_ring_size = (uint32_t)ring_mb * 1024 * 1024;
+  L("gxm: param buffer %d MB, transient ring %d MB", pb_mb, ring_mb);
   r = sceGxmInitialize(&ip);
   if (r < 0) fatal("sceGxmInitialize failed 0x%08X", r);
   gpu_mem_log("after sceGxmInitialize (param buffer)");

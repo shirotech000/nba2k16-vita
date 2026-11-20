@@ -11,12 +11,18 @@
 #define DISPLAY_BUFFERS 3
 
 // knobs. rings are bigger than the sdk defaults, this game is draw heavy
-#define GXM_PARAM_BUF_SIZE     (16 * 1024 * 1024)
+// param buffer: 8MB (pb_mb= in config.txt). gxm's default 16MB came straight
+// out of cdram on hw and a full match load needs every MB; if it ever fills
+// the gpu just does a partial render, nothing breaks
+#define GXM_PARAM_BUF_MB_DEFAULT 8
 #define GXM_VDM_RING_SIZE      (256 * 1024)
 #define GXM_VERTEX_RING_SIZE   (4 * 1024 * 1024)
 #define GXM_FRAGMENT_RING_SIZE (2 * 1024 * 1024)
 #define GXM_FRAG_USSE_RING_SIZE (16 * 1024)
-#define GXM_TRANSIENT_RING_SIZE (8 * 1024 * 1024)
+// transient ring for client arrays etc, 4MB (ring_mb= in config.txt). 8 never
+// came close to filling; the monitor prints the peak
+extern uint32_t g_ring_size;
+#define GXM_TRANSIENT_RING_SIZE g_ring_size
 // per render target. the game switches fbos a lot, so go to the gxm max
 // (SCE_GXM_MAX_SCENES_PER_RENDERTARGET, 8. vitasdk only names it in a comment)
 #define GXM_SCENES_PER_FRAME   8
