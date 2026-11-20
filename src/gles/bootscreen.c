@@ -59,13 +59,13 @@ static const uint8_t *glyph_rows(char c)
   return NULL;   // space and anything we didn't draw
 }
 
-// ---- drawing: everything is a scissored clear (top-left coords) ----
+// ---- drawing: solid quads at pixel coords (top-left origin) ----
+// not scissored clears: gxm's region clip is 32x32-tile granular, which
+// turned every font pixel into a block on hw
+void gl_fill_rect(int x, int y, int w, int h, float r, float g, float b);
 static void rect(int x, int y, int w, int h, float r, float g, float b)
 {
-  if (w <= 0 || h <= 0) return;
-  glScissor(x, SCR_H - y - h, w, h);
-  glClearColor(r, g, b, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
+  gl_fill_rect(x, y, w, h, r, g, b);
 }
 
 static int text_w(const char *s, int scale) { return (int)strlen(s) * 6 * scale - scale; }
@@ -107,7 +107,6 @@ static void rrect(int x, int y, int w, int h, float r, float g, float b)
 
 static void draw_frame(uint32_t done, uint32_t total)
 {
-  glEnable(GL_SCISSOR_TEST);
   // background: dark blue to near black
   const int bands = 34;
   for (int i = 0; i < bands; i++) {
@@ -132,7 +131,6 @@ static void draw_frame(uint32_t done, uint32_t total)
   text_c(line, 320, 2, 0.70f, 0.73f, 0.80f);
   text_c("THIS ONLY HAPPENS ONCE PER INSTALL OR UPDATE", 470, 2, 0.40f, 0.43f, 0.50f);
 
-  glDisable(GL_SCISSOR_TEST);
   gxm_swap();
 }
 

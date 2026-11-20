@@ -540,3 +540,46 @@ void glClear(GLbitfield mask)
   g_st.clears++;
   G.dirty = 1;
 }
+
+// solid rect at pixel coords (top-left origin) on the current target, for the
+// boot screen. the clear shader with its own quad from the ring: gxm's region
+// clip only works in whole 32x32 tiles, so small scissored clears come out
+// as blocks (that's why vita2d clips with stencil)
+void gl_fill_rect(int x, int y, int w, int h, float r, float g, float b)
+{
+  if (w <= 0 || h <= 0 || !gxm_ready()) return;
+  draw_init();
+  if (gl_ensure_scene(0) < 0) return;
+  SceGxmContext *c = gxm_ctx;
+  SceGxmFragmentProgram *fp = clear_get_fp(SCE_GXM_COLOR_MASK_ALL, T.out_fmt);
+  if (!fp) return;
+  float *v = ring_alloc(8 * sizeof(float), 16);
+  if (!v) return;
+  float x0 = x * 2.0f / T.w - 1.0f, x1 = (x + w) * 2.0f / T.w - 1.0f;
+  float y0 = y * 2.0f / T.h - 1.0f, y1 = (y + h) * 2.0f / T.h - 1.0f;
+  // the viewport below flips y, so y here grows downwards like the screen
+  v[0] = x0; v[1] = y0; v[2] = x1; v[3] = y0; v[4] = x0; v[5] = y1; v[6] = x1; v[7] = y1;
+  sceGxmSetViewport(c, T.w * 0.5f, T.w * 0.5f, T.h * 0.5f, T.h * 0.5f, 0.5f, 0.5f);
+  sceGxmSetRegionClip(c, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, T.w - 1, T.h - 1);
+  sceGxmSetCullMode(c, SCE_GXM_CULL_NONE);
+  sceGxmSetFrontPolygonMode(c, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+  sceGxmSetBackPolygonMode(c, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+  sceGxmSetFrontFragmentProgramEnable(c, SCE_GXM_FRAGMENT_PROGRAM_ENABLED);
+  sceGxmSetBackFragmentProgramEnable(c, SCE_GXM_FRAGMENT_PROGRAM_ENABLED);
+  sceGxmSetFrontDepthFunc(c, SCE_GXM_DEPTH_FUNC_ALWAYS);
+  sceGxmSetBackDepthFunc(c, SCE_GXM_DEPTH_FUNC_ALWAYS);
+  sceGxmSetFrontDepthWriteEnable(c, SCE_GXM_DEPTH_WRITE_DISABLED);
+  sceGxmSetBackDepthWriteEnable(c, SCE_GXM_DEPTH_WRITE_DISABLED);
+  sceGxmSetFrontStencilFunc(c, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                            SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0);
+  sceGxmSetBackStencilFunc(c, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                           SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0);
+  sceGxmSetVertexProgram(c, CLR.vp);
+  sceGxmSetFragmentProgram(c, fp);
+  void *ub;
+  float z = 0.0f, col[4] = { r, g, b, 1.0f };
+  if (sceGxmReserveVertexDefaultUniformBuffer(c, &ub) >= 0) sceGxmSetUniformDataF(ub, CLR.u_depth, 0, 1, &z);
+  if (sceGxmReserveFragmentDefaultUniformBuffer(c, &ub) >= 0) sceGxmSetUniformDataF(ub, CLR.u_color, 0, 4, col);
+  sceGxmSetVertexStream(c, 0, v);
+  sceGxmDraw(c, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, g_quad_idx, 4);
+}
