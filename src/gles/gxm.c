@@ -879,12 +879,14 @@ void gxm_display_target(gxm_target *out)
 void *gxm_back_buffer(void) { return g_disp_mb[g_back].base; }
 void *gxm_front_buffer(void) { return g_disp_mb[g_front].base; }
 
-// screenshots: drop an (empty) ux0:data/nba2k16/shot.flag and the next frame
-// lands in shots/ as a bmp. only ever captures our own frames, works the
-// same in vita3k and on hw. checked every 30 frames so it costs nothing.
+// screenshots: with shots=1 in config.txt, drop an (empty)
+// ux0:data/nba2k16/shot.flag and the next frame lands in shots/ as a bmp.
+// opt-in because a getstat on the memory card costs a few ms on hw
 static void maybe_screenshot(void)
 {
-  if (g_frame % 30) return;
+  static int on = -1;
+  if (on < 0) on = config_int("shots", 0);
+  if (!on || g_frame % 60) return;
   SceIoStat st;
   if (sceIoGetstat(DATA_PATH "/shot.flag", &st) < 0) return;
   sceIoRemove(DATA_PATH "/shot.flag");
