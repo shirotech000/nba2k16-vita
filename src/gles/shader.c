@@ -292,7 +292,12 @@ static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2,
           hd.cg_hash2 == h2 && hd.gxp_size > 0 && hd.gxp_size < 4 * 1024 * 1024 &&
           n == sizeof(hd) + hd.gxp_size) {
         SceGxmProgram *p = (SceGxmProgram *)(buf + sizeof(hd));
-        if (sceGxmProgramCheck(p) >= 0) return p;
+        if (sceGxmProgramCheck(p) >= 0) {
+          // the header isn't part of the program: move it down so callers
+          // can free() what we hand them like a normal malloc
+          memmove(buf, p, hd.gxp_size);
+          return (SceGxmProgram *)buf;
+        }
         L("shader: bad pack entry %s, falling back", path);
       }
       free(buf);
