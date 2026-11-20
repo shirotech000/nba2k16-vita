@@ -37,6 +37,7 @@ void nt_set(name_table *t, GLuint name, void *obj);
 typedef struct gl_buffer {
   GLuint name;
   gpu_block *mem;
+  void *shadow;        // cpu copy when the gpu pool had no room, streamed per draw
   uint32_t size;
   GLenum usage;
   uint32_t last_use;   // scene id

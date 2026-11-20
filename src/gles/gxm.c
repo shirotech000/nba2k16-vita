@@ -410,6 +410,14 @@ gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref)
 static void chunk_maybe_release(gpu_chunk *c, int ti)
 {
   int release = c->dedicated;
+  if (!release && c->heap.used == 0 && ti == 0) {
+    // no spare when the os is almost out of cdram, someone else needs it
+    SceKernelFreeMemorySizeInfo fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.size = sizeof(fi);
+    sceKernelGetFreeMemorySize(&fi);
+    if ((int)fi.size_cdram < 4 * 1024 * 1024) release = 1;
+  }
   if (!release && c->heap.used == 0) {
     // empty shared chunk: give it back unless it's the only spare left.
     // the game needs every MB of cdram it can get (bigmem borrows it)

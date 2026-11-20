@@ -16,7 +16,9 @@ GLuint nt_gen(name_table *t)
   if (n >= t->cap) {
     GLuint nc = t->cap ? t->cap * 2 : 256;
     while (nc <= n) nc *= 2;
-    t->objs = realloc(t->objs, nc * sizeof(void *));
+    void **no = realloc(t->objs, nc * sizeof(void *));
+    if (!no) { t->next--; L("gl: out of memory growing a name table"); return 0; }
+    t->objs = no;
     memset(t->objs + t->cap, 0, (nc - t->cap) * sizeof(void *));
     t->cap = nc;
   }
@@ -274,24 +276,34 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
     gpu_free_deferred(b->mem);
     b->mem = NULL;
   }
+  free(b->shadow);
+  b->shadow = NULL;
   if (!b->mem && size) {
     int pref = usage == GL_STATIC_DRAW ? GPU_PREF_CDRAM : GPU_PREF_LPDDR;
     b->mem = gpu_alloc((uint32_t)size, 16, pref);
-    if (!b->mem) { GL_ERR(GL_OUT_OF_MEMORY); b->size = 0; return; }
+    if (!b->mem) {
+      // gpu pool's full (hw match load: heads + crowd vbos died here and their
+      // draws got dropped). keep a cpu copy, draws stream it through the ring
+      b->shadow = malloc((size_t)size);
+      if (!b->shadow) { GL_ERR(GL_OUT_OF_MEMORY); b->size = 0; return; }
+      static int n;
+      if (n++ < 8) L("gl: buffer %u (%u bytes) has no gpu room, kept on the cpu", b->name, (unsigned)size);
+    }
     b->last_use = 0;
   }
   b->size = (uint32_t)size;
   b->usage = usage;
-  if (data && size) memcpy(b->mem->ptr, data, size);
+  if (data && size) memcpy(b->mem ? b->mem->ptr : b->shadow, data, size);
 }
 
 void glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void *data)
 {
   gl_buffer *b = bound_buf(target);
-  if (!b || !b->mem || off < 0 || size < 0 || (uint32_t)(off + size) > b->size) {
+  if (!b || (!b->mem && !b->shadow) || off < 0 || size < 0 || (uint32_t)(off + size) > b->size) {
     GL_ERR(GL_INVALID_VALUE);
     return;
   }
+  if (!b->mem) { memcpy((uint8_t *)b->shadow + off, data, size); return; }
   if (gxm_busy(b->last_use)) {
     // gpu still has the old contents queued, copy-on-write
     static uint32_t cow_count;
@@ -320,6 +332,7 @@ void glDeleteBuffers(GLsizei n, const GLuint *names)
       if (G.va[a].buffer == names[i]) G.va[a].buffer = (GLuint)-1;  // dangling, draw skips it
     gpu_free_deferred(b->mem);
     nt_set(&g_bufs, names[i], NULL);
+    free(b->shadow);
     free(b);
   }
 }

@@ -165,6 +165,7 @@ static SceGxmVertexProgram *get_vp(gl_program *p, stream_t *st, int ns)
     vp = NULL;
   }
   vp_variant *v = calloc(1, sizeof(*v));
+  if (!v) return vp;   // works, just isn't cached
   v->hash = h;
   v->keylen = kl;
   memcpy(v->key, key, kl);
@@ -193,6 +194,7 @@ static SceGxmFragmentProgram *get_fp(gl_program *p)
     fp = NULL;
   }
   fp_variant *v = calloc(1, sizeof(*v));
+  if (!v) return fp;
   v->key = key;
   v->fp = fp;
   v->next = p->fps;
@@ -250,7 +252,10 @@ static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *
   int has_client = 0;
   for (int i = 0; i < p->n_attribs; i++) {
     const prog_attrib *a = &p->attribs[i];
-    if (a->reg >= 0 && G.va[a->loc].enabled && !G.va[a->loc].buffer) has_client = 1;
+    if (a->reg < 0 || !G.va[a->loc].enabled) continue;
+    gl_vattrib *v = &G.va[a->loc];
+    gl_buffer *vb = v->buffer && v->buffer != (GLuint)-1 ? buf_get(v->buffer) : NULL;
+    if (!v->buffer || (vb && !vb->mem && vb->shadow)) has_client = 1;
   }
 
   // ---- indices
@@ -278,11 +283,18 @@ static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *
     if (!isz) { GL_ERR(GL_INVALID_ENUM); return; }
     if (G.element_buffer) {
       ibuf = buf_get(G.element_buffer);
-      if (!ibuf || !ibuf->mem || (uintptr_t)indices + count * isz > ibuf->size) {
+      if (!ibuf || (!ibuf->mem && !ibuf->shadow) || (uintptr_t)indices + count * isz > ibuf->size) {
         L_ONCE("gl: glDrawElements index buffer missing or too small");
+        g_st.skipped++;
         return;
       }
-      isrc = (const uint8_t *)ibuf->mem->ptr + (uintptr_t)indices;
+      if (!ibuf->mem) {
+        // cpu-shadowed index buffer: copy this draw's indices into the ring
+        isrc = (const uint8_t *)ibuf->shadow + (uintptr_t)indices;
+        ibuf = NULL;
+      } else {
+        isrc = (const uint8_t *)ibuf->mem->ptr + (uintptr_t)indices;
+      }
     } else {
       if (!indices) return;
       isrc = indices;
@@ -334,7 +346,16 @@ static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *
     s->stride = va->stride ? va->stride : tsz * va->size;
     if (va->buffer) {
       gl_buffer *b = va->buffer == (GLuint)-1 ? NULL : buf_get(va->buffer);
-      if (!b || !b->mem) { L_ONCE("gl: attrib %d points at a dead buffer, draw skipped", a->loc); return; }
+      if (b && !b->mem && b->shadow) {
+        s->ptr = NULL;   // streamed from the shadow through the ring below
+        need += ALIGN_UP((vmax - vmin) * s->stride + tsz * va->size, 16);
+        continue;
+      }
+      if (!b || !b->mem) {
+        L_ONCE("gl: attrib %d points at a dead buffer, draw skipped", a->loc);
+        g_st.skipped++;
+        return;
+      }
       s->ptr = (const uint8_t *)b->mem->ptr + (uintptr_t)va->ptr + (arrays ? (uint32_t)first * s->stride : 0);
       s->buf = b;
     } else {
@@ -378,7 +399,12 @@ static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *
     unsigned tsz;
     map_attr(va->type, va->norm, &s->fmt, &tsz);
     uint32_t bytes = (vmax - vmin) * s->stride + tsz * va->size;
-    memcpy(rp, (const uint8_t *)va->ptr + vmin * s->stride, bytes);
+    const uint8_t *src = (const uint8_t *)va->ptr;
+    if (va->buffer && va->buffer != (GLuint)-1) {
+      gl_buffer *sb = buf_get(va->buffer);
+      src = (const uint8_t *)sb->shadow + (uintptr_t)va->ptr;
+    }
+    memcpy(rp, src + vmin * s->stride, bytes);
     s->ptr = rp;
     rp += ALIGN_UP(bytes, 16);
   }

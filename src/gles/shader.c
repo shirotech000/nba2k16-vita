@@ -416,8 +416,9 @@ SceGxmProgram *shacc_compile(const char *cg, int frag, char **log)
   if (out->programData && out->programSize) {
     // copy it out, the patcher keeps pointing at whatever we register
     p = malloc(out->programSize);
-    memcpy(p, out->programData, out->programSize);
-    if (sceGxmProgramCheck(p) < 0) {
+    if (!p) {
+      log_append(log, "out of memory copying the compiled program");
+    } else if (memcpy(p, out->programData, out->programSize), sceGxmProgramCheck(p) < 0) {
       log_append(log, "sceGxmProgramCheck rejected the output");
       free(p);
       p = NULL;
