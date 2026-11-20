@@ -96,15 +96,25 @@ static const char *class_of(const void *p) {
 // --- handlers for java methods the game calls ---
 static jvalue h_null(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = NULL }; }
 static jvalue h_package(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_string(PACKAGE_NAME) }; }
-static jvalue h_files_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(FILES_DIR) }; }
-static jvalue h_cache_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(CACHE_DIR) }; }
-static jvalue h_obb_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(OBB_DIR) }; }
-static jvalue h_ext_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(EXTERNAL_DIR) }; }
+// android paths, not ux0: ones. path_fix maps them back (see paths.h)
+static jvalue h_files_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(ANDROID_FILES_DIR) }; }
+static jvalue h_cache_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(ANDROID_CACHE_DIR) }; }
+static jvalue h_obb_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(ANDROID_OBB_DIR) }; }
+static jvalue h_ext_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(ANDROID_EXTERNAL_DIR) }; }
+static jvalue h_sdcard(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(ANDROID_SDCARD) }; }
 static jvalue h_path(jobj *self, const jvalue *a, jmeth *m) {
   (void)a; (void)m;
   return (jvalue){ .l = new_string(is_jobj(self) && self->str ? self->str : "") };
 }
 static jvalue h_self(jobj *self, const jvalue *a, jmeth *m) { (void)a; (void)m; return (jvalue){ .l = self }; }
+// Settings.Secure.getString(resolver, "android_id"). NULL here was followed
+// by guest null reads at ~30s, so hand back a fixed fake id instead
+static jvalue h_secure_string(jobj *self, const jvalue *a, jmeth *m) {
+  (void)self; (void)m;
+  const jobj *k = a[1].l;
+  L("JNI: Settings.Secure.getString(%s)", is_jobj(k) && k->str ? k->str : "?");
+  return (jvalue){ .l = new_string("2b16f17a00c0ffee") };
+}
 static jvalue h_true(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .z = 1 }; }
 static jobj *find_class(const char *name);
 static jvalue h_class_loader(jobj *self, const jvalue *a, jmeth *m) {
@@ -139,7 +149,7 @@ static const struct { const char *name; const char *sig; jhandler fn; } handlers
   { "getExternalCacheDir", NULL, h_cache_dir },
   { "getObbDir", NULL, h_obb_dir },
   { "getExternalFilesDir", NULL, h_ext_dir },
-  { "getExternalStorageDirectory", NULL, h_ext_dir },
+  { "getExternalStorageDirectory", NULL, h_sdcard },
   { "getAbsolutePath", NULL, h_path },
   { "getPath", NULL, h_path },
   { "toString", "()Ljava/lang/String;", h_path },
@@ -153,6 +163,7 @@ static const struct { const char *name; const char *sig; jhandler fn; } handlers
   { "isPermissionReceived", "()Z", h_true },
   { "getVersionCode", "()I", h_version_code },
   { "getVersionName", NULL, h_version_name },
+  { "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", h_secure_string },
 };
 
 static jhandler pick_handler(const char *name, const char *sig) {

@@ -27,6 +27,9 @@ $pref = ([regex]::Match($cfg, '(?m)^pref-path:\s*(.+)$')).Groups[1].Value.Trim()
 if (-not $pref) { $pref = Join-Path $appDir '' }
 $dataDir = Join-Path $pref 'ux0\data\nba2k16'
 New-Item -ItemType Directory -Force -Path $dataDir, (Join-Path $dataDir 'obb'), (Join-Path $pref 'ur0\data') | Out-Null
+# tells the port it's running in vita3k (emu-only workarounds). this only
+# ever lands in the emulator's profile, a real vita never has it.
+Set-Content -Path (Join-Path $dataDir 'vita3k.flag') -Value 'vita3k' -NoNewline
 
 if (-not $GameFiles -and (Test-Path (Join-Path $repo 'gamefiles\libnba2k16_clean_opt.so'))) {
     $GameFiles = Join-Path $repo 'gamefiles'

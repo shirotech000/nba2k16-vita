@@ -16,6 +16,7 @@ Nothing from the game is in this repo. You need:
 - A hacked Vita (HENkaku / Ensō) with **unsafe homebrew enabled**
 - **kubridge**, a recent build with `kuKernelMemReserve` / `kuKernelMemCommit` (in your taiHEN `*KERNEL` section)
 - **libshacccg.suprx** in `ur0:data/`. Shaders get compiled on device, and you have to dump this file yourself (same as other ports that compile shaders at runtime).
+- **Optional: the CapUnlocker plugin.** If it's loaded, the port detects it and lets the game's worker threads use the 4th CPU core too. Without it you get the usual 3 cores. Set `capunlocker=0` in `ux0:data/nba2k16/config.txt` to opt out.
 
 ## Setup
 

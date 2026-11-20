@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <psp2/display.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 
@@ -15,6 +16,12 @@ SceGxmContext *gxm_ctx;
 SceGxmShaderPatcher *gxm_patcher;
 
 static int g_ready;
+// gpu_dry_run=1 in config.txt: nothing ever reaches the gpu. no scenes (so
+// no draws or clears either), no flips, no finish, swaps just pace to 60hz.
+// texture uploads + shader compiles still happen, they're cpu side.
+// for bisecting emulator-only renderer trouble.
+static int g_dry_run;
+extern int config_int(const char *key, int def);
 
 // ============================================================ memblocks
 
@@ -442,7 +449,7 @@ uint32_t gxm_scene_counter(void) { return g_scene_ctr; }
 
 int gxm_scene_done(uint32_t id)
 {
-  if (!g_notif) return 1;
+  if (!g_notif || g_dry_run) return 1;  // dry run: nothing in flight, ever
   return (int32_t)(*g_notif - id) >= 0;
 }
 
@@ -660,6 +667,8 @@ void gxm_begin_scene(const gxm_target *t, int load_depth)
 {
   if (!g_ready) return;
   if (g_in_scene) gxm_end_scene();
+  // dry run: never open one, gl_ensure_scene then skips the draw/clear
+  if (g_dry_run) return;
 
   rt_entry *e = rt_get(t->w, t->h);
   if (!e->rt) return;
@@ -713,6 +722,7 @@ void gxm_finish(void)
 {
   if (!g_ready) return;
   gxm_end_scene();
+  if (g_dry_run) { ring_retire(); process_deferred(); return; }
   sceGxmFinish(gxm_ctx);
   gxm_wait_scene(g_scene_ctr);
   ring_retire();
@@ -767,12 +777,22 @@ void gxm_swap(void)
   if (!g_ready) return;
   gxm_end_scene();
 
-  sceGxmPadHeartbeat(&g_disp_surf[g_back], g_disp_sync[g_back]);
-  flip_data d = { g_disp_mb[g_back].base };
-  int r = sceGxmDisplayQueueAddEntry(g_disp_sync[g_front], g_disp_sync[g_back], &d);
-  if (r < 0) L_ONCE("gxm: sceGxmDisplayQueueAddEntry failed 0x%08X", r);
-  g_front = g_back;
-  g_back = (g_back + 1) % DISPLAY_BUFFERS;
+  if (g_dry_run) {
+    // no flip, just keep the game's frame pacing roughly where vsync had it
+    static SceUInt64 last;
+    SceUInt64 now = sceKernelGetProcessTimeWide();
+    if (last && now - last < 16667) sceKernelDelayThread(16667 - (SceUInt32)(now - last));
+    last = sceKernelGetProcessTimeWide();
+    g_ring_used = g_ring_pending = g_ring_head = 0;  // the gpu never reads it
+    g_mark_count = 0;
+  } else {
+    sceGxmPadHeartbeat(&g_disp_surf[g_back], g_disp_sync[g_back]);
+    flip_data d = { g_disp_mb[g_back].base };
+    int r = sceGxmDisplayQueueAddEntry(g_disp_sync[g_front], g_disp_sync[g_back], &d);
+    if (r < 0) L_ONCE("gxm: sceGxmDisplayQueueAddEntry failed 0x%08X", r);
+    g_front = g_back;
+    g_back = (g_back + 1) % DISPLAY_BUFFERS;
+  }
 
   g_frame++;
   if (g_scenes_frame > g_scenes_peak) {
@@ -934,6 +954,8 @@ int gxm_init(void)
   g_vsync = vs;
 
   rt_get(SCREEN_W, SCREEN_H);
+  g_dry_run = config_int("gpu_dry_run", 0);
+  if (g_dry_run) L("gxm: gpu_dry_run=1, no scenes/draws/clears/flips get submitted");
   g_ready = 1;
   gpu_mem_log("after gxm init");
   return 0;

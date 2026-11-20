@@ -162,7 +162,7 @@ static int sce_flags(int f) {
 
 static int b_open(const char *path, int flags, ...) {
   char fixed[512];
-  path_fix(path, fixed, sizeof(fixed));
+  if (path_fix_checked("open", path, fixed, sizeof(fixed)) < 0) return -1;
   SceUID uid = sceIoOpen(fixed, sce_flags(flags), 0666);
   int fd = uid < 0 ? sce_fail(uid) : fd_alloc(uid);
   if (uid >= 0 && fd < 0) {
@@ -265,7 +265,7 @@ static void sce_to_bstat(const SceIoStat *s, b_stat *b) {
 static int b_stat_fn(const char *path, b_stat *b) {
   char fixed[512];
   SceIoStat s;
-  path_fix(path, fixed, sizeof(fixed));
+  if (path_fix_checked("stat", path, fixed, sizeof(fixed)) < 0) return -1;
   int r = sceIoGetstat(fixed, &s);
   L("stat(%s) -> 0x%X", fixed, r < 0 ? r : 0);
   if (r < 0) return sce_fail(r);
@@ -319,8 +319,11 @@ static int b_statfs_fn(const char *path, b_statfs *s) {
 
 static int b_mkdir(const char *path, int mode) {
   char fixed[512];
-  path_fix(path, fixed, sizeof(fixed));
+  // vita3k exits hard on mkdir of ".../files/ux0:data", so the check
+  // matters most right here
+  if (path_fix_checked("mkdir", path, fixed, sizeof(fixed)) < 0) return -1;
   int r = sceIoMkdir(fixed, 0777);
+  L("mkdir(%s) -> 0x%X", fixed, r < 0 ? r : 0);
   if (r < 0) {
     errno = (r & 0xFF) == 0x11 ? EEXIST : ENOENT;  // SCE_ERROR_ERRNO_EEXIST is 0x80010011
     return -1;
@@ -331,14 +334,16 @@ static int b_mkdir(const char *path, int mode) {
 // these get logged on purpose, the game likes cleaning up dirs on boot
 static int b_rmdir(const char *path) {
   char fixed[512];
-  int r = sceIoRmdir(path_fix(path, fixed, sizeof(fixed)));
+  if (path_fix_checked("rmdir", path, fixed, sizeof(fixed)) < 0) return -1;
+  int r = sceIoRmdir(fixed);
   L("rmdir(%s) -> 0x%X", fixed, r < 0 ? r : 0);
   return r < 0 ? sce_fail(r) : 0;
 }
 
 static int b_unlink(const char *path) {
   char fixed[512];
-  int r = sceIoRemove(path_fix(path, fixed, sizeof(fixed)));
+  if (path_fix_checked("unlink", path, fixed, sizeof(fixed)) < 0) return -1;
+  int r = sceIoRemove(fixed);
   L("unlink(%s) -> 0x%X", fixed, r < 0 ? r : 0);
   static int bt_once;
   if (!bt_once++) so_backtrace("first unlink");
@@ -347,7 +352,9 @@ static int b_unlink(const char *path) {
 
 static int b_rename(const char *a, const char *b) {
   char fa[512], fb[512];
-  int r = sceIoRename(path_fix(a, fa, sizeof(fa)), path_fix(b, fb, sizeof(fb)));
+  if (path_fix_checked("rename", a, fa, sizeof(fa)) < 0 ||
+      path_fix_checked("rename", b, fb, sizeof(fb)) < 0) return -1;
+  int r = sceIoRename(fa, fb);
   L("rename(%s -> %s) -> 0x%X", fa, fb, r < 0 ? r : 0);
   return r < 0 ? sce_fail(r) : 0;
 }
@@ -360,7 +367,7 @@ typedef struct {
 
 static b_dir *b_opendir(const char *path) {
   char fixed[512];
-  path_fix(path, fixed, sizeof(fixed));
+  if (path_fix_checked("opendir", path, fixed, sizeof(fixed)) < 0) return NULL;
   SceUID d = sceIoDopen(fixed);
   L("opendir(%s) -> 0x%X", fixed, d);
   if (d < 0) {

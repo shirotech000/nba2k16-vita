@@ -46,7 +46,7 @@ static void std_write(int idx, const char *s, size_t n) {
 
 static FILE *b_fopen(const char *path, const char *mode) {
   char fixed[512];
-  path_fix(path, fixed, sizeof(fixed));
+  if (path_fix_checked("fopen", path, fixed, sizeof(fixed)) < 0) return NULL;
   FILE *f = fopen(fixed, mode);
   L("fopen(%s, %s) -> %s", fixed, mode, f ? "ok" : "FAIL");
   return f;

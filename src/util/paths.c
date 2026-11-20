@@ -1,5 +1,9 @@
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <psp2/io/stat.h>
+#include "loader/so_loader.h"
+#include "util/log.h"
 #include "util/paths.h"
 
 // android path prefix -> where we keep it on the vita
@@ -35,4 +39,37 @@ char *path_fix(const char *in, char *out, int outlen) {
   // anything else absolute goes under root/, never next to our own files
   snprintf(out, outlen, "%s/root%s", DATA_PATH, in);
   return out;
+}
+
+int path_is_bad(const char *p) {
+  // a vita path has one ':' and it ends the device name ("ux0:"). a second
+  // one, or one after a '/', is junk no vita fs can hold, and vita3k doesn't
+  // survive some of those (mkdir of one exits the whole emulator)
+  const char *c = strchr(p, ':');
+  if (!c) return 0;
+  const char *slash = strchr(p, '/');
+  if (slash && slash < c) return 1;
+  return strchr(c + 1, ':') != NULL;
+}
+
+int path_fix_checked(const char *what, const char *in, char *out, int outlen) {
+  path_fix(in, out, outlen);
+  if (!path_is_bad(out)) return 0;
+  static int logged;
+  if (logged < 16) {
+    L("%s(%s) refused, bad path (game passed %s)", what, out, in);
+    if (!logged) so_backtrace("bad path");
+    logged++;
+  }
+  errno = ENOENT;
+  return -1;
+}
+
+int emu_is_vita3k(void) {
+  static int v = -1;
+  if (v < 0) {
+    SceIoStat st;
+    v = sceIoGetstat(DATA_PATH "/vita3k.flag", &st) >= 0;
+  }
+  return v;
 }

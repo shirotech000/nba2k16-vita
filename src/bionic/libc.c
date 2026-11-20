@@ -19,6 +19,7 @@
 #include "util/abi.h"
 #include "util/log.h"
 #include "bionic/bionic.h"
+#include "util/cpu.h"
 
 // --- malloc with stats, memory is THE question for this port ---
 static volatile int mem_live, mem_peak, mem_biggest, mem_fails, mem_count;
@@ -163,7 +164,7 @@ static long b_sysconf(int name) {
     case 0x0027: return 4096;  // _SC_PAGESIZE
     case 0x0028: return 4096;  // _SC_PAGE_SIZE
     case 0x0060:               // _SC_NPROCESSORS_CONF
-    case 0x0061: return 3;     // _SC_NPROCESSORS_ONLN, 3 cores are ours
+    case 0x0061: return cpu_count();  // _SC_NPROCESSORS_ONLN, 3 (4 with CapUnlocker)
     case 0x0006: return 100;   // _SC_CLK_TCK
     case 0x0062: return 64 * 1024 * 1024 / 4096; // _SC_PHYS_PAGES, lie a bit
   }

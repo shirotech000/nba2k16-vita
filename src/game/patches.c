@@ -92,8 +92,10 @@ void game_monitor_tick(void) {
 
   extern void mem_report(void);
   extern unsigned shacc_mem_live(void);
+  extern void gpu_mem_log(const char *why);
   mem_report();
   L("Cg compiler live %uK", shacc_mem_live() / 1024);
+  gpu_mem_log("monitor");  // cdram/lpddr use + free user/cdram/phycont
   if (!g_get_heap) return;
   uintptr_t h = g_get_heap();
   if (!h) return;

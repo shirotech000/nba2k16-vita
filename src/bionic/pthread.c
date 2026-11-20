@@ -12,6 +12,7 @@
 #include "loader/exports.h"
 #include "util/log.h"
 #include "bionic/bionic.h"
+#include "util/cpu.h"
 
 #define DEFAULT_STACK (1024 * 1024)
 
@@ -170,6 +171,7 @@ typedef struct {
 static void *thread_tramp(void *p) {
   thread_start ts = *(thread_start *)p;
   free(p);
+  cpu_place_game_thread();  // core 3 too when CapUnlocker is around
   return ts.fn(ts.arg);
 }
 

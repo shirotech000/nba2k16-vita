@@ -13,6 +13,7 @@
 #include "game/patches.h"
 #include "loader/imports.h"
 #include "loader/so_loader.h"
+#include "util/cpu.h"
 #include "util/log.h"
 #include "util/paths.h"
 
@@ -42,22 +43,22 @@ static void need_file(const char *p, const char *what) {
 }
 
 // the game reads /proc/cpuinfo (maps to DATA_PATH/root/proc/cpuinfo), give it a
-// plausible one: 3 usable cortex-a9 cores with neon
+// plausible one: our usable cortex-a9 cores (3, or 4 with CapUnlocker), neon
 static void write_fake_cpuinfo(void) {
-  static const char info[] =
-    "Processor\t: ARMv7 Processor rev 0 (v7l)\n"
-    "processor\t: 0\nBogoMIPS\t: 888.00\n\n"
-    "processor\t: 1\nBogoMIPS\t: 888.00\n\n"
-    "processor\t: 2\nBogoMIPS\t: 888.00\n\n"
+  char info[1024];
+  int n = snprintf(info, sizeof(info), "Processor\t: ARMv7 Processor rev 0 (v7l)\n");
+  for (int i = 0; i < cpu_count(); i++)
+    n += snprintf(info + n, sizeof(info) - n, "processor\t: %d\nBogoMIPS\t: 888.00\n\n", i);
+  n += snprintf(info + n, sizeof(info) - n,
     "Features\t: swp half thumb fastmult vfp edsp neon vfpv3 tls\n"
     "CPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x4\n"
     "CPU part\t: 0xc09\nCPU revision\t: 0\n\n"
-    "Hardware\t: PS Vita\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n";
+    "Hardware\t: PS Vita\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n");
   sceIoMkdir(DATA_PATH "/root", 0777);
   sceIoMkdir(DATA_PATH "/root/proc", 0777);
   SceUID fd = sceIoOpen(DATA_PATH "/root/proc/cpuinfo", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
   if (fd >= 0) {
-    sceIoWrite(fd, info, sizeof(info) - 1);
+    sceIoWrite(fd, info, n);
     sceIoClose(fd);
   }
 }
@@ -65,6 +66,7 @@ static void write_fake_cpuinfo(void) {
 int main(void) {
   log_init();
   L("nba2k16 vita loader, built " __DATE__ " " __TIME__);
+  if (emu_is_vita3k()) L("vita3k.flag found, running in vita3k");
 
   scePowerSetArmClockFrequency(444);
   scePowerSetBusClockFrequency(222);
@@ -78,6 +80,7 @@ int main(void) {
   sceIoMkdir(CACHE_DIR, 0777);
   sceIoMkdir(OBB_DIR, 0777);
   sceIoMkdir(SHADER_CACHE, 0777);
+  cpu_init();          // CapUnlocker probe, before anything asks for core counts
   write_fake_cpuinfo();
 
   // no_crash_handler=1 lets vita3k (or the vita's coredump) report faults itself

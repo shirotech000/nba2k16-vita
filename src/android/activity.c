@@ -30,11 +30,12 @@ void activity_boot(void *onCreate) {
   g_activity.vm = jni_vm();
   g_activity.env = jni_env();
   g_activity.clazz = jni_activity_object();
-  g_activity.internalDataPath = FILES_DIR;
-  g_activity.externalDataPath = EXTERNAL_DIR;
+  // android spellings on purpose, see paths.h
+  g_activity.internalDataPath = ANDROID_FILES_DIR;
+  g_activity.externalDataPath = ANDROID_EXTERNAL_DIR;
   g_activity.sdkVersion = 19;
   g_activity.assetManager = &fake_asset_manager;
-  g_activity.obbPath = OBB_DIR;
+  g_activity.obbPath = ANDROID_OBB_DIR;
 
   L("activity: ANativeActivity_onCreate");
   ((onCreate_fn)onCreate)(&g_activity, NULL, 0);
