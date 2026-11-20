@@ -46,9 +46,35 @@ static size_t live, peak;
 // memblocks can land on either side of it, so lo/hi alone won't filter.
 static uintptr_t heap_lo, heap_hi;
 
+// the glass reserve: held from boot, handed over only when a big ask has
+// exhausted everything else. the match load's scene block (31.8MB) and the
+// career exit's context asks (10-12MB) need one contiguous run that a
+// fragmented late-load heap can't give them (hw31-33: dead at 55%, with
+// cdram nominally free both times). taken at boot while cdram is still
+// empty. reserve_mb=0 turns it off
+#define RESERVE_MIN (8 * 1024 * 1024)
+static SceUID g_res_uid = -1;
+static size_t g_res_sz;
+
+static void reserve_init(void)
+{
+  extern int config_int(const char *key, int def);
+  int mb = config_int("reserve_mb", 36);
+  if (mb < 16) return;
+  g_res_sz = (size_t)mb << 20;
+  g_res_uid = sceKernelAllocMemBlock("nba_res", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, g_res_sz, NULL);
+  if (g_res_uid < 0) {
+    L("bigmem: no %dMB cdram reserve (0x%08X)", mb, g_res_uid);
+    g_res_uid = -1;
+    return;
+  }
+  L("bigmem: %dMB cdram reserve held back for scene loads", mb);
+}
+
 void bigmem_init(void) {
   if (ready) return;
   sceKernelCreateLwMutex(&lock, "bigmem", 0, 0, NULL);
+  reserve_init();
   void *probe = malloc(16);
   SceKernelMemBlockInfo mi;
   memset(&mi, 0, sizeof(mi));
@@ -83,7 +109,16 @@ static size_t main_live, cdram_live;
 
 static void *bigmem_alloc_inner(size_t n, int urgent, int no_release);
 
-void *bigmem_alloc_ex(size_t n, int urgent) { return bigmem_alloc_inner(n, urgent, 0); }
+// the whole chain failed for a big ask: break the reserve and try once
+// more. if this fails too the game derefs the NULL either way
+void *bigmem_alloc_ex(size_t n, int urgent) {
+  void *p = bigmem_alloc_inner(n, urgent, 0);
+  if (p || n < RESERVE_MIN || g_res_uid < 0) return p;
+  sceKernelFreeMemBlock(g_res_uid);
+  g_res_uid = -1;
+  L("bigmem: broke the %uMB reserve for a %uK ask", (unsigned)(g_res_sz >> 20), (unsigned)(n >> 10));
+  return bigmem_alloc_inner(n, urgent, 1);
+}
 
 static void *bigmem_alloc_inner(size_t n, int urgent, int no_release) {
   if (!ready) return NULL;
@@ -170,7 +205,13 @@ static void *bigmem_alloc_inner(size_t n, int urgent, int no_release) {
       }
     }
     if (uid < 0) uid = sceKernelAllocMemBlock("nba_big", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, sz, NULL);
-    if (uid < 0) return NULL;
+    if (uid < 0) {
+      // cdram had nominal room but no contiguous run that big: fragmentation,
+      // not exhaustion (hw33: a 31MB ask died here with cdram free)
+      L("bigmem: %uK ask refused by plain cdram too (0x%08X), %uK cdram free",
+        (unsigned)(n >> 10), uid, (unsigned)(fi.size_cdram >> 10));
+      return NULL;
+    }
     in_cdram = 1;
   }
   void *base = NULL;
