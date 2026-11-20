@@ -1,0 +1,26 @@
+# game files - never commit these, bring your own
+*.apk
+*.obb
+*.so
+*.dex
+*.suprx
+*.skprx
+com.t2ksports.*/
+gamefiles/
+
+# build junk
+build/
+build_*/
+*.vpk
+*.velf
+*.elf
+*.self
+eboot.bin
+
+# local test stuff
+tools/vita3k/profile/
+tools/vita3k/app/
+dumps/
+*.log
+*.dmp
+__pycache__/
