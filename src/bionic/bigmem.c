@@ -81,7 +81,11 @@ static size_t main_live, cdram_live;
 #define PC_FLOOR    0                    // gxm's own chunks are 2MB, a 1MB floor saved nothing
 #define CDRAM_FLOOR (256 * 1024)
 
-void *bigmem_alloc_ex(size_t n, int urgent) {
+static void *bigmem_alloc_inner(size_t n, int urgent, int no_release);
+
+void *bigmem_alloc_ex(size_t n, int urgent) { return bigmem_alloc_inner(n, urgent, 0); }
+
+static void *bigmem_alloc_inner(size_t n, int urgent, int no_release) {
   if (!ready) return NULL;
   const size_t main_res = urgent ? MAIN_FLOOR : MAIN_RESERVE;
   const size_t pc_res = urgent ? PC_FLOOR : PC_RESERVE;
@@ -133,6 +137,19 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
         if ((uintptr_t)bp + sz > hi) hi = (uintptr_t)bp + sz;
         sceKernelUnlockLwMutex(&lock, 1);
         return bp;
+      }
+      // a big ask with nowhere to go: hand the gl pool's empty chunks back to
+      // the system and try the whole chain again once. the career exit died
+      // on exactly this (hw26): 12MB + 10MB asks failed while the pool sat
+      // on ~8MB of empty cdram chunks
+      if (n >= 4 * 1024 * 1024 && !no_release) {
+        extern uint32_t gxm_pool_release_empty(void);
+        uint32_t got = gxm_pool_release_empty();
+        if (got) {
+          L("bigmem: gave %u KiB of empty gl chunks back for a %uK ask, retrying",
+            got >> 10, (unsigned)(n >> 10));
+          return bigmem_alloc_inner(n, urgent, 1);
+        }
       }
       if (urgent)
         L("bigmem: even the floors are hit (user %uK, cdram %uK, phycont %uK), %uK has nowhere to go",

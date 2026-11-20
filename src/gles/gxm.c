@@ -434,6 +434,50 @@ static void chunk_maybe_release(gpu_chunk *c, int ti)
   }
 }
 
+// hand every empty shared chunk back to the system. bigmem calls this when a
+// big game allocation is about to fail: the empty chunks are idle space the
+// kernel could place the ask in (hw: career exit died on a 10-12MB ask twice,
+// with ~8MB of empty chunks sitting in cdram while cdram free was 11MB)
+uint32_t gxm_pool_release_empty(void)
+{
+  pool_lock();
+  uint32_t freed = 0;
+  for (int ti = 0; ti < 2; ti++) {
+    for (gpu_chunk *c = g_chunks[ti], *nx; c; c = nx) {
+      nx = c->next;
+      if (c->dedicated || c->heap.used) continue;
+      freed += c->mb.size;
+      chunk_unlink(c, ti);
+      rh_destroy(&c->heap);
+      blk_free(&c->mb);
+      free(c);
+    }
+  }
+  pool_unlock();
+  return freed;
+}
+
+// roughly how much room is left for gpu allocations: free space inside the
+// pool chunks plus what the os could still hand out (cdram + phycont feed
+// the pool). the texture budget mode watches this
+uint32_t gxm_pool_free_kb(void)
+{
+  SceKernelFreeMemorySizeInfo fi;
+  memset(&fi, 0, sizeof(fi));
+  fi.size = sizeof(fi);
+  sceKernelGetFreeMemorySize(&fi);
+  // hw has shown user as -2MB when things got tight; cdram/phycont clamp too
+  uint32_t os_free = ((int)fi.size_cdram > 0 ? fi.size_cdram : 0)
+                   + ((int)fi.size_phycont > 0 ? fi.size_phycont : 0);
+  pool_lock();
+  uint32_t in_pool = 0;
+  for (int ti = 0; ti < 2; ti++)
+    for (gpu_chunk *c = g_chunks[ti]; c; c = c->next)
+      in_pool += c->heap.size - c->heap.used;
+  pool_unlock();
+  return (os_free + in_pool) >> 10;
+}
+
 void gpu_free(gpu_block *b)
 {
   if (!b) return;
@@ -734,6 +778,14 @@ void gxm_prof_report(void)
       (unsigned)(g_tex_us / 1000), g_tex_n, (unsigned)(g_link_us / 1000), g_link_n);
   g_tex_us = g_link_us = 0;
   g_tex_n = g_link_n = 0;
+  // whether the game actually takes what we queue: "events queued but 0
+  // read" means its input side stopped draining (hw: dead controller hunt)
+  {
+    extern void input_stats(unsigned *, unsigned *, unsigned *, unsigned *);
+    unsigned k, s, t, rd;
+    input_stats(&k, &s, &t, &rd);
+    L("input: %u key, %u stick, %u touch queued, %u read by the game", k, s, t, rd);
+  }
 }
 
 typedef struct {
