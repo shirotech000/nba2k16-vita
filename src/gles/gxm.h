@@ -19,8 +19,8 @@
 #define GXM_VERTEX_RING_SIZE   (4 * 1024 * 1024)
 #define GXM_FRAGMENT_RING_SIZE (2 * 1024 * 1024)
 #define GXM_FRAG_USSE_RING_SIZE (16 * 1024)
-// transient ring for client arrays etc, 4MB (ring_mb= in config.txt). 8 never
-// came close to filling; the monitor prints the peak
+// transient ring for client arrays etc, 1MB (ring_mb= in config.txt). the
+// game only draws from vbos (peak 0 on hw); the monitor prints the peak
 extern uint32_t g_ring_size;
 #define GXM_TRANSIENT_RING_SIZE g_ring_size
 // per render target. the game switches fbos a lot, so go to the gxm max

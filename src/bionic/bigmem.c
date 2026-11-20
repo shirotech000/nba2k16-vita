@@ -70,8 +70,18 @@ static int find(const void *p) {
 
 static size_t main_live, cdram_live;
 
-void *bigmem_alloc(size_t n) {
+// urgent = the caller is about to hand the game a NULL (which it crashes
+// on). then the reserves shrink to small floors: a texture or thread
+// failing later beats a crash right now
+#define MAIN_FLOOR  (3 * 1024 * 1024)
+#define PC_FLOOR    (1 * 1024 * 1024)
+#define CDRAM_FLOOR (1 * 1024 * 1024)
+
+void *bigmem_alloc_ex(size_t n, int urgent) {
   if (!ready) return NULL;
+  const size_t main_res = urgent ? MAIN_FLOOR : MAIN_RESERVE;
+  const size_t pc_res = urgent ? PC_FLOOR : PC_RESERVE;
+  const size_t gl_res = urgent ? CDRAM_FLOOR : GL_RESERVE;
 
   SceKernelFreeMemorySizeInfo fi;
   memset(&fi, 0, sizeof(fi));
@@ -87,22 +97,26 @@ void *bigmem_alloc(size_t n) {
   size_t sz = ALIGN_UP(n, MAIN_GRAN);
   int in_cdram = 0;
   // main memory first, it's normal cached ram
-  if ((size_t)fi.size_user >= sz + MAIN_RESERVE)
+  if ((size_t)fi.size_user >= sz + main_res)
     uid = sceKernelAllocMemBlock("nba_big", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, sz, NULL);
 
   // phycont next: cached ram in its own 26MB pool, mostly gxm rings. the
   // match load died with ~8MB sitting idle in there. 1MB+ blocks only,
   // anything smaller would waste most of its 1MB granule
-  if (uid < 0 && n >= PC_GRAN && (size_t)fi.size_phycont >= ALIGN_UP(n, PC_GRAN) + PC_RESERVE) {
+  if (uid < 0 && n >= (urgent ? 64 * 1024 : PC_GRAN) && (size_t)fi.size_phycont >= ALIGN_UP(n, PC_GRAN) + pc_res) {
     sz = ALIGN_UP(n, PC_GRAN);
     uid = sceKernelAllocMemBlock("nba_big", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, sz, NULL);
   }
 
   if (uid < 0) {
     sz = ALIGN_UP(n, CDRAM_GRAN);
-    if ((size_t)fi.size_cdram < sz + GL_RESERVE) {
-      L_ONCE("bigmem: main + cdram both at their reserves (user %uK, cdram %uK)",
-             fi.size_user / 1024, fi.size_cdram / 1024);
+    if ((size_t)fi.size_cdram < sz + gl_res) {
+      if (urgent)
+        L("bigmem: even the floors are hit (user %uK, cdram %uK, phycont %uK), %uK has nowhere to go",
+          fi.size_user / 1024, fi.size_cdram / 1024, fi.size_phycont / 1024, (unsigned)(n / 1024));
+      else
+        L_ONCE("bigmem: main + cdram both at their reserves (user %uK, cdram %uK)",
+               fi.size_user / 1024, fi.size_cdram / 1024);
       return NULL;
     }
     // cpu-cached cdram if we can get it, plain (uncached, slow reads) if not
@@ -141,6 +155,8 @@ void *bigmem_alloc(size_t n) {
       (unsigned)(main_live / 1024), (unsigned)(cdram_live / 1024), cached_type ? "cached" : "uncached", n_blocks);
   return base;
 }
+
+void *bigmem_alloc(size_t n) { return bigmem_alloc_ex(n, 0); }
 
 int bigmem_owns(const void *p) {
   if (!maybe_ours((uintptr_t)p)) return 0;  // fast path, nearly every free()

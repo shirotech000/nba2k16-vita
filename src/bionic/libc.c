@@ -104,17 +104,28 @@ static void *alloc_once(size_t n) {
 
 static void *alloc_any(size_t n) {
   void *p = alloc_once(n);
-  if (p || n < BIG_MIN) return p;
+  if (p) return p;
+  if (n < BIG_MIN) {
+    // small ones don't wait, but a NULL still crashes the game
+    return n >= 16 * 1024 ? bigmem_alloc_ex(n, 1) : NULL;
+  }
   // everything's at its reserve. loading is bursty and other threads drop
   // their temp buffers all the time, so give it a couple seconds before
   // handing the game a NULL it'll probably crash on
   static volatile int waits;
   if (__sync_add_and_fetch(&waits, 1) <= 8) L("mem: %uK didn't fit anywhere, waiting for memory to free up", (unsigned)(n / 1024));
-  for (int i = 0; i < 100 && !p; i++) {
+  for (int i = 0; i < 25 && !p; i++) {
     sceKernelDelayThread(20 * 1000);
     p = alloc_once(n);
   }
   if (p) L("mem: %uK fit after waiting", (unsigned)(n / 1024));
+  // still nothing: the game crashes on NULL, so spend the reserves
+  if (!p) {
+    p = bigmem_alloc_ex(n, 1);
+    static volatile int urgents;
+    if (p && __sync_add_and_fetch(&urgents, 1) <= 16)
+      L("mem: %uK came out of the reserves", (unsigned)(n / 1024));
+  }
   return p;
 }
 

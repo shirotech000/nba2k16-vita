@@ -8,6 +8,7 @@
 
 void bigmem_init(void);
 void *bigmem_alloc(size_t n);       // NULL if CDRAM is too tight
+void *bigmem_alloc_ex(size_t n, int urgent);  // urgent: dip into the reserves
 int bigmem_owns(const void *p);
 size_t bigmem_size(const void *p);  // requested size, 0 if not ours
 void bigmem_free(void *p);

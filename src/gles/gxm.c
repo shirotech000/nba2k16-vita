@@ -594,7 +594,7 @@ static void process_deferred(void)
 static memblk g_ring_mb;
 static uint8_t *g_ring;
 static uint32_t g_ring_head, g_ring_used, g_ring_pending;
-uint32_t g_ring_size = 4 * 1024 * 1024;
+uint32_t g_ring_size = 1 * 1024 * 1024;
 
 typedef struct { uint32_t scene, bytes; } ring_mark_t;
 #define RING_MARKS 1024
@@ -1057,8 +1057,9 @@ int gxm_init(void)
   if (pb_mb < 4) pb_mb = 4;
   if (pb_mb > 16) pb_mb = 16;
   ip.parameterBufferSize = (uint32_t)pb_mb * 1024 * 1024;
-  int ring_mb = config_int("ring_mb", 4);
-  if (ring_mb < 2) ring_mb = 2;
+  // the game only draws from vbos (ring peak 0 on hw), so 1MB is plenty
+  int ring_mb = config_int("ring_mb", 1);
+  if (ring_mb < 1) ring_mb = 1;
   if (ring_mb > 16) ring_mb = 16;
   g_ring_size = (uint32_t)ring_mb * 1024 * 1024;
   L("gxm: param buffer %d MB, transient ring %d MB", pb_mb, ring_mb);
