@@ -17,6 +17,8 @@
 #include "util/paths.h"
 #include "util/cpu.h"
 
+extern size_t port_usable_size(void *p);  // libc.c, knows spill/bigmem blocks
+
 // say "linked" even when we failed, so the game keeps going and just
 // skips those draws. off = tell the truth.
 #define LIE_ABOUT_LINK_FAILURES 0
@@ -139,7 +141,7 @@ static void arena_free(void *p) {
 static volatile int shacc_live, shacc_peak;
 static void *shacc_malloc(unsigned int n) {
   void *p = malloc(n);
-  size_t got = p ? malloc_usable_size(p) : 0;
+  size_t got = p ? port_usable_size(p) : 0;
   if (!p && arena_open()) {
     p = arena_alloc(n);
     if (p) got = ((ablk *)p - 1)->size;
@@ -164,7 +166,7 @@ static void shacc_free(void *p) {
     arena_free(p);
     return;
   }
-  __sync_sub_and_fetch(&shacc_live, (int)malloc_usable_size(p));
+  __sync_sub_and_fetch(&shacc_live, (int)port_usable_size(p));
   free(p);
 }
 

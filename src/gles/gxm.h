@@ -11,13 +11,13 @@
 #define DISPLAY_BUFFERS 3
 
 // knobs. rings are bigger than the sdk defaults, this game is draw heavy
-// param buffer: 8MB (pb_mb= in config.txt). gxm's default 16MB came straight
+// param buffer: 4MB (pb_mb= in config.txt). gxm's default 16MB came straight
 // out of cdram on hw and a full match load needs every MB; if it ever fills
 // the gpu just does a partial render, nothing breaks
-#define GXM_PARAM_BUF_MB_DEFAULT 8
+#define GXM_PARAM_BUF_MB_DEFAULT 4
 #define GXM_VDM_RING_SIZE      (256 * 1024)
 #define GXM_VERTEX_RING_SIZE   (4 * 1024 * 1024)
-#define GXM_FRAGMENT_RING_SIZE (2 * 1024 * 1024)
+#define GXM_FRAGMENT_RING_SIZE (1 * 1024 * 1024)  // fragment uniforms are small
 #define GXM_FRAG_USSE_RING_SIZE (16 * 1024)
 // transient ring for client arrays etc, 1MB (ring_mb= in config.txt). the
 // game only draws from vbos (peak 0 on hw); the monitor prints the peak

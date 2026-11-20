@@ -24,6 +24,14 @@
 #include "bionic/spill.h"
 
 // --- malloc with stats, memory is THE question for this port ---
+// the whole eboot links with --wrap=malloc/calloc/realloc/free/memalign, so
+// our own code (gl layer, jni, pthreads...) gets the same spill/bigmem
+// fallbacks as the game. a NULL from plain newlib killed us in
+// glCreateProgram once the heap was full. newlib itself is __real_*.
+void *__real_malloc(size_t n);
+void *__real_realloc(void *p, size_t n);
+void __real_free(void *p);
+void *__real_memalign(size_t a, size_t n);
 static volatile int mem_live, mem_peak, mem_biggest, mem_fails, mem_count;
 
 static size_t usable(void *p);
@@ -99,7 +107,7 @@ static void *alloc_once(size_t n) {
     void *p = bigmem_alloc(n);
     if (p) return p;
   }
-  void *p = malloc(n);
+  void *p = __real_malloc(n);
   if (!p && n >= FALLBACK_MIN) p = bigmem_alloc(n);
   return p;
 }
@@ -134,7 +142,7 @@ static void *alloc_any(size_t n) {
 static void free_any(void *p) {
   if (spill_owns(p)) spill_free(p);
   else if (bigmem_owns(p)) bigmem_free(p);
-  else free(p);
+  else __real_free(p);
 }
 
 static void *b_malloc(size_t n) { void *p = alloc_any(n); mem_add(p, n); return p; }
@@ -151,7 +159,7 @@ static void *b_realloc(void *p, size_t n) {
   if (!n) { b_free(p); return NULL; }
   size_t old = usable(p);
   void *q = NULL;
-  if (!bigmem_owns(p) && !spill_owns(p)) q = realloc(p, n);
+  if (!bigmem_owns(p) && !spill_owns(p)) q = __real_realloc(p, n);
   if (!q) {
     // cdram block, or newlib couldn't grow it: allocate fresh and copy
     q = alloc_any(n);
@@ -166,12 +174,20 @@ static void *b_realloc(void *p, size_t n) {
 }
 static void *b_memalign(size_t a, size_t n) {
   // cdram blocks are 256K aligned, so big aligned requests can go there too
-  void *p = memalign(a, n);
+  void *p = __real_memalign(a, n);
   if (!p && n >= FALLBACK_MIN && a <= 256 * 1024) p = bigmem_alloc_ex(n, 1);
   if (!p && n < FALLBACK_MIN && a <= 16) p = spill_alloc(n);
   mem_add(p, n);
   return p;
 }
+
+// the --wrap entry points for everything linked into the eboot
+void *__wrap_malloc(size_t n) { return b_malloc(n); }
+void *__wrap_calloc(size_t a, size_t b) { return b_calloc(a, b); }
+void *__wrap_realloc(void *p, size_t n) { return b_realloc(p, n); }
+void __wrap_free(void *p) { if (p) b_free(p); }
+void *__wrap_memalign(size_t a, size_t n) { return b_memalign(a, n); }
+size_t port_usable_size(void *p) { return p ? usable(p) : 0; }
 
 // --- ctype: bionic reads _ctype_ as a pointer to a 1+256 BSD style table ---
 static char ctype_table[257];

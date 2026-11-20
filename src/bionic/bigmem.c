@@ -73,7 +73,7 @@ static size_t main_live, cdram_live;
 // urgent = the caller is about to hand the game a NULL (which it crashes
 // on). then the reserves shrink to small floors: a texture or thread
 // failing later beats a crash right now
-#define MAIN_FLOOR  (3 * 1024 * 1024)
+#define MAIN_FLOOR  (2 * 1024 * 1024)
 #define PC_FLOOR    (1 * 1024 * 1024)
 #define CDRAM_FLOOR (1 * 1024 * 1024)
 

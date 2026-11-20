@@ -43,6 +43,9 @@ add_executable(nba2k16 ${PORT_SOURCES})
 # extended memory mode loads the eboot above its link address, so the
 # thumb->arm stubs ld makes must be pc-relative (bit mbaavita on hw)
 target_link_options(nba2k16 PRIVATE -Wl,--pic-veneer)
+# every malloc in the eboot goes through bionic/libc.c's fallbacks
+target_link_options(nba2k16 PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
+                    -Wl,--wrap=free -Wl,--wrap=memalign)
 
 target_link_libraries(nba2k16
   kubridge_stub
