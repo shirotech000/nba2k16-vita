@@ -32,7 +32,9 @@
 #define AXIS_RZ 14
 #define AXIS_HAT_X 15
 #define AXIS_HAT_Y 16
-#define N_AXES 17
+#define AXIS_GAS 22     // r2, the game reads it (AMotionEvent_getAxisValue)
+#define AXIS_BRAKE 23   // l2
+#define N_AXES 24
 
 #define MAX_PTRS 6
 
@@ -159,6 +161,7 @@ void input_poll(void) {
   if (!touch_inited) {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
     touch_inited = 1;
   }
 
@@ -191,6 +194,32 @@ void input_poll(void) {
   m.axes[AXIS_RZ] = stick(pad.ry);
   m.axes[AXIS_HAT_X] = (pad.buttons & SCE_CTRL_RIGHT) ? 1 : (pad.buttons & SCE_CTRL_LEFT) ? -1 : 0;
   m.axes[AXIS_HAT_Y] = (pad.buttons & SCE_CTRL_DOWN) ? 1 : (pad.buttons & SCE_CTRL_UP) ? -1 : 0;
+  // the vita has no l2/r2: rear touch, left half = l2 (brake), right half =
+  // r2 (gas). the game reads both trigger axes. also sent as key presses
+  // (BUTTON_L2 104 / BUTTON_R2 105) in case a menu wants buttons
+  {
+    SceTouchData bt;
+    memset(&bt, 0, sizeof(bt));
+    sceTouchPeek(SCE_TOUCH_PORT_BACK, &bt, 1);
+    int l2 = 0, r2 = 0;
+    for (unsigned i = 0; i < bt.reportNum && i < 8; i++) {
+      if (bt.report[i].x < 960) l2 = 1; else r2 = 1;
+    }
+    m.axes[AXIS_BRAKE] = (float)l2;
+    m.axes[AXIS_GAS] = (float)r2;
+    static int prev_l2, prev_r2;
+    for (int k = 0; k < 2; k++) {
+      int now = k ? r2 : l2, *prev = k ? &prev_r2 : &prev_l2;
+      if (now == *prev) continue;
+      vevent e = { 0 };
+      e.type = AINPUT_EVENT_TYPE_KEY;
+      e.source = SRC_GAMEPAD;
+      e.keycode = k ? 105 : 104;
+      e.action = now ? KEY_DOWN : KEY_UP;
+      push(&e);
+      *prev = now;
+    }
+  }
   if (memcmp(m.axes, prev_axes, sizeof(prev_axes))) {
     push(&m);
     memcpy(prev_axes, m.axes, sizeof(prev_axes));
