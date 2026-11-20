@@ -70,9 +70,51 @@ static void patch_delete_retries(so_module *game) {
     L("patch: DeleteFile_LowLevel retries 33 -> 1");
 }
 
+// VCHEAP2::Init stores the minimum growth chunk into [heap+0x6c] with one
+// "mov r2, #0x400000" at +0x132AA08. VCHEAP2::GrowMemory (+0x1329718) sizes
+// every new chunk as max(request + overhead, [heap+0x6c]), so every grow also
+// pulls at least 4 MB (4194315 = 4 MB + the 11-byte VCHEAPINTERFACE header,
+// that's the malloc(4194315) in the log) even when the requester only needs a
+// few hundred KB. A partly-used chunk then carries up to ~4 MB of dead tail.
+// We shrink the floor to 1 MB: big requests (>1 MB) still grow by their exact
+// size, small ones waste at most ~1 MB instead of ~4.
+// arm_mod_imm encodes an ARM "mov" modify-immediate (imm8 rotate-right by
+// 2*rot). The sizes we hand it here are always powers of two MB values.
+static int arm_mod_imm(uint32_t val, uint32_t *out) {
+  if (val <= 0xFF) {
+    *out = 0xE3A00000 | val;
+    return 0;
+  }
+  for (uint32_t rot = 1; rot < 16; rot++) {
+    uint32_t v = (val << (rot * 2)) | (val >> (32 - rot * 2));
+    if (v <= 0xFF) {
+      *out = 0xE3A00000 | (rot << 8) | v;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+static void patch_grow_step(so_module *game) {
+  int mb = config_int("heap_grow_mb", 1);
+  if (mb < 1) mb = 1;
+  if (mb > 64) mb = 64;
+  uint32_t imm = 0xE3A02601;  /* 1MB if the encoder ever fails */
+  if (arm_mod_imm((uint32_t)mb * 1024 * 1024, &imm) != 0) {
+    L("patch: heap grow step %dMB not encodable, falling back to 1MB", mb);
+    arm_mod_imm(1024 * 1024, &imm);
+  }
+  // keep the destination register: the original is mov r2, so re-encoding with
+  // the plain 0xE3A00000 base would clobber r0 (the heap base, in use)
+  uint32_t word = (imm & ~0xF00u) | (0xE3A02501 & 0xF00u);
+  if (!patch_word(game, 0x132AA08, 0xE3A02501, word, "VCHEAP2 grow step")) return;
+  L("patch: VCHEAP2 grow step 4MB -> %dMB", mb);
+}
+
 void patches_apply(so_module *game) {
   patch_global_heap(game);
   patch_delete_retries(game);
+  patch_grow_step(game);
 }
 
 // --- heap monitor: is the game's own heap actually full? ---

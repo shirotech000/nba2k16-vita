@@ -19,7 +19,8 @@
 // attributes keep their GLSL names as the VS entry param names. int attribs
 // arrive as float params and get cast in the shader.
 // samplers keep their names (samplerCube is spelled samplerCUBE in Cg).
-// builtins: gl_FragCoord=WPOS (no y flip), gl_FrontFacing=FACE (> 0),
+// builtins: gl_FragCoord=WPOS (no y flip), gl_FrontFacing=FACE sign-corrected
+// by the GL layer via the generated "_g2c_ffs" uniform (see gl_state.c),
 // gl_PointCoord=SPRITECOORD, gl_PointSize=PSIZE, gl_InstanceID=INSTANCE,
 // gl_VertexID=INDEX, gl_FragDepth=DEPTH, frag output = COLOR.
 
@@ -73,5 +74,6 @@ int g2c_translate(const char *vs_glsl, const char *fs_glsl, g2c_result *out);
 int g2c_translate_ex(const char *vs_glsl, const char *fs_glsl, unsigned flags, g2c_result *out);
 void g2c_free(g2c_result *r);
 
-// build stamp of the translator, part of the translation cache key
-extern const char g2c_build_id[];
+// build stamp of the translator, part of the translation cache key.
+// it's G2C_BUILD in shader.c (CMake-time SHA1 of glsl2cg.c + glsl2cg.h,
+// see glsl2cg.c for the note), not __DATE__/__TIME__ anymore

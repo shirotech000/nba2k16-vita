@@ -24,6 +24,7 @@ static void draw_init(void)
   g_static = gpu_alloc(256, 16, GPU_PREF_CDRAM);
   if (!g_seq16 || !g_static) fatal("gl: can't allocate static draw buffers");
   uint16_t *tmp = malloc(SEQ16_COUNT * 2);
+  if (!tmp) fatal("gl: can't allocate the seq16 index table");
   for (int i = 0; i < SEQ16_COUNT; i++) tmp[i] = (uint16_t)i;
   memcpy(g_seq16->ptr, tmp, SEQ16_COUNT * 2);
   free(tmp);
@@ -165,6 +166,7 @@ static SceGxmVertexProgram *get_vp(gl_program *p, stream_t *st, int ns)
     vp = NULL;
   }
   vp_variant *v = calloc(1, sizeof(*v));
+  if (!v) return NULL;   // nothing to cache this one under, the draw skips
   v->hash = h;
   v->keylen = kl;
   memcpy(v->key, key, kl);
@@ -193,6 +195,7 @@ static SceGxmFragmentProgram *get_fp(gl_program *p)
     fp = NULL;
   }
   fp_variant *v = calloc(1, sizeof(*v));
+  if (!v) return NULL;   // nothing to cache this one under, the draw skips
   v->key = key;
   v->fp = fp;
   v->next = p->fps;
@@ -400,6 +403,12 @@ static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *
   prog_bind_textures(p, sc);
   for (int i = 0; i < ns; i++) sceGxmSetVertexStream(gxm_ctx, i, st[i].ptr);
 
+  // _g2c_ffs is never in the game's uniform set: sign-correct gxm's raw FACE
+  // bit into GL's gl_FrontFacing per draw (glFrontFace can change between
+  // draws), see gl_state.c (gl_facing_sign)
+  for (int i = 0; i < p->n_uniforms; i++)
+    if (!strcmp(p->uniforms[i].name, "_g2c_ffs"))
+      p->uniforms[i].data[0] = gl_facing_sign();
   prog_upload_uniforms(p);
   int r;
   int list = pt == SCE_GXM_PRIMITIVE_TRIANGLES || pt == SCE_GXM_PRIMITIVE_LINES || pt == SCE_GXM_PRIMITIVE_POINTS;

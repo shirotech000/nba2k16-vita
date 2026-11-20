@@ -568,6 +568,7 @@ static void bc_saved_log(void)
 static gl_texture *tex_make(GLuint name)
 {
   gl_texture *t = calloc(1, sizeof(*t));
+  if (!t) return NULL;   // the game regenerates the name
   t->name = name;
   t->min_filter = GL_NEAREST_MIPMAP_LINEAR;
   t->mag_filter = GL_LINEAR;
@@ -575,6 +576,15 @@ static gl_texture *tex_make(GLuint name)
   t->max_level = 1000;
   nt_set(&g_texs, name, t);
   return t;
+}
+
+// gxm.c's pool compaction moved this texture's gpu_block (gpu idle, pool
+// lock held): rebuild the descriptor so it points at the new base level
+void gl_tex_moved(void *v)
+{
+  gl_texture *t = v;
+  if (!t || !t->mem || !t->mem->movable) return;
+  tex_desc(t);
 }
 
 static void tex_release(gl_texture *t)

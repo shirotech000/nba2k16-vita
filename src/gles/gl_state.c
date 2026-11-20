@@ -17,6 +17,7 @@ GLuint nt_gen(name_table *t)
     GLuint nc = t->cap ? t->cap * 2 : 256;
     while (nc <= n) nc *= 2;
     t->objs = realloc(t->objs, nc * sizeof(void *));
+    if (!t->objs) { L_ONCE("gl: name table grow failed, names go out"); return 0; }
     memset(t->objs + t->cap, 0, (nc - t->cap) * sizeof(void *));
     t->cap = nc;
   }
@@ -135,6 +136,7 @@ void glDepthMask(GLboolean m) { G.depth_mask = m; G.dirty = 1; }
 void glCullFace(GLenum m) { G.cull_face = m; G.dirty = 1; }
 void glFrontFace(GLenum m) { G.front_face = m; G.dirty = 1; }
 
+
 SOFTFP void glPolygonOffset(GLfloat factor, GLfloat units)
 {
   G.poly_factor = factor;
@@ -234,6 +236,7 @@ gl_buffer *buf_get(GLuint name) { return nt_get(&g_bufs, name); }
 static gl_buffer *buf_make(GLuint name)
 {
   gl_buffer *b = calloc(1, sizeof(*b));
+  if (!b) return NULL;   // callers just skip, the game retries the bind
   b->name = name;
   nt_set(&g_bufs, name, b);
   return b;
@@ -583,6 +586,19 @@ void gl_blend_info(SceGxmBlendInfo *bi)
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+// FACE sign for _g2c_FrontFacing = FACE * _g2c_ffs > 0 must come out as "GL
+// winding == glFrontFace". gxm judges facing in window coords (see the winding
+// parity above), where GL's CCW winding is CW on every target, so a
+// front-facing (glFrontFace=GL_CCW) triangle has FACE < 0 there; Cg's FACE
+// semantic is positive for gxm-front-facing. flip both of these together with
+// fbo_cull_flip=0 if the game ever shows FrontFacing inverted.
+float gl_facing_sign(void)
+{
+  int pre_vp = !config_int("fbo_cull_flip", 1);
+  int cw_flip = ((G.front_face == GL_CW) ^ pre_vp);   // parens: ^ binds looser than ==
+  return cw_flip ? 1.0f : -1.0f;
+}
+
 // GL window coords are y-up. on the display we flip (negative y scale) so the
 // image is upright; fbos are drawn unflipped so texture row 0 is GL's bottom
 // row, like GL expects when sampling. culling winding flips with it.
@@ -625,23 +641,32 @@ int gl_apply_state(int prim)
   sceGxmSetFrontDepthWriteEnable(c, dw);
   sceGxmSetBackDepthWriteEnable(c, dw);
 
-  // winding test knobs (config.txt), both unverified on hw:
-  //   fbo_cull_flip=0  don't mirror winding on fbos (if gxm judges facing pre-viewport)
-  //   stencil_swap=1   swap gxm front/back stencil (if gxm "front" = cw on screen)
+  // winding parity. gxm judges facing in window coords (y down, after the
+  // viewport), where GL's CCW winding is CW on every target. what flips it is
+  // the display target's negative-y viewport, so culling mirrors there and
+  // nowhere else. the yaw of gxm's "front" (ccw = front vs cw = front) pairs
+  // with stencil_swap below: flip both together if the game ever disagrees.
+  //   fbo_cull_flip=0  gxm judges facing pre-viewport: nothing mirrors at all
+  //   stencil_swap=1   swap gxm front/back stencil (if gxm "front" = cw)
   static int k_fbo_flip = -1, k_sswap;
   if (k_fbo_flip < 0) {
     k_fbo_flip = config_int("fbo_cull_flip", 1) ? 1 : 0;
     k_sswap = config_int("stencil_swap", 0) ? 1 : 0;
     if (!k_fbo_flip || k_sswap) L("gl: winding knobs fbo_cull_flip=%d stencil_swap=%d", k_fbo_flip, k_sswap);
   }
-  int mirrored = !T.flip && k_fbo_flip;
+  int pre_vp = !k_fbo_flip;                    // facing judged pre-viewport
+  int mirrored = pre_vp ? 0 : (int)T.flip;
 
   // stencil. assumption: gxm "front" = ccw on screen (y down). no stencil
   // attachment in GL (D16 fbo) = test always passes, gxm's plane is junk there
   int st = G.stencil_test && T.has_stencil;
   if (G.stencil_test && !T.has_stencil && T.has_depth)
     L_ONCE("gl: stencil test on a depth-only fbo (%ux%u), treated as always-pass", T.w, T.h);
-  int swap = (G.front_face == GL_CW) ^ mirrored ^ k_sswap;
+  // stencil front/back: gxm's front faces = GL's back winding on every target
+  // (see above), so with glFrontFace=GL_CCW the GL front rules land in gxm's
+  // back stencil slot and the sides swap. fbo_cull_flip=0 (pre-viewport
+  // facing) needs no swap.
+  int swap = ((G.front_face == GL_CCW) ^ pre_vp) ^ k_sswap;
   for (int side = 0; side < 2; side++) {
     const gl_stencil_side *s = &G.stencil[side ^ swap];
     void (*fn)(SceGxmContext *, SceGxmStencilFunc, SceGxmStencilOp, SceGxmStencilOp, SceGxmStencilOp,
@@ -660,7 +685,8 @@ int gl_apply_state(int prim)
   if (two_sided) L_ONCE("gl: two-sided stencil in use (front/back mapping unverified)");
   sceGxmSetTwoSidedEnable(c, two_sided ? SCE_GXM_TWO_SIDED_ENABLED : SCE_GXM_TWO_SIDED_DISABLED);
 
-  // cull. on the display gxm winding == what you see; fbos are mirrored
+  // cull. GL's winding is CW in gxm's window coords on every target; the
+  // display's negative-y viewport is what mirrors it, fbos don't.
   SceGxmCullMode cm = SCE_GXM_CULL_NONE;
   if (G.cull && prim == 0) {
     if (G.cull_face == GL_FRONT_AND_BACK) return 0;

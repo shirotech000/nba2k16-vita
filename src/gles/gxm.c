@@ -316,6 +316,7 @@ static void chunk_unlink(gpu_chunk *c, int ti)
 static gpu_chunk *chunk_new(uint32_t size, int cdram, int dedicated, int pc)
 {
   gpu_chunk *c = calloc(1, sizeof(*c));
+  if (!c) return NULL;
   if (blk_alloc_pc(&c->mb, size, cdram, MAP_GPU, NULL, pc) < 0) { free(c); return NULL; }
   c->dedicated = dedicated;
   rh_init(&c->heap, c->mb.size);
@@ -521,6 +522,7 @@ static unsigned pmap_hash(void *k) { return ((uintptr_t)k >> 4) * 2654435761u >>
 static void pmap_put(pmap *m, void *k, void *v, uint32_t size)
 {
   pmap_node *n = malloc(sizeof(*n));
+  if (!n) { L_ONCE("gxm: out of memory for a patcher buffer map node"); return; }
   unsigned h = pmap_hash(k) & (PMAP_BUCKETS - 1);
   n->key = k; n->val = v; n->size = size;
   n->next = m->b[h];
@@ -561,6 +563,10 @@ static void *usse_alloc(int frag, uint32_t size, unsigned *usse_off)
   for (usse_heap *h = g_usse[frag]; ; h = h->next) {
     if (!h) {
       h = calloc(1, sizeof(*h));
+      if (!h) {
+        L("gxm: can't even get the %s usse heap header", frag ? "fragment" : "vertex");
+        return NULL;
+      }
       uint32_t hs = size > USSE_HEAP_SIZE ? ALIGN_UP(size, 4096) : USSE_HEAP_SIZE;
       if (blk_alloc(&h->mb, hs, 0, frag ? MAP_FUSSE : MAP_VUSSE, &h->base_off) < 0) {
         L("gxm: can't get %s usse memory (%u)", frag ? "fragment" : "vertex", size);
@@ -686,6 +692,7 @@ static void defer_at(void (*fn)(void *), void *arg, uint32_t scene)
   if (g_def_count == g_def_cap) {
     uint32_t ncap = g_def_cap ? g_def_cap * 2 : 256;
     deferred_t *n = malloc(ncap * sizeof(*n));
+    if (!n) fatal("gxm: can't allocate deferred work slots, the deferred call is lost");
     for (uint32_t i = 0; i < g_def_count; i++) n[i] = g_def[(g_def_head + i) % g_def_cap];
     free(g_def);
     g_def = n;
@@ -1214,6 +1221,7 @@ int gxm_init(void)
     fatal("gxm: can't allocate fragment usse ring");
 
   ctx_host_mem = malloc(SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE);
+  if (!ctx_host_mem) fatal("gxm: can't allocate the context host memory");
   SceGxmContextParams cp;
   memset(&cp, 0, sizeof(cp));
   cp.hostMem = ctx_host_mem;

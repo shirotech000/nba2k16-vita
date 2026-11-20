@@ -581,6 +581,7 @@ SceGxmProgram *shacc_compile(const char *cg, int frag, char **log)
   if (out->programData && out->programSize) {
     // copy it out, the patcher keeps pointing at whatever we register
     p = malloc(out->programSize);
+    if (!p) { log_append(log, "out of memory copying a compiled program"); return NULL; }
     memcpy(p, out->programData, out->programSize);
     if (sceGxmProgramCheck(p) < 0) {
       log_append(log, "sceGxmProgramCheck rejected the output");
@@ -741,6 +742,7 @@ void shader_init(void)
 GLuint glCreateShader(GLenum type)
 {
   gl_shader *s = calloc(1, sizeof(*s));
+  if (!s) { GL_ERR(GL_OUT_OF_MEMORY); return 0; }   // 0 = no shader created, like on GL
   s->name = nt_gen(&g_shaders);
   s->type = type;
   nt_set(&g_shaders, s->name, s);
@@ -882,10 +884,16 @@ static void prog_reset(gl_program *p)
   job_detach(p);
   if (p->vgxp || p->fgxp || p->vps || p->fps) {
     prog_garbage *g = calloc(1, sizeof(*g));
-    g->vgxp = p->vgxp; g->fgxp = p->fgxp;
-    g->vid = p->vid; g->fid = p->fid;
-    g->vps = p->vps; g->fps = p->fps;
-    gxm_defer(prog_garbage_free, g);
+    if (!g) {
+      // oom for the garbage node: leak the old programs instead of crashing.
+      // no queue-thread can be using them, job_detach(p) just ran
+      L_ONCE("shader: out of memory for a prog garbage node, leaking the old programs");
+    } else {
+      g->vgxp = p->vgxp; g->fgxp = p->fgxp;
+      g->vid = p->vid; g->fid = p->fid;
+      g->vps = p->vps; g->fps = p->fps;
+      gxm_defer(prog_garbage_free, g);
+    }
   }
   p->vgxp = p->fgxp = NULL;
   p->vid = p->fid = NULL;

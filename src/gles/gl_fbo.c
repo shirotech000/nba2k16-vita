@@ -17,6 +17,7 @@ void glGenRenderbuffers(GLsizei n, GLuint *out)
 {
   for (int i = 0; i < n; i++) {
     gl_renderbuffer *r = calloc(1, sizeof(*r));
+    if (!r) continue;   // no name handed out for it, the game retries
     r->name = out[i] = nt_gen(&g_rbs);
     nt_set(&g_rbs, r->name, r);
   }
@@ -27,6 +28,7 @@ void glBindRenderbuffer(GLenum target, GLuint rb)
   (void)target;
   if (rb && !rb_get(rb)) {
     gl_renderbuffer *r = calloc(1, sizeof(*r));
+    if (!r) return;     // not bound, the game rebinds it
     r->name = rb;
     nt_set(&g_rbs, rb, r);
   }
@@ -112,6 +114,7 @@ void glGenFramebuffers(GLsizei n, GLuint *out)
 {
   for (int i = 0; i < n; i++) {
     gl_framebuffer *f = calloc(1, sizeof(*f));
+    if (!f) continue;   // no name handed out for it, the game retries
     f->name = out[i] = nt_gen(&g_fbos);
     nt_set(&g_fbos, f->name, f);
   }
@@ -127,6 +130,7 @@ void glBindFramebuffer(GLenum target, GLuint fb)
 {
   if (fb && !fbo_get(fb)) {
     gl_framebuffer *f = calloc(1, sizeof(*f));
+    if (!f) return;     // not bound, the game rebinds it
     f->name = fb;
     nt_set(&g_fbos, fb, f);
   }

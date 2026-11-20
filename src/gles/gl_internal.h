@@ -79,6 +79,8 @@ typedef struct gl_texture {
 } gl_texture;
 
 gl_texture *tex_get(GLuint name);
+// gxm.c pool compaction moved the texture's gpu_block: rebuild the descriptor
+void gl_tex_moved(void *tex);
 // texture to sample for a unit. never NULL, falls back to a white dummy
 const SceGxmTexture *tex_for_unit(int unit, int cube, uint32_t scene);
 
@@ -299,6 +301,7 @@ void gl_state_init(void);
 // returns 0 if the draw would be fully clipped/culled and can be skipped
 int gl_apply_state(int prim);
 int gl_set_region_clip(void);
+float gl_facing_sign(void);   // _g2c_ffs: FACE sign for gl_FrontFacing
 uint8_t gl_gxm_color_mask(void);
 void gl_blend_info(SceGxmBlendInfo *bi);
 

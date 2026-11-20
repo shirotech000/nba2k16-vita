@@ -2645,7 +2645,15 @@ static void emit_stage(ctx *c, stage *st, sb *o) {
     if (u & U_VID) sb_puts(c, o, "static int _g2c_VertexID;\n");
   } else {
     if (u & U_FCOORD) sb_puts(c, o, "static float4 _g2c_FragCoord;\n");
-    if (u & U_FACE) sb_puts(c, o, "static bool _g2c_FrontFacing;\n");
+    if (u & U_FACE) {
+      sb_puts(c, o, "static bool _g2c_FrontFacing;\n");
+      // GL semantics: FrontFacing = winding matches glFrontFace. gxm's FACE is
+      // a raw facing bit, so the GL layer sign-corrects it per draw through
+      // this uniform (+1: face>0 is GL-front, -1: face<0 is). see gl_state.c
+      // (gl_facing_sign) and shader.c (prog_upload_uniforms).
+      sb_puts(c, o, "uniform float _g2c_ffs;\n");
+      add_uniform(c, "_g2c_ffs", "_g2c_ffs", ty(B_FLOAT, 1, 1), 1);
+    }
     if (u & U_PCOORD) sb_puts(c, o, "static float2 _g2c_PointCoord;\n");
     if (u & U_FCOLOR) sb_puts(c, o, "static float4 _g2c_FragColor;\n");
     if (u & U_FDATA) sb_puts(c, o, "static float4 _g2c_FragData[1];\n");
@@ -2703,7 +2711,7 @@ static void emit_stage(ctx *c, stage *st, sb *o) {
     else sb_printf(c, o, "\t%s = (%s)round(_g2c_tc%d);\n", v->cg, cgty(c, v->t), v->tc);
   }
   if (u & U_FCOORD) sb_puts(c, o, "\t_g2c_FragCoord = _g2c_wpos;\n");
-  if (u & U_FACE) sb_puts(c, o, "\t_g2c_FrontFacing = _g2c_face > 0.0;\n");
+  if (u & U_FACE) sb_puts(c, o, "\t_g2c_FrontFacing = _g2c_face * _g2c_ffs > 0.0;\n");
   if (u & U_PCOORD) sb_puts(c, o, "\t_g2c_PointCoord = _g2c_spc;\n");
   if (u & U_FCOLOR) sb_puts(c, o, "\t_g2c_FragColor = (float4)0;\n");
   if (u & U_FDATA) sb_puts(c, o, "\t_g2c_FragData[0] = (float4)0;\n");
@@ -2793,9 +2801,10 @@ int g2c_translate(const char *vs_glsl, const char *fs_glsl, g2c_result *out) {
   return g2c_translate_ex(vs_glsl, fs_glsl, 0, out);
 }
 
-// changes every time this file gets rebuilt, so cached translations (shader.c)
-// never outlive a translator change
-const char g2c_build_id[] = __DATE__ " " __TIME__;
+// the translator's cache stamp isn't __DATE__/__TIME__ anymore: every rebuild
+// would wipe shadercache/t*.g2c for nothing. shader.c now keys it on
+// G2C_BUILD, a CMake-time SHA1 of this file + glsl2cg.h, so plain rebuilds
+// keep the cache and only translator changes actually invalidate it.
 
 void g2c_free(g2c_result *r) {
   if (!r) return;

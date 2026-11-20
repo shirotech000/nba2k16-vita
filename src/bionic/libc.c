@@ -61,7 +61,7 @@ static void mem_add(void *p, size_t req) {
     // only backtrace the first few, the loader does dozens of these
     static int bt;
     L("big alloc: %uK (live %uK)%s", (unsigned)(req / 1024), n / 1024, bigmem_owns(p) ? " [cdram]" : "");
-    if (req < 32 * 1024 * 1024 && bt++ < 16) so_backtrace("big alloc");
+    if (req < 32 * 1024 * 1024 && bt++ < 64) so_backtrace("big alloc");
   }
 }
 

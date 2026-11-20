@@ -40,7 +40,11 @@ typedef struct gpu_block {
   void *ptr;
   uint32_t size;
   uint32_t off;
+  uint32_t align;      // alignment it was allocated with (compaction moves)
   gpu_chunk *chunk;
+  struct gpu_block *cnext;  // per-chunk block list (gxm.c internal)
+  uint8_t movable;     // texture memory: safe to memcpy + repoint the owner
+  void *owner;         // movable blocks: the gl_texture that owns them
 } gpu_block;
 
 gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref);

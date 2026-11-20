@@ -100,8 +100,20 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
   SceUID uid = -1;
   size_t sz = ALIGN_UP(n, MAIN_GRAN);
   int in_cdram = 0;
-  // main memory first, it's normal cached ram
-  if ((size_t)fi.size_user >= sz + main_res)
+
+  // hw run 9: the big blocks that habitually overflow are the async loader's
+  // texture/model "MakeAbsolute" blobs (VCSTATICCONTEXT::Create ->
+  // VCTexture/VCModel_MakeAbsoluteWithVramOffsetTranslation, 1-4 MB a pop,
+  // ~160 MB by the end of a match load). the game reads each of those once
+  // and then only keeps it around, so CDRAM is fine for them: cpu reads from
+  // cached CDRAM (L1WBWA) are slower, but this keeps main RAM free for the
+  // game heap's own GrowMemory steps, which OOM'd and crashed the load
+  // thread at 87%+ when they had nowhere to go.
+  int prefer_cdram = n >= 1024 * 1024 && !urgent && (size_t)fi.size_user < 64 * 1024 * 1024;
+
+  // main memory first (unless the cdram path below is preferred), it's
+  // normal cached ram
+  if (!prefer_cdram && (size_t)fi.size_user >= sz + main_res)
     uid = sceKernelAllocMemBlock("nba_big", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, sz, NULL);
 
   // phycont next: cached ram in its own 26MB pool, mostly gxm rings. the

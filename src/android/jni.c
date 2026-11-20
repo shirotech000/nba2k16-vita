@@ -54,22 +54,30 @@ static int is_jobj(const void *p) { return p && ((const jobj *)p)->magic == JOBJ
 
 static jobj *new_obj(int kind, const char *cls) {
   jobj *o = calloc(1, sizeof(*o));
+  if (!o) fatal("jni: out of memory for a java object");
   o->magic = JOBJ_MAGIC;
   o->kind = kind;
   o->cls = cls;
   return o;
 }
 
+// checked strdup: the small allocations die first when the heap runs out
+static char *xstrdup(const char *s) {
+  char *d = strdup(s);
+  if (!d) fatal("jni: out of memory for a string copy");
+  return d;
+}
+
 static jobj *new_string(const char *s) {
   jobj *o = new_obj(K_STRING, "java/lang/String");
-  o->str = strdup(s ? s : "");
+  o->str = xstrdup(s ? s : "");
   o->len = strlen(o->str);
   return o;
 }
 
 static jobj *new_file(const char *path) {
   jobj *o = new_obj(K_OBJECT, "java/io/File");
-  o->str = strdup(path);
+  o->str = xstrdup(path);
   return o;
 }
 
@@ -88,7 +96,7 @@ static jobj *find_class(const char *name) {
     if (!strcmp(classes[i]->cls, name)) c = classes[i];
   if (!c) {
     if (n_classes >= MAX_CLASSES) fatal("jni: too many classes");
-    c = new_obj(K_CLASS, strdup(name));
+    c = new_obj(K_CLASS, xstrdup(name));
     classes[n_classes++] = c;
   }
   sceKernelUnlockLwMutex(&jni_lock, 1);
@@ -199,9 +207,10 @@ static jmeth *get_method(jobj *cls, const char *name, const char *sig, int is_st
   }
   if (n_methods >= MAX_METHODS) fatal("jni: too many methods");
   jmeth *m = calloc(1, sizeof(*m));
+  if (!m) fatal("jni: out of memory for a method");
   m->cls = cn;
-  m->name = strdup(name);
-  m->sig = strdup(sig);
+  m->name = xstrdup(name);
+  m->sig = xstrdup(sig);
   m->is_static = is_static;
   m->fn = pick_handler(name, sig);
   methods[n_methods++] = m;
@@ -212,9 +221,10 @@ static jmeth *get_method(jobj *cls, const char *name, const char *sig, int is_st
 
 static jfield *get_field(jobj *cls, const char *name, const char *sig, int is_static) {
   jfield *f = calloc(1, sizeof(*f));
+  if (!f) fatal("jni: out of memory for a field");
   f->cls = is_jobj(cls) ? cls->cls : "?";
-  f->name = strdup(name);
-  f->sig = strdup(sig);
+  f->name = xstrdup(name);
+  f->sig = xstrdup(sig);
   f->is_static = is_static;
   L("JNI: Get%sFieldID %s.%s %s", is_static ? "Static" : "", f->cls, name, sig);
   return f;
@@ -330,6 +340,7 @@ static jobj *new_array(int len, int elem) {
   a->len = len;
   a->elem = elem;
   a->data = calloc(len ? len : 1, elem);
+  if (!a->data) fatal("jni: out of memory for a java array");
   return a;
 }
 
@@ -380,6 +391,7 @@ J int GetStringLength(void *e, jobj *s) { return GetStringUTFLength(e, s); }
 J void *NewString(void *e, const uint16_t *u, int len) {
   (void)e;
   char *tmp = malloc(len + 1);
+  if (!tmp) fatal("jni: out of memory for a string copy");
   for (int i = 0; i < len; i++) tmp[i] = u[i] < 0x80 ? (char)u[i] : '?';
   tmp[len] = 0;
   jobj *s = new_string(tmp);
@@ -392,6 +404,7 @@ J const uint16_t *GetStringChars(void *e, jobj *s, uint8_t *copy) {
   const char *c = is_jobj(s) && s->str ? s->str : "";
   int n = strlen(c);
   uint16_t *u = malloc((n + 1) * 2);
+  if (!u) fatal("jni: out of memory for a string copy");
   for (int i = 0; i <= n; i++) u[i] = (uint8_t)c[i];
   return u;
 }
