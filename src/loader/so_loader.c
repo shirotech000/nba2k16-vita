@@ -364,8 +364,21 @@ void so_backtrace(const char *why) {
   // module's code is probably a return address. good enough to find callers.
   uintptr_t *sp = __builtin_frame_address(0);
   int shown = 0;
+  // stop at the top of whatever block the stack lives in. on hw the page
+  // past a thread stack isn't mapped (vita3k maps it, so it never showed)
+  int n = 512;
+  SceKernelMemBlockInfo mi;
+  memset(&mi, 0, sizeof(mi));
+  mi.size = sizeof(mi);
+  if (sceKernelGetMemBlockInfoByAddr(sp, &mi) >= 0) {
+    uintptr_t top = (uintptr_t)mi.mappedBase + mi.mappedSize;
+    int left = (int)((top - (uintptr_t)sp) / sizeof(uintptr_t));
+    if (left < n) n = left;
+  } else {
+    n = 64;  // don't know the bounds, stay close
+  }
   L("backtrace (%s):", why);
-  for (int i = 0; i < 512 && shown < 12; i++) {
+  for (int i = 0; i < n && shown < 12; i++) {
     so_module *m = so_module_for_addr(sp[i]);
     if (m && sp[i] >= m->text_start && sp[i] < m->text_end) {
       char w[96];
