@@ -83,7 +83,28 @@ void patches_apply(so_module *game) {
 static uintptr_t (*g_get_heap)(void);
 static unsigned (*g_heap_free)(uintptr_t), (*g_heap_total)(uintptr_t), (*g_heap_peak)(uintptr_t);
 
+// the game frees a texture/stream/index block's cpu copy one frame after its
+// gl upload, through a 1024-entry free queue drained in VCSCREEN_RENDERTHREAD::
+// Render. if more than 1024 uploads land in one frame the rest are just
+// dropped (leaked). this watches the queue's fill so we know if that happens.
+static volatile int *g_freeq_count;
+static int g_freeq_peak;
+
+void game_freeq_sample(void) {
+  if (!g_freeq_count) return;
+  int n = *g_freeq_count;
+  if (n > g_freeq_peak) g_freeq_peak = n;
+}
+
+static void freeq_init(so_module *game) {
+  // ldr r2,[pc,#1128] @ +0x1303974 loads this literal, add r2,pc,r2 @ +0x130397c
+  const uint32_t *lit = (const uint32_t *)(game->base + 0x1303de4);
+  if (*lit != 0x0074bb7c) { L("freeq: literal mismatch (%08X), not watching the free queue", *lit); return; }
+  g_freeq_count = (volatile int *)(game->base + 0x1303984 + 0x74bb7c + 0x7454);
+}
+
 void game_monitor_init(so_module *game) {
+  freeq_init(game);
   g_get_heap = (void *)so_symbol(game, "_Z15get_global_heapv");
   g_heap_free = (void *)so_symbol(game, "_ZNK7VCHEAP220GetNumberOfFreeBytesEv");
   g_heap_total = (void *)so_symbol(game, "_ZNK7VCHEAP221GetTotalNumberOfBytesEv");
@@ -114,6 +135,10 @@ void game_monitor_tick(void) {
   gpu_mem_log("monitor");  // cdram/lpddr use + free user/cdram/phycont
   extern void gxm_prof_report(void);
   gxm_prof_report();
+  if (g_freeq_count) {
+    L("game free queue: peak %d / 1024 per frame%s", g_freeq_peak, g_freeq_peak >= 1024 ? " (FULL, blocks leaked)" : "");
+    g_freeq_peak = 0;
+  }
   if (!g_get_heap) return;
   uintptr_t h = g_get_heap();
   if (!h) return;

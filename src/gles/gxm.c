@@ -1114,6 +1114,7 @@ static void maybe_screenshot(void)
 void gxm_swap(void)
 {
   if (!g_ready) return;
+  { extern void game_freeq_sample(void) __attribute__((weak)); if (game_freeq_sample) game_freeq_sample(); }
   // whoever swaps is the render thread: give it a core of its own once a
   // few hundred frames in (past boot, all game threads exist by then)
   if (g_frame == 300) { extern void cpu_pin_render_thread(void); cpu_pin_render_thread(); }
