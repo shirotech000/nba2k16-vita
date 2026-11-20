@@ -221,7 +221,8 @@ static void rh_free(range_heap *h, uint32_t off, uint32_t size)
 
 // ============================================================ gpu pool
 
-#define CHUNK_SIZE      (8 * 1024 * 1024)
+// shared chunks only serve < 2 MiB requests, so big ones just strand memory
+#define CHUNK_SIZE      (2 * 1024 * 1024)
 #define DEDICATED_MIN   (2 * 1024 * 1024)
 
 struct gpu_chunk {
@@ -343,7 +344,14 @@ void gpu_free(gpu_block *b)
   int ti = c->mb.cdram ? 0 : 1;
   st.used[ti] -= b->size;
   rh_free(&c->heap, b->off, b->size);
-  if (c->dedicated) {
+  int release = c->dedicated;
+  if (!release && c->heap.used == 0) {
+    // empty shared chunk: give it back unless it's the only spare left.
+    // the game needs every MB of cdram it can get (bigmem borrows it)
+    for (gpu_chunk *o = g_chunks[ti]; o; o = o->next)
+      if (o != c && !o->dedicated && o->heap.used == 0) { release = 1; break; }
+  }
+  if (release) {
     chunk_unlink(c, ti);
     rh_destroy(&c->heap);
     blk_free(&c->mb);
