@@ -89,28 +89,28 @@ static void patch_heap_grow(so_module *game) {
 
 // the game's video settings (crowd / crowd2d / stadium / player / shadow /
 // sideline / frontend / reflection / presentation lighting LOD) live in one
-// global struct and default low on this build. forcing them up turned out
-// to make the match load ask for a ~32MB asset that never fits (hw29/31/32,
-// dead at 55-76%), so it's opt-in now: quality_max=1 forces the arena set
-// (crowd=2, crowd2d/stadium=3), quality_max_all=1 forces all nine
+// global struct. the default here is the crowd diet: the 3d crowd sections
+// are what pushes the match load over the line at the tail (hw35/36: ~2MB
+// asks at the floors, dead at 79%), so crowd lod 0 skips them and
+// crowd2d=3 keeps the billboard fans - "billboard is fine" per the owner.
+// quality_max=0 puts the game's own defaults back, quality_max_all=1
+// forces everything to 3 for experiments
 static int quality_lod_max(void) { return 3; }
-// crowd lod 3 makes the game load a single ~32MB crowd asset that can never
-// fit mid-match (hw31, died at 55%). lod 2 is the tier below it and takes
-// the renderer's own medium path
-static int quality_lod_crowd2(void) { return 2; }
+static int quality_lod_crowd0(void) { return 0; }
+static int quality_lod_crowd2d(void) { return 3; }
 
 static void patch_video_lods(so_module *game) {
   int all = config_int("quality_max_all", 0);
-  if (!config_int("quality_max", 0)) return;
+  if (!config_int("quality_max", 1)) return;
   static const struct { uint32_t off, w0, w1; const char *name; int arena; int (*fn)(void); } lods[] = {
-    { 0x81EF80, 0xE59F3004, 0xE79F0003, "crowd", 1, quality_lod_crowd2 },
+    { 0x81EF80, 0xE59F3004, 0xE79F0003, "crowd", 1, quality_lod_crowd0 },
     { 0x81EFA4, 0xE59F3008, 0xE08F3003, "player", 0, quality_lod_max },
     { 0x81EFCC, 0xE59F3008, 0xE08F3003, "reflection", 0, quality_lod_max },
     { 0x81EFF4, 0xE59F3008, 0xE08F3003, "sideline", 0, quality_lod_max },
     { 0x81F01C, 0xE59F3008, 0xE08F3003, "shadow", 0, quality_lod_max },
-    { 0x81F044, 0xE59F3008, 0xE08F3003, "stadium", 1, quality_lod_max },
+    { 0x81F044, 0xE59F3008, 0xE08F3003, "stadium", 0, quality_lod_max },
     { 0x81F06C, 0xE59F3008, 0xE08F3003, "frontend", 0, quality_lod_max },
-    { 0x81F094, 0xE59F3008, 0xE08F3003, "crowd2d", 1, quality_lod_max },
+    { 0x81F094, 0xE59F3008, 0xE08F3003, "crowd2d", 1, quality_lod_crowd2d },
     { 0x81F0BC, 0xE59F3008, 0xE08F3003, "presentation lighting", 0, quality_lod_max },
   };
   int n = 0;
@@ -126,7 +126,7 @@ static void patch_video_lods(so_module *game) {
     p[1] = (uint32_t)(uintptr_t)lods[i].fn;
     n++;
   }
-  if (n) L("patch: %d video LOD getters hooked (crowd=2, rest=3)%s", n, all ? " (all)" : "");
+  if (n) L("patch: %d video LOD getters hooked (crowd=0, crowd2d=3)%s", n, all ? " (all)" : "");
 }
 
 void patches_apply(so_module *game) {
