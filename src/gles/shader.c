@@ -239,6 +239,23 @@ static void cache_path(char *out, int n, uint64_t h, int frag)
   snprintf(out, n, "%s/%c%016llx.gxp", SHADER_CACHE, frag ? 'f' : 'v', (unsigned long long)h);
 }
 
+// read through a stack buffer: once the heap is full our buffers can live in
+// cdram/gpu pool memory, and sceIoRead into that just fails (hw: shaders
+// "bad cache file" right as spilling started -> headless players)
+static int io_read_bounce(SceUID fd, void *dst, uint32_t n)
+{
+  uint8_t tmp[8192];
+  uint8_t *d = dst;
+  while (n) {
+    uint32_t k = n < sizeof(tmp) ? n : sizeof(tmp);
+    if (sceIoRead(fd, tmp, k) != (SceSSize)k) return -1;
+    memcpy(d, tmp, k);
+    d += k;
+    n -= k;
+  }
+  return 0;
+}
+
 // *oom gets set when the file was there but we had no memory to read it:
 // that's "try again later", not "compile it" (loading the compiler then is worse)
 static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2, int *oom)
@@ -256,7 +273,7 @@ static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2,
       sceIoClose(fd);
       return NULL;
     }
-    if (sceIoRead(fd, p, hd.gxp_size) != (SceSSize)hd.gxp_size || sceGxmProgramCheck(p) < 0) {
+    if (io_read_bounce(fd, p, hd.gxp_size) < 0 || sceGxmProgramCheck(p) < 0) {
       L("shader: bad cache file %s, ignoring", path);
       free(p);
       p = NULL;
@@ -1207,10 +1224,10 @@ static int tcache_load(const char *vs, const char *fs, g2c_result *r)
   if (sceIoRead(fd, &h, sizeof(h)) == sizeof(h) && h.magic == TCACHE_MAGIC && h.build == tcache_build() &&
       h.src_hash2 == tcache_check(vs, fs) && h.res_size == sizeof(*r) &&
       h.vs_len < 1024 * 1024 && h.fs_len < 1024 * 1024 &&
-      sceIoRead(fd, r, sizeof(*r)) == sizeof(*r)) {
+      io_read_bounce(fd, r, sizeof(*r)) == 0) {
     v = malloc(h.vs_len + 1);
     f = malloc(h.fs_len + 1);
-    if (v && f && sceIoRead(fd, v, h.vs_len) == (SceSSize)h.vs_len && sceIoRead(fd, f, h.fs_len) == (SceSSize)h.fs_len) {
+    if (v && f && io_read_bounce(fd, v, h.vs_len) == 0 && io_read_bounce(fd, f, h.fs_len) == 0) {
       v[h.vs_len] = 0;
       f[h.fs_len] = 0;
       r->vs_cg = v;
