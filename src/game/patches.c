@@ -93,6 +93,12 @@ void game_monitor_tick(void) {
   extern void mem_report(void);
   extern unsigned shacc_mem_live(void);
   extern void gpu_mem_log(const char *why);
+  extern uint32_t gxm_frame_count(void);
+  // fps over the last 5s window, so "how fast is it" comes from the log
+  static uint32_t last_frames;
+  uint32_t f = gxm_frame_count();
+  L("fps: %u.%u (frame %u)", (f - last_frames) / 5, ((f - last_frames) * 2) % 10, (unsigned)f);
+  last_frames = f;
   mem_report();
   L("Cg compiler live %uK", shacc_mem_live() / 1024);
   gpu_mem_log("monitor");  // cdram/lpddr use + free user/cdram/phycont

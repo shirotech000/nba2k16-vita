@@ -209,6 +209,11 @@ static void do_draw(GLenum mode, GLsizei count, GLenum itype, const void *indice
   if (dbg_no_draw) { g_st.skipped++; return; }
   draw_init();
   gl_program *p = prog_current();
+  // still compiling in the background? skip just this draw, the frame goes on
+  if (p && p->pending && !prog_try_finish(p)) {
+    g_st.skipped++;
+    return;
+  }
   if (!p || !p->linked) {
     g_st.skipped++;
     if (p && p->link_tried && !p->delete_pending) {

@@ -18,13 +18,59 @@ static int log_ready;
 // part you want. turn on with sync_log=1 in config.txt.
 static int log_sync;
 
+// buffered mode: L() just appends to log_bufs[log_cur] under log_lock, a
+// low prio thread swaps buffers and writes the full one out every ~100ms.
+// a direct sceIoWrite per line serialized every game thread on card io.
+// flush_lock keeps file writes in order (log thread vs log_flush/fatal).
+#define LOG_BUF_SZ (64 * 1024)
+static char log_bufs[2][LOG_BUF_SZ];
+static volatile int log_cur, log_len, log_dropped;
+static SceKernelLwMutexWork flush_lock;
+static SceUID log_kick = -1;   // sema, pokes the log thread early when half full
+
 int config_int(const char *key, int def);
+
+// file writes only, caller holds flush_lock. no newlib in here
+static void flush_locked(void) {
+  sceKernelLockLwMutex(&log_lock, 1, NULL);
+  char *b = log_bufs[log_cur];
+  int n = log_len, dropped = log_dropped;
+  log_cur ^= 1;
+  log_len = 0;
+  log_dropped = 0;
+  sceKernelUnlockLwMutex(&log_lock, 1);
+  if (log_fd < 0) return;
+  if (n > 0) sceIoWrite(log_fd, b, n);
+  if (dropped) {
+    char m[64];
+    int mn = sceClibSnprintf(m, sizeof(m), "[log] buffer full, dropped %d lines\n", dropped);
+    if (mn > 0) sceIoWrite(log_fd, m, mn);
+  }
+}
+
+static int log_thread(SceSize args, void *argp) {
+  (void)args; (void)argp;
+  for (;;) {
+    SceUInt timeout = 100 * 1000;
+    sceKernelWaitSema(log_kick, 1, &timeout);
+    log_flush();
+  }
+  return 0;
+}
 
 void log_init(void) {
   sceIoMkdir(DATA_PATH, 0777);
   sceKernelCreateLwMutex(&log_lock, "log", 0, 0, NULL);
+  sceKernelCreateLwMutex(&flush_lock, "log_flush", 0, 0, NULL);
   log_fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
   log_sync = config_int("sync_log", 0);
+  if (!log_sync) {
+    log_kick = sceKernelCreateSema("log_kick", 0, 0, 1, NULL);
+    // below the game's threads (pthread default is 160), user lowest is 191
+    SceUID th = sceKernelCreateThread("nba_log", log_thread, 0xB0, 16 * 1024, 0, 0, NULL);
+    if (th >= 0) sceKernelStartThread(th, 0, NULL);
+    else sceClibPrintf("log: no flush thread (0x%08X), flushing on fatal only\n", th);
+  }
   log_ready = 1;
 }
 
@@ -40,15 +86,29 @@ void log_vprintf(const char *fmt, va_list ap) {
 
   sceClibPrintf("%s", buf);
   if (!log_ready) return;
-  sceKernelLockLwMutex(&log_lock, 1, NULL);
-  if (log_fd >= 0) {
-    sceIoWrite(log_fd, buf, n);
-    if (log_sync) {
+  if (log_sync) {
+    sceKernelLockLwMutex(&log_lock, 1, NULL);
+    if (log_fd >= 0) {
+      sceIoWrite(log_fd, buf, n);
       sceIoClose(log_fd);
       log_fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_APPEND, 0777);
     }
+    sceKernelUnlockLwMutex(&log_lock, 1);
+    return;
+  }
+  // full buffer: drop the line and count it, never block on the card
+  int kick = 0;
+  sceKernelLockLwMutex(&log_lock, 1, NULL);
+  int len = log_len;
+  if (len + n <= LOG_BUF_SZ) {
+    memcpy(log_bufs[log_cur] + len, buf, n);
+    log_len = len + n;
+    kick = len < LOG_BUF_SZ / 2 && len + n >= LOG_BUF_SZ / 2;
+  } else {
+    log_dropped++;
   }
   sceKernelUnlockLwMutex(&log_lock, 1);
+  if (kick && log_kick >= 0) sceKernelSignalSema(log_kick, 1);
 }
 
 void log_printf(const char *fmt, ...) {
@@ -59,7 +119,26 @@ void log_printf(const char *fmt, ...) {
 }
 
 void log_flush(void) {
-  // sceIoWrite isn't buffered, nothing to do. here in case that changes.
+  // sync mode writes every line right away, nothing pending
+  if (!log_ready || log_sync) return;
+  sceKernelLockLwMutex(&flush_lock, 1, NULL);
+  flush_locked();
+  sceKernelUnlockLwMutex(&flush_lock, 1);
+}
+
+// crash path, no locks: the faulting thread might be holding one. best
+// effort, a write already in flight on the log thread can land after this.
+void log_flush_unlocked(void) {
+  if (!log_ready || log_sync || log_fd < 0) return;
+  int n = log_len;
+  if (n > 0 && n <= LOG_BUF_SZ) {
+    sceIoWrite(log_fd, log_bufs[log_cur], n);
+    log_len = 0;
+  }
+}
+
+void log_write_raw(const char *buf, int len) {
+  if (log_fd >= 0 && len > 0) sceIoWrite(log_fd, buf, len);
 }
 
 void fatal(const char *fmt, ...) {
@@ -68,7 +147,17 @@ void fatal(const char *fmt, ...) {
   log_printf("!!! FATAL !!!");
   log_vprintf(fmt, ap);
   va_end(ap);
-  if (log_fd >= 0) sceIoClose(log_fd);
+  if (log_ready) {
+    log_flush();
+    sceKernelLockLwMutex(&flush_lock, 1, NULL);
+    sceKernelLockLwMutex(&log_lock, 1, NULL);
+    if (log_fd >= 0) sceIoClose(log_fd);
+    log_fd = -1;
+    sceKernelUnlockLwMutex(&log_lock, 1);
+    sceKernelUnlockLwMutex(&flush_lock, 1);
+  } else if (log_fd >= 0) {
+    sceIoClose(log_fd);
+  }
   sceKernelDelayThread(500 * 1000);
   sceKernelExitProcess(1);
   for (;;) {}

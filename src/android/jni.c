@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <psp2/kernel/threadmgr.h>
 
 #include "android/jni.h"
 #include "game/patches.h"
@@ -72,17 +73,25 @@ static jobj *new_file(const char *path) {
   return o;
 }
 
+// class + method tables get hit from several game threads, one lock for both
+static SceKernelLwMutexWork jni_lock;
+
 // --- classes, interned by name so the same jclass comes back every time ---
 #define MAX_CLASSES 256
 static jobj *classes[MAX_CLASSES];
 static int n_classes;
 
 static jobj *find_class(const char *name) {
-  for (int i = 0; i < n_classes; i++)
-    if (!strcmp(classes[i]->cls, name)) return classes[i];
-  if (n_classes >= MAX_CLASSES) fatal("jni: too many classes");
-  jobj *c = new_obj(K_CLASS, strdup(name));
-  classes[n_classes++] = c;
+  jobj *c = NULL;
+  sceKernelLockLwMutex(&jni_lock, 1, NULL);
+  for (int i = 0; i < n_classes && !c; i++)
+    if (!strcmp(classes[i]->cls, name)) c = classes[i];
+  if (!c) {
+    if (n_classes >= MAX_CLASSES) fatal("jni: too many classes");
+    c = new_obj(K_CLASS, strdup(name));
+    classes[n_classes++] = c;
+  }
+  sceKernelUnlockLwMutex(&jni_lock, 1);
   return c;
 }
 
@@ -180,10 +189,13 @@ static int n_methods;
 
 static jmeth *get_method(jobj *cls, const char *name, const char *sig, int is_static) {
   const char *cn = is_jobj(cls) ? cls->cls : "?";
+  sceKernelLockLwMutex(&jni_lock, 1, NULL);
   for (int i = 0; i < n_methods; i++) {
     jmeth *m = methods[i];
-    if (m->is_static == is_static && !strcmp(m->cls, cn) && !strcmp(m->name, name) && !strcmp(m->sig, sig))
+    if (m->is_static == is_static && !strcmp(m->cls, cn) && !strcmp(m->name, name) && !strcmp(m->sig, sig)) {
+      sceKernelUnlockLwMutex(&jni_lock, 1);
       return m;
+    }
   }
   if (n_methods >= MAX_METHODS) fatal("jni: too many methods");
   jmeth *m = calloc(1, sizeof(*m));
@@ -193,6 +205,7 @@ static jmeth *get_method(jobj *cls, const char *name, const char *sig, int is_st
   m->is_static = is_static;
   m->fn = pick_handler(name, sig);
   methods[n_methods++] = m;
+  sceKernelUnlockLwMutex(&jni_lock, 1);
   L("JNI: Get%sMethodID %s.%s %s%s", is_static ? "Static" : "", cn, name, sig, m->fn ? "" : " (no handler)");
   return m;
 }
@@ -520,6 +533,7 @@ void *jni_find_native(const char *name) {
 #define SET3(i, base) SET(i, base); SET(i + 1, base##V); SET(i + 2, base##A)
 
 void jni_init(void) {
+  sceKernelCreateLwMutex(&jni_lock, "jni", 0, 0, NULL);
   vm_ptr = &vm_obj;
   activity_obj = new_obj(K_OBJECT, ACTIVITY_CLASS);
 

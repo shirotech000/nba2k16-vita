@@ -1,10 +1,12 @@
 // NBA 2K16 vita loader: load the android libs, fake enough android
 // around them, then let the game run.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 
@@ -26,6 +28,7 @@ int _newlib_heap_size_user = NBA_HEAP_MB * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 1024 * 1024;
 
 void libc_init(void);
+void io_init(void);
 void mem_report(void);
 void crash_init(void);
 // graphics layer hook, the GL side fills this in
@@ -40,6 +43,16 @@ static int file_exists(const char *p) {
 
 static void need_file(const char *p, const char *what) {
   if (!file_exists(p)) fatal("missing %s: %s (see README)", what, p);
+}
+
+static void log_free_mem(const char *when) {
+  SceKernelFreeMemorySizeInfo fi;
+  memset(&fi, 0, sizeof(fi));
+  fi.size = sizeof(fi);
+  int r = sceKernelGetFreeMemorySize(&fi);
+  if (r < 0) L("free mem (%s): query failed 0x%08X", when, r);
+  else L("free mem (%s): user %d KiB, cdram %d KiB, phycont %d KiB", when,
+         fi.size_user >> 10, fi.size_cdram >> 10, fi.size_phycont >> 10);
 }
 
 // the game reads /proc/cpuinfo (maps to DATA_PATH/root/proc/cpuinfo), give it a
@@ -65,6 +78,15 @@ static void write_fake_cpuinfo(void) {
 
 int main(void) {
   log_init();
+  // the newlib heap block gets grabbed before main with no fallback. if it
+  // didn't fit, every malloc is NULL from here on, so say so right away
+  // (volatile so gcc can't fold the malloc/free pair away)
+  void *volatile heap_probe = malloc(64);
+  if (!heap_probe)
+    fatal("newlib heap is dead: malloc(64) failed. the %d MB heap (_newlib_heap_size_user) "
+          "probably didn't fit, try a smaller NBA_HEAP_MB", NBA_HEAP_MB);
+  free(heap_probe);
+  log_free_mem("boot");
   L("nba2k16 vita loader, built " __DATE__ " " __TIME__);
   if (emu_is_vita3k()) L("vita3k.flag found, running in vita3k");
 
@@ -86,6 +108,7 @@ int main(void) {
   // no_crash_handler=1 lets vita3k (or the vita's coredump) report faults itself
   if (!config_int("no_crash_handler", 0)) crash_init();
   libc_init();
+  io_init();
   imports_init();
   jni_init();
 
@@ -107,6 +130,7 @@ int main(void) {
   mem_report();
   game_monitor_init(&game_mod);
 
+  log_free_mem("before gfx_init");
   if (gfx_init) gfx_init();
 
   int (*jni_onload)(void *vm, void *reserved) = (void *)so_symbol(&game_mod, "JNI_OnLoad");

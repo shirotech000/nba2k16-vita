@@ -110,17 +110,14 @@ static int pipe_write(vpipe *p, const void *src, size_t n) {
 
 static SceUID fds[MAX_FDS];      // 0 = free, else SceUID + 1
 static SceKernelLwMutexWork fd_lock;
-static int fd_lock_ok;
 
-static void fd_lock_init(void) {
-  if (!fd_lock_ok) {
-    sceKernelCreateLwMutex(&fd_lock, "fds", 0, 0, NULL);
-    fd_lock_ok = 1;
-  }
+// main calls this once before any game code runs. lazy init raced when
+// two threads opened their first file at the same time
+void io_init(void) {
+  sceKernelCreateLwMutex(&fd_lock, "fds", 0, 0, NULL);
 }
 
 static int fd_alloc(SceUID uid) {
-  fd_lock_init();
   sceKernelLockLwMutex(&fd_lock, 1, NULL);
   int fd = -1;
   for (int i = 0; i < MAX_FDS; i++) {
@@ -140,9 +137,18 @@ static SceUID fd_uid(int fd) {
   return fds[i] - 1;
 }
 
-// sce errors are 0x8001xxxx with a regular errno in the low byte
+// sce errors are 0x8001xxxx with a regular errno in the low byte. that's
+// newlib numbering, the game wants linux's where they differ
 static int sce_fail(int r) {
-  errno = r & 0xFF;
+  int e = r & 0xFF;
+  switch (e) {
+    case ENAMETOOLONG: e = B_ENAMETOOLONG; break;
+    case ENOSYS:       e = B_ENOSYS; break;
+    case ENOTEMPTY:    e = B_ENOTEMPTY; break;
+    case ELOOP:        e = B_ELOOP; break;
+    case EOVERFLOW:    e = B_EOVERFLOW; break;
+  }
+  errno = e;
   return -1;
 }
 

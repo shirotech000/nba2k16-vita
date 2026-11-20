@@ -52,19 +52,38 @@ static void st_blk(int cdram, int64_t delta)
 
 // the 26MB phycont pool is separate from the main user budget, and the
 // game eats the main one alive. so non-cdram gpu stuff goes there first.
-static int phycont_full;
+// no "pool full" latch: one big ask not fitting doesn't mean a smaller one
+// won't, so every lpddr ask tries phycont first.
+enum {
+  PC_TRY,    // phycont, then the main budget
+  PC_ONLY,   // phycont or nothing
+  PC_SKIP,   // main budget only (caller already tried phycont)
+};
 
-static int blk_alloc(memblk *m, uint32_t size, int cdram, int map, unsigned *usse_off)
+// one fallback line per size class (log2 of the MiB-rounded size)
+static uint32_t pc_fallback_logged;
+
+static void pc_fallback_log(uint32_t size, int err)
+{
+  uint32_t mb = ALIGN_UP(size, 1024 * 1024) >> 20;
+  int cls = 31 - __builtin_clz(mb);
+  if (pc_fallback_logged & (1u << cls)) return;
+  pc_fallback_logged |= 1u << cls;
+  if (err) L("gxm: phycont can't fit %u KiB (0x%08X), using the main budget for that size", size >> 10, err);
+  else L("gxm: phycont can't fit %u KiB, using the main budget for that size", size >> 10);
+}
+
+static int blk_alloc_pc(memblk *m, uint32_t size, int cdram, int map, unsigned *usse_off, int pc)
 {
   SceUID uid = -1;
-  if (!cdram && !phycont_full) {
+  if (!cdram && pc != PC_SKIP) {
     uint32_t psize = ALIGN_UP(size, 1024 * 1024);
     uid = sceKernelAllocMemBlock("nba_phycont", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, psize, NULL);
     if (uid >= 0) size = psize;
-    else {
-      phycont_full = 1;
-      L("gxm: phycont pool full (0x%08X), lpddr from the main budget from now on", uid);
-    }
+    else if (pc == PC_ONLY) return uid;
+    else pc_fallback_log(size, uid);
+  } else if (!cdram) {
+    pc_fallback_log(size, 0);
   }
   if (uid < 0) {
     uint32_t gran = cdram ? 256 * 1024 : 4096;
@@ -96,6 +115,11 @@ static int blk_alloc(memblk *m, uint32_t size, int cdram, int map, unsigned *uss
   m->map = map;
   st_blk(cdram, size);
   return 0;
+}
+
+static int blk_alloc(memblk *m, uint32_t size, int cdram, int map, unsigned *usse_off)
+{
+  return blk_alloc_pc(m, size, cdram, map, usse_off, PC_TRY);
 }
 
 static void blk_free(memblk *m)
@@ -223,10 +247,10 @@ static void chunk_unlink(gpu_chunk *c, int ti)
   if (c->next) c->next->prev = c->prev;
 }
 
-static gpu_chunk *chunk_new(uint32_t size, int cdram, int dedicated)
+static gpu_chunk *chunk_new(uint32_t size, int cdram, int dedicated, int pc)
 {
   gpu_chunk *c = calloc(1, sizeof(*c));
-  if (blk_alloc(&c->mb, size, cdram, MAP_GPU, NULL) < 0) { free(c); return NULL; }
+  if (blk_alloc_pc(&c->mb, size, cdram, MAP_GPU, NULL, pc) < 0) { free(c); return NULL; }
   c->dedicated = dedicated;
   rh_init(&c->heap, c->mb.size);
   chunk_link(c, cdram ? 0 : 1);
@@ -239,7 +263,7 @@ static int pool_try(gpu_block *b, uint32_t size, uint32_t align, int cdram)
   uint32_t off;
 
   if (size >= DEDICATED_MIN) {
-    gpu_chunk *c = chunk_new(size, cdram, 1);
+    gpu_chunk *c = chunk_new(size, cdram, 1, PC_TRY);
     if (!c) return -1;
     rh_alloc(&c->heap, size, align, &off);
     b->chunk = c; b->off = off;
@@ -253,10 +277,21 @@ static int pool_try(gpu_block *b, uint32_t size, uint32_t align, int cdram)
       return 0;
     }
   }
-  // new chunk, shrink the ask if memory is tight
+  // new chunk, shrink the ask if memory is tight. lpddr walks the sizes
+  // in phycont first (it's 1 MiB granular) before touching the main budget
   uint32_t gran = cdram ? 256 * 1024 : 4096;
+  if (!cdram) {
+    for (uint32_t cs = CHUNK_SIZE; cs >= 1024 * 1024 && cs >= size; cs >>= 1) {
+      gpu_chunk *c = chunk_new(cs, 0, 0, PC_ONLY);
+      if (!c) continue;
+      if (rh_alloc(&c->heap, size, align, &off) == 0) {
+        b->chunk = c; b->off = off;
+        return 0;
+      }
+    }
+  }
   for (uint32_t cs = CHUNK_SIZE; cs >= gran && cs >= size; cs >>= 1) {
-    gpu_chunk *c = chunk_new(cs, cdram, 0);
+    gpu_chunk *c = chunk_new(cs, cdram, 0, PC_SKIP);
     if (!c) continue;
     if (rh_alloc(&c->heap, size, align, &off) == 0) {
       b->chunk = c; b->off = off;

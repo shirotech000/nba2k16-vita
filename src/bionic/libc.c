@@ -20,9 +20,12 @@
 #include "util/log.h"
 #include "bionic/bionic.h"
 #include "util/cpu.h"
+#include "bionic/bigmem.h"
 
 // --- malloc with stats, memory is THE question for this port ---
 static volatile int mem_live, mem_peak, mem_biggest, mem_fails, mem_count;
+
+static size_t usable(void *p);
 
 static void mem_add(void *p, size_t req) {
   if (!p) {
@@ -32,7 +35,7 @@ static void mem_add(void *p, size_t req) {
     return;
   }
   if (req >= 32 * 1024 * 1024) so_backtrace("huge alloc");
-  int n = __sync_add_and_fetch(&mem_live, (int)malloc_usable_size(p));
+  int n = __sync_add_and_fetch(&mem_live, (int)usable(p));
   if (n > mem_peak) {
     // timeline: one line every 8MB of new peak
     static volatile int last_mark;
@@ -46,14 +49,22 @@ static void mem_add(void *p, size_t req) {
   __sync_add_and_fetch(&mem_count, 1);
   if ((int)req > mem_biggest) mem_biggest = req;
   if (req >= 1024 * 1024) {
-    L("big alloc: %uK (live %uK)", (unsigned)(req / 1024), n / 1024);
-    if (req < 32 * 1024 * 1024) so_backtrace("big alloc");
+    // only backtrace the first few, the loader does dozens of these
+    static int bt;
+    L("big alloc: %uK (live %uK)%s", (unsigned)(req / 1024), n / 1024, bigmem_owns(p) ? " [cdram]" : "");
+    if (req < 32 * 1024 * 1024 && bt++ < 16) so_backtrace("big alloc");
   }
+}
+
+// usable size of any pointer we handed out, newlib or cdram
+static size_t usable(void *p) {
+  size_t s = bigmem_size(p);
+  return s ? s : malloc_usable_size(p);
 }
 
 static void mem_sub(void *p) {
   if (!p) return;
-  __sync_sub_and_fetch(&mem_live, (int)malloc_usable_size(p));
+  __sync_sub_and_fetch(&mem_live, (int)usable(p));
   __sync_sub_and_fetch(&mem_count, 1);
 }
 
@@ -62,23 +73,74 @@ void mem_report(void) {
   L("mem: live %uK peak %uK biggest %uK fails %d (arena %uK free %uK)",
     mem_live / 1024, mem_peak / 1024, mem_biggest / 1024, mem_fails,
     (unsigned)mi.arena / 1024, (unsigned)mi.fordblks / 1024);
+  bigmem_report();
 }
 
-static void *b_malloc(size_t n) { void *p = malloc(n); mem_add(p, n); return p; }
-static void *b_calloc(size_t a, size_t b) { void *p = calloc(a, b); mem_add(p, a * b); return p; }
-static void b_free(void *p) { mem_sub(p); free(p); }
-static void *b_realloc(void *p, size_t n) {
-  size_t old = p ? malloc_usable_size(p) : 0;
-  void *q = realloc(p, n);
-  if (q || !n) {
-    __sync_sub_and_fetch(&mem_live, (int)old);
-    if (q) mem_add(q, n);
-  } else {
-    mem_add(NULL, n);
+// --- main heap vs cdram policy ---
+// the game wants more than the main budget, so once newlib's heap gets
+// tight, big blocks (texture/model data mostly) go to cdram instead, and
+// anything that would outright fail gets a second chance there.
+#define BIG_MIN       (256 * 1024)
+#define HEADROOM_MIN  (48 * 1024 * 1024)
+#define FALLBACK_MIN  (64 * 1024)
+
+extern int _newlib_heap_size_user;
+
+static size_t heap_headroom(void) {
+  struct mallinfo mi = mallinfo();
+  size_t used = mi.arena - mi.fordblks;
+  return (size_t)_newlib_heap_size_user > used ? _newlib_heap_size_user - used : 0;
+}
+
+static void *alloc_any(size_t n) {
+  if (n >= BIG_MIN && n < 32 * 1024 * 1024 && heap_headroom() < HEADROOM_MIN) {
+    void *p = bigmem_alloc(n);
+    if (p) return p;
   }
+  void *p = malloc(n);
+  if (!p && n >= FALLBACK_MIN) p = bigmem_alloc(n);
+  return p;
+}
+
+static void free_any(void *p) {
+  if (bigmem_owns(p)) bigmem_free(p);
+  else free(p);
+}
+
+static void *b_malloc(size_t n) { void *p = alloc_any(n); mem_add(p, n); return p; }
+static void *b_calloc(size_t a, size_t b) {
+  size_t n = a * b;
+  void *p = alloc_any(n);
+  if (p) memset(p, 0, n);
+  mem_add(p, n);
+  return p;
+}
+static void b_free(void *p) { mem_sub(p); free_any(p); }
+static void *b_realloc(void *p, size_t n) {
+  if (!p) return b_malloc(n);
+  if (!n) { b_free(p); return NULL; }
+  size_t old = usable(p);
+  void *q = NULL;
+  if (!bigmem_owns(p)) q = realloc(p, n);
+  if (!q) {
+    // cdram block, or newlib couldn't grow it: allocate fresh and copy
+    q = alloc_any(n);
+    if (!q) { mem_add(NULL, n); return NULL; }
+    memcpy(q, p, old < n ? old : n);
+    free_any(p);
+  }
+  __sync_sub_and_fetch(&mem_live, (int)old);
+  __sync_sub_and_fetch(&mem_count, 1);
+  mem_add(q, n);
   return q;
 }
-static void *b_memalign(size_t a, size_t n) { void *p = memalign(a, n); mem_add(p, n); return p; }
+static void *b_memalign(size_t a, size_t n) {
+  // cdram blocks are 256K aligned, so big aligned requests can go there too
+  void *p = memalign(a, n);
+  if (!p && n >= FALLBACK_MIN && a <= 256 * 1024) p = bigmem_alloc(n);
+  mem_add(p, n);
+  return p;
+}
 
 // --- ctype: bionic reads _ctype_ as a pointer to a 1+256 BSD style table ---
 static char ctype_table[257];
@@ -126,6 +188,7 @@ static int b_raise(int sig) {
 static void b_exit(int code) {
   L("game called exit(%d)", code);
   mem_report();
+  log_flush();  // logging is buffered, don't lose the last lines
   sceKernelExitProcess(code);
 }
 
@@ -222,8 +285,9 @@ static int b_nanosleep(const struct timespec *req, struct timespec *rem) {
   return 0;
 }
 
-static int b_usleep(unsigned us) { sceKernelDelayThread(us); return 0; }
-static int b_sched_yield(void) { sceKernelDelayThread(0); return 0; }
+// delay 0 doesn't give the core away on hw, equal prio spinners need 1
+static int b_usleep(unsigned us) { sceKernelDelayThread(us ? us : 1); return 0; }
+static int b_sched_yield(void) { sceKernelDelayThread(1); return 0; }
 
 // --- strings that touch floats ---
 static SOFTFP double b_strtod(const char *s, char **end) { return strtod(s, end); }
@@ -255,6 +319,7 @@ static uintptr_t b_gnu_unwind_find_exidx(uintptr_t pc, int *count) {
 }
 
 void libc_init(void) {
+  bigmem_init();
   ctype_init();
 }
 

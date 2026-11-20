@@ -6,8 +6,11 @@
 
 // linux errno values where newlib disagrees. the small common ones
 // (ENOENT, EEXIST, EINVAL, EAGAIN, EBUSY...) are identical.
+#define B_ENAMETOOLONG 36
 #define B_ENOSYS     38
 #define B_ENOTEMPTY  39
+#define B_ELOOP      40
+#define B_EOVERFLOW  75
 #define B_ENETDOWN   100
 #define B_ETIMEDOUT  110
 #define B_EINPROGRESS 115

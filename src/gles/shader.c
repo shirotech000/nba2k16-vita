@@ -13,6 +13,7 @@
 #include "gles/gl_internal.h"
 #include "gles/gl_api.h"
 #include "util/paths.h"
+#include "util/cpu.h"
 
 // say "linked" even when we failed, so the game keeps going and just
 // skips those draws. off = tell the truth.
@@ -161,6 +162,17 @@ static void log_append(char **log, const char *fmt, ...)
   memcpy(*log + old, tmp, add);
   (*log)[old + add] = '\n';
   (*log)[old + add + 1] = 0;
+}
+
+// cache only, never compiles. NULL = not cached (yet)
+static SceGxmProgram *shacc_lookup(const char *cg, int frag)
+{
+  size_t len = strlen(cg);
+  uint64_t h = hash64(cg, len) ^ (frag ? 0x9E3779B97F4A7C15ull : 0);
+  uint32_t h2 = fnv1a(cg, len, 2166136261u);
+  char path[128];
+  cache_path(path, sizeof(path), h, frag);
+  return cache_load(path, (uint32_t)len, h2);
 }
 
 SceGxmProgram *shacc_compile(const char *cg, int frag, char **log)
@@ -518,6 +530,8 @@ typedef struct {
   fp_variant *fps;
 } prog_garbage;
 
+static void job_detach(struct gl_program *p);
+
 static void prog_garbage_free(void *arg)
 {
   prog_garbage *g = arg;
@@ -540,6 +554,7 @@ static void prog_garbage_free(void *arg)
 
 static void prog_reset(gl_program *p)
 {
+  job_detach(p);
   if (p->vgxp || p->fgxp || p->vps || p->fps) {
     prog_garbage *g = calloc(1, sizeof(*g));
     g->vgxp = p->vgxp; g->fgxp = p->fgxp;
@@ -668,52 +683,16 @@ static void collect_samplers(gl_program *p, int stage)
   }
 }
 
-static int link_program(gl_program *p, char **log)
+// ============================================================ link
+// split in two so a slow Cg compile never freezes the game:
+//   link_front: translate + attribute/uniform locations (no gxp needed),
+//               so glGetUniformLocation / glUniform* work right away
+//   link_back:  register with the patcher + resolve gxp params. runs on the
+//               render thread once both gxps exist (cache hit or worker done)
+// draws with a program that's still compiling just get skipped.
+
+static void link_front(gl_program *p, const g2c_result *r)
 {
-  gl_shader *vs = sh_get(p->vs), *fs = sh_get(p->fs);
-  if (!vs || !fs || !vs->src || !fs->src) {
-    log_append(log, "missing vertex or fragment shader");
-    return 0;
-  }
-  if (!gxm_ready()) {
-    log_append(log, "gxm not initialized");
-    return 0;
-  }
-
-  // ~12KB, keep it off the game thread's stack
-  g2c_result *r = calloc(1, sizeof(*r));
-  if (!r) { log_append(log, "out of memory"); return 0; }
-  if (g2c_translate(vs->src, fs->src, r) != 0) {
-    log_append(log, "glsl2cg: %s", r->error);
-    dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, r->error);
-    g2c_free(r);
-    free(r);
-    return 0;
-  }
-
-  p->vgxp = shacc_compile(r->vs_cg, 0, log);
-  p->fgxp = p->vgxp ? shacc_compile(r->fs_cg, 1, log) : NULL;
-  if (!p->vgxp || !p->fgxp) {
-    dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, *log);
-    g2c_free(r);
-    free(r);
-    return 0;
-  }
-
-  int e1 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->vgxp, &p->vid);
-  int e2 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->fgxp, &p->fid);
-  if (e1 < 0 || e2 < 0) {
-    log_append(log, "sceGxmShaderPatcherRegisterProgram failed 0x%08X 0x%08X", e1, e2);
-    if (e1 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->vid);
-    if (e2 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->fid);
-    p->vid = p->fid = NULL;
-    g2c_free(r);
-    free(r);
-    return 0;
-  }
-  p->vbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->vgxp);
-  p->fbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->fgxp);
-
   // ---- attributes: explicit binds > layout(location) > first free ----
   unsigned used = 0;
   int loc_of[GLSL2CG_MAX_ATTRIBS];
@@ -737,11 +716,6 @@ static int link_program(gl_program *p, char **log)
     snprintf(a->cg_name, sizeof(a->cg_name), "%s", r->attribs[i].cg_name[0] ? r->attribs[i].cg_name : r->attribs[i].name);
     a->loc = loc_of[i];
     a->reg = -1;
-    const SceGxmProgramParameter *prm = sceGxmProgramFindParameterByName(p->vgxp, a->cg_name);
-    if (prm && sceGxmProgramParameterGetCategory(prm) == SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE) {
-      a->reg = sceGxmProgramParameterGetResourceIndex(prm);
-      a->comps = sceGxmProgramParameterGetComponentCount(prm);
-    }
   }
 
   // ---- uniforms ----
@@ -762,13 +736,13 @@ static int link_program(gl_program *p, char **log)
     u->is_sampler = g->type == G2C_SAMPLER2D || g->type == G2C_SAMPLERCUBE;
     u->is_cube = g->type == G2C_SAMPLERCUBE;
     u->is_int = type_is_int(g->type);
+    u->in_vs = g->in_vs;
+    u->in_fs = g->in_fs;
     u->data = calloc(u->slots * 4, sizeof(float));
     u->loc_base = nloc;
     nloc += u->elems;
     if (!u->is_sampler && u->slots > 1 && g->vec4_slots != u->slots)
       L("shader: %s: glsl2cg says %d slots, we think %d", u->name, g->vec4_slots, u->slots);
-    if (g->in_vs) setup_uniform_stage(p, u, 0);
-    if (g->in_fs) setup_uniform_stage(p, u, 1);
   }
   p->n_locs = nloc;
   p->loc_map = malloc((nloc ? nloc : 1) * sizeof(int16_t));
@@ -776,11 +750,40 @@ static int link_program(gl_program *p, char **log)
     for (int e = 0; e < p->uniforms[i].elems; e++)
       p->loc_map[p->uniforms[i].loc_base + e] = (int16_t)i;
 
-  collect_samplers(p, 0);
-  collect_samplers(p, 1);
-
   // gl_InstanceID is an INSTANCE param the hardware fills, nothing to bind
   p->uses_iid = r->uses_instance_id;
+}
+
+// p->vgxp / p->fgxp are set. patcher + gxp lookups, render thread only
+static int link_back(gl_program *p, char **log)
+{
+  int e1 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->vgxp, &p->vid);
+  int e2 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->fgxp, &p->fid);
+  if (e1 < 0 || e2 < 0) {
+    log_append(log, "sceGxmShaderPatcherRegisterProgram failed 0x%08X 0x%08X", e1, e2);
+    if (e1 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->vid);
+    if (e2 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->fid);
+    p->vid = p->fid = NULL;
+    return 0;
+  }
+  p->vbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->vgxp);
+  p->fbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->fgxp);
+
+  for (int i = 0; i < p->n_attribs; i++) {
+    prog_attrib *a = &p->attribs[i];
+    const SceGxmProgramParameter *prm = sceGxmProgramFindParameterByName(p->vgxp, a->cg_name);
+    if (prm && sceGxmProgramParameterGetCategory(prm) == SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE) {
+      a->reg = sceGxmProgramParameterGetResourceIndex(prm);
+      a->comps = sceGxmProgramParameterGetComponentCount(prm);
+    }
+  }
+  for (int i = 0; i < p->n_uniforms; i++) {
+    prog_uniform *u = &p->uniforms[i];
+    if (u->in_vs) setup_uniform_stage(p, u, 0);
+    if (u->in_fs) setup_uniform_stage(p, u, 1);
+  }
+  collect_samplers(p, 0);
+  collect_samplers(p, 1);
 
   if (g_link_logs < 40) {
     g_link_logs++;
@@ -790,17 +793,189 @@ static int link_program(gl_program *p, char **log)
       L("shader:   attrib %s loc %d reg %d comps %d", p->attribs[i].name, p->attribs[i].loc,
         p->attribs[i].reg, p->attribs[i].comps);
   }
-  g2c_free(r);
-  free(r);
   return 1;
+}
+
+// ---- background compile worker ----
+typedef struct compile_job {
+  GLuint prog;
+  char *vcg, *fcg, *vsrc, *fsrc;  // owned copies (glsl kept for the failure dump)
+  SceGxmProgram *vgxp, *fgxp;     // whichever came from the cache are already set
+  char *log;
+  int done, orphan;               // guarded by q_lock
+  struct compile_job *next;
+} compile_job;
+
+static SceKernelLwMutexWork q_lock;
+static SceUID q_sema = -1;
+static compile_job *q_head, *q_tail;
+static int g_async = -1;          // -1 untried, 0 off (sync compiles), 1 worker running
+static volatile int q_pending;
+
+static void job_free(compile_job *j)
+{
+  free(j->vcg); free(j->fcg); free(j->vsrc); free(j->fsrc);
+  free(j->log);
+  free(j->vgxp);
+  free(j->fgxp);
+  free(j);
+}
+
+static int compile_worker(SceSize args, void *argp)
+{
+  (void)args; (void)argp;
+  cpu_place_game_thread();  // core 3 too with CapUnlocker, that's what it's for
+  for (;;) {
+    sceKernelWaitSema(q_sema, 1, NULL);
+    sceKernelLockLwMutex(&q_lock, 1, NULL);
+    compile_job *j = q_head;
+    if (j) { q_head = j->next; if (!q_head) q_tail = NULL; }
+    sceKernelUnlockLwMutex(&q_lock, 1);
+    if (!j) continue;
+
+    if (!j->vgxp) j->vgxp = shacc_compile(j->vcg, 0, &j->log);
+    if (j->vgxp && !j->fgxp) j->fgxp = shacc_compile(j->fcg, 1, &j->log);
+
+    sceKernelLockLwMutex(&q_lock, 1, NULL);
+    int orphan = j->orphan;
+    j->done = 1;
+    sceKernelUnlockLwMutex(&q_lock, 1);
+    __sync_sub_and_fetch(&q_pending, 1);
+    if (orphan) job_free(j);  // program got relinked/deleted meanwhile
+  }
+  return 0;
+}
+
+static int async_ready(void)
+{
+  if (g_async >= 0) return g_async;
+  g_async = 0;
+  extern int config_int(const char *key, int def);
+  if (!config_int("async_shaders", 1)) {
+    L("shader: async_shaders=0, compiling inline");
+    return 0;
+  }
+  sceKernelCreateLwMutex(&q_lock, "shader_q", 0, 0, NULL);
+  q_sema = sceKernelCreateSema("shader_q", 0, 0, 0x7FFFFFFF, NULL);
+  // just under the game's threads (160): uses idle cpu, doesn't starve gameplay
+  SceUID th = sceKernelCreateThread("nba_shaderq", compile_worker, 0xA8, COMPILE_STACK, 0, 0, NULL);
+  if (q_sema < 0 || th < 0) {
+    L("shader: no compile worker (0x%08X), compiling inline", th);
+    return 0;
+  }
+  sceKernelStartThread(th, 0, NULL);
+  g_async = 1;
+  L("shader: background compile worker up");
+  return 1;
+}
+
+static void queue_job(compile_job *j)
+{
+  sceKernelLockLwMutex(&q_lock, 1, NULL);
+  if (q_tail) q_tail->next = j; else q_head = j;
+  q_tail = j;
+  sceKernelUnlockLwMutex(&q_lock, 1);
+  int n = __sync_add_and_fetch(&q_pending, 1);
+  if (n == 1 || !(n & 7)) L("shader: %d compiles queued", n);
+  sceKernelSignalSema(q_sema, 1);
+}
+
+// detach a pending job from its program (relink/delete). the worker frees it
+// when it's done, or we free it now if it already is
+static void job_detach(gl_program *p)
+{
+  compile_job *j = p->job;
+  if (!j) return;
+  p->job = NULL;
+  p->pending = 0;
+  sceKernelLockLwMutex(&q_lock, 1, NULL);
+  int done = j->done;
+  if (!done) j->orphan = 1;
+  sceKernelUnlockLwMutex(&q_lock, 1);
+  if (done) job_free(j);
+}
+
+// called before drawing with p. 1 = ready to draw
+int prog_try_finish(gl_program *p)
+{
+  if (!p->pending) return p->linked;
+  compile_job *j = p->job;
+  sceKernelLockLwMutex(&q_lock, 1, NULL);
+  int done = j->done;
+  sceKernelUnlockLwMutex(&q_lock, 1);
+  if (!done) return 0;
+
+  p->job = NULL;
+  p->pending = 0;
+  p->vgxp = j->vgxp; j->vgxp = NULL;
+  p->fgxp = j->fgxp; j->fgxp = NULL;
+  char *log = j->log; j->log = NULL;
+  int ok = p->vgxp && p->fgxp && link_back(p, &log);
+  if (!ok) {
+    dump_fail(p, j->vsrc, j->fsrc, j->vcg, j->fcg, log ? log : "?");
+    L("!!!! shader: LINK FAILED for program %u (background compile):\n%s", p->name, log ? log : "?");
+    p->log = NULL;
+    prog_reset(p);
+    p->log = log;
+    p->linked = 0;
+  } else {
+    free(log);
+  }
+  job_free(j);
+  return ok;
 }
 
 typedef struct { gl_program *p; char *log; int ok; } link_job;
 
 static void link_job_fn(void *arg)
 {
-  link_job *j = arg;
-  j->ok = link_program(j->p, &j->log);
+  link_job *lj = arg;
+  gl_program *p = lj->p;
+  char **log = &lj->log;
+  lj->ok = 0;
+
+  gl_shader *vs = sh_get(p->vs), *fs = sh_get(p->fs);
+  if (!vs || !fs || !vs->src || !fs->src) { log_append(log, "missing vertex or fragment shader"); return; }
+  if (!gxm_ready()) { log_append(log, "gxm not initialized"); return; }
+
+  // ~12KB, keep it off the game thread's stack
+  g2c_result *r = calloc(1, sizeof(*r));
+  if (!r) { log_append(log, "out of memory"); return; }
+  if (g2c_translate(vs->src, fs->src, r) != 0) {
+    log_append(log, "glsl2cg: %s", r->error);
+    dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, r->error);
+    g2c_free(r);
+    free(r);
+    return;
+  }
+  link_front(p, r);
+
+  SceGxmProgram *vg = shacc_lookup(r->vs_cg, 0);
+  SceGxmProgram *fg = shacc_lookup(r->fs_cg, 1);
+  if (vg && fg) {
+    // cached: finish right here like before
+    p->vgxp = vg;
+    p->fgxp = fg;
+    lj->ok = link_back(p, log);
+  } else if (async_ready()) {
+    compile_job *j = calloc(1, sizeof(*j));
+    j->prog = p->name;
+    j->vcg = strdup(r->vs_cg); j->fcg = strdup(r->fs_cg);
+    j->vsrc = strdup(vs->src); j->fsrc = strdup(fs->src);
+    j->vgxp = vg; j->fgxp = fg;
+    p->job = j;
+    p->pending = 1;
+    queue_job(j);
+    lj->ok = 1;  // locations are valid, draws wait for the gxps
+  } else {
+    free(vg); free(fg);
+    p->vgxp = shacc_compile(r->vs_cg, 0, log);
+    p->fgxp = p->vgxp ? shacc_compile(r->fs_cg, 1, log) : NULL;
+    if (!p->vgxp || !p->fgxp) dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, *log);
+    else lj->ok = link_back(p, log);
+  }
+  g2c_free(r);
+  free(r);
 }
 
 void glLinkProgram(GLuint prog)

@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
+#include <sys/time.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include "loader/exports.h"
@@ -132,8 +134,25 @@ static int b_cond_wait(volatile int *c, volatile int *m) {
 }
 
 static int b_cond_timedwait(volatile int *c, volatile int *m, const struct timespec *abstime) {
-  // vitasdk time_t is 32-bit like bionic's, so the timespec passes straight through
-  int r = pthread_cond_timedwait(get_cond(c), get_mutex(m), abstime);
+  // the game's deadline is gettimeofday based, pthread-embedded checks it
+  // against newlib clock_gettime(CLOCK_REALTIME) (sceRtc). different clocks
+  // on hw, so rebase: time left by gettimeofday, added to clock_gettime now.
+  // (time_t is 32-bit on both sides, so the layout itself passes through)
+  struct timeval tv;
+  struct timespec now, dl;
+  gettimeofday(&tv, NULL);
+  int64_t left = ((int64_t)abstime->tv_sec - tv.tv_sec) * 1000000000LL +
+                 ((int64_t)abstime->tv_nsec - (int64_t)tv.tv_usec * 1000);
+  if (left < 0) left = 0;
+  clock_gettime(CLOCK_REALTIME, &now);
+  int64_t ns = (int64_t)now.tv_nsec + left % 1000000000LL;
+  int64_t sec = (int64_t)now.tv_sec + left / 1000000000LL + ns / 1000000000LL;
+  ns %= 1000000000LL;
+  // "wait forever" style deadlines would wrap the 32-bit time_t
+  if (sec > 0x7FFFFFFF) { sec = 0x7FFFFFFF; ns = 0; }
+  dl.tv_sec = (time_t)sec;
+  dl.tv_nsec = (long)ns;
+  int r = pthread_cond_timedwait(get_cond(c), get_mutex(m), &dl);
   return r == ETIMEDOUT ? B_ETIMEDOUT : r;
 }
 

@@ -128,6 +128,7 @@ typedef struct prog_uniform {
   int slots;               // elems * cols
   int loc_base;
   int is_sampler, is_cube, is_int;
+  int in_vs, in_fs;        // which stages declare it (gxp lookups happen at finish)
   float *data;             // slots * 4 floats, zero padded
   struct {
     const SceGxmProgramParameter *p;
@@ -166,11 +167,15 @@ typedef struct fp_variant {
   struct fp_variant *next;
 } fp_variant;
 
+struct compile_job;
+
 typedef struct gl_program {
   GLuint name;
   GLuint vs, fs;
-  int linked;              // usable for drawing
+  int linked;              // link succeeded (locations valid). may still be pending
   int link_tried;
+  int pending;             // cg compile still running in the background, can't draw yet
+  struct compile_job *job;
   char *log;
   struct { char name[GLSL2CG_NAME_LEN]; int loc; } binds[MAX_ATTRIBS * 2];
   int n_binds;
@@ -198,6 +203,8 @@ typedef struct gl_program {
 
 gl_program *prog_get(GLuint name);
 gl_program *prog_current(void);
+// finishes a background-compiled program once its gxps are in. 1 = drawable
+int prog_try_finish(gl_program *p);
 // writes all uniforms of p into freshly reserved default uniform buffers
 void prog_upload_uniforms(gl_program *p);
 void prog_bind_textures(gl_program *p, uint32_t scene);

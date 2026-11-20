@@ -17,7 +17,9 @@
 #define GXM_FRAGMENT_RING_SIZE (2 * 1024 * 1024)
 #define GXM_FRAG_USSE_RING_SIZE (16 * 1024)
 #define GXM_TRANSIENT_RING_SIZE (8 * 1024 * 1024)
-#define GXM_SCENES_PER_FRAME   4   // per render target, gxm max is 8
+// per render target. the game switches fbos a lot, so go to the gxm max
+// (SCE_GXM_MAX_SCENES_PER_RENDERTARGET, 8. vitasdk only names it in a comment)
+#define GXM_SCENES_PER_FRAME   8
 
 // ---- gpu memory ----
 enum {

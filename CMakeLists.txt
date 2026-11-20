@@ -49,6 +49,7 @@ target_link_libraries(nba2k16
   SceCtrl_stub
   SceTouch_stub
   SceAudio_stub
+  SceAudiodec_stub
   SceSysmodule_stub
   SceAppMgr_stub
   SceAppUtil_stub
