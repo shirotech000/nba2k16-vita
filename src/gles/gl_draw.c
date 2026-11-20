@@ -2,6 +2,7 @@
 // so attribute offsets never end up in the vertex program cache key.
 #include <stdlib.h>
 #include <string.h>
+#include <psp2/kernel/processmgr.h>
 #include "gles/gl_internal.h"
 #include "gles/gl_api.h"
 
@@ -201,8 +202,26 @@ static SceGxmFragmentProgram *get_fp(gl_program *p)
 
 // ============================================================ draw
 
+static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *indices, GLint first,
+                          GLsizei inst, int arrays);
+static int dbg_prof = -1;
+
 static void do_draw(GLenum mode, GLsizei count, GLenum itype, const void *indices, GLint first,
                     GLsizei inst, int arrays)
+{
+  if (dbg_prof < 0) dbg_prof = config_int("prof", 0);
+  if (!dbg_prof) {
+    do_draw_inner(mode, count, itype, indices, first, inst, arrays);
+    gxm_prof_draws(1, 0);
+    return;
+  }
+  SceUInt64 t0 = sceKernelGetProcessTimeWide();
+  do_draw_inner(mode, count, itype, indices, first, inst, arrays);
+  gxm_prof_draws(1, sceKernelGetProcessTimeWide() - t0);
+}
+
+static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *indices, GLint first,
+                          GLsizei inst, int arrays)
 {
   stat_tick();
   if (count <= 0 || inst <= 0 || !gxm_ready()) return;

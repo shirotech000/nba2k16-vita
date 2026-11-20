@@ -500,15 +500,45 @@ int gxm_scene_done(uint32_t id)
   return (int32_t)(*g_notif - id) >= 0;
 }
 
+// frame timing, the monitor prints it every 5s (gxm_prof_report)
+static struct {
+  uint64_t wait_us, queue_us, frame_us, draw_us;
+  uint32_t waits, frames, scenes, draws;
+} g_prof;
+static SceUInt64 g_last_swap;
+
+void gxm_prof_draws(uint32_t n, uint64_t us) { g_prof.draws += n; g_prof.draw_us += us; }
+
 void gxm_wait_scene(uint32_t id)
 {
   if (!g_ready || gxm_scene_done(id)) return;
   if (g_in_scene && id >= g_scene_ctr) gxm_end_scene();
+  SceUInt64 t0 = sceKernelGetProcessTimeWide();
   int spins = 0;
   while (!gxm_scene_done(id)) {
     sceKernelDelayThread(100);
     if (++spins == 20000) L("gxm: waited 2s for scene %u (gpu at %u), gpu hang?", id, *g_notif);
   }
+  g_prof.wait_us += sceKernelGetProcessTimeWide() - t0;
+  g_prof.waits++;
+}
+
+// where the frames went. "cpu stalls" = waiting on the gpu mid frame (ring
+// full, mipmaps off a render target, readpixels...), "queue" = blocked handing
+// the frame to the display (gpu or vsync bound), the rest is game + gl cpu
+void gxm_prof_report(void)
+{
+  uint32_t f = g_prof.frames;
+  if (!f) return;
+  unsigned fm = (unsigned)(g_prof.frame_us / f), wm = (unsigned)(g_prof.wait_us / f),
+           qm = (unsigned)(g_prof.queue_us / f), dm = (unsigned)(g_prof.draw_us / f);
+  L("frame: %u.%02ums avg | cpu stalls %u.%02ums (%u.%u/frame) | display queue %u.%02ums | "
+    "draws %u/frame%s%u.%02ums | %u.%u scenes/frame",
+    fm / 1000, fm % 1000 / 10, wm / 1000, wm % 1000 / 10, g_prof.waits / f, g_prof.waits * 10 / f % 10,
+    qm / 1000, qm % 1000 / 10, g_prof.draws / f, g_prof.draw_us ? " in " : " ",
+    g_prof.draw_us ? dm / 1000 : 0, g_prof.draw_us ? dm % 1000 / 10 : 0,
+    g_prof.scenes / f, g_prof.scenes * 10 / f % 10);
+  memset(&g_prof, 0, sizeof(g_prof));
 }
 
 typedef struct {
@@ -912,13 +942,19 @@ void gxm_swap(void)
   } else {
     sceGxmPadHeartbeat(&g_disp_surf[g_back], g_disp_sync[g_back]);
     flip_data d = { g_disp_mb[g_back].base };
+    SceUInt64 q0 = sceKernelGetProcessTimeWide();
     int r = sceGxmDisplayQueueAddEntry(g_disp_sync[g_front], g_disp_sync[g_back], &d);
+    g_prof.queue_us += sceKernelGetProcessTimeWide() - q0;
     if (r < 0) L_ONCE("gxm: sceGxmDisplayQueueAddEntry failed 0x%08X", r);
     g_front = g_back;
     g_back = (g_back + 1) % DISPLAY_BUFFERS;
   }
 
   g_frame++;
+  SceUInt64 now = sceKernelGetProcessTimeWide();
+  if (g_last_swap) { g_prof.frame_us += now - g_last_swap; g_prof.frames++; }
+  g_last_swap = now;
+  g_prof.scenes += g_scenes_frame;
   if (g_scenes_frame > g_scenes_peak) {
     g_scenes_peak = g_scenes_frame;
     L("gxm: new peak of %u scenes in a frame (frame %u)", g_scenes_peak, g_frame);

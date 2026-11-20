@@ -80,6 +80,8 @@ void gxm_end_scene(void);
 void gxm_swap(void);         // end scene, queue the flip, rotate buffers
 void gxm_set_vsync(int interval);  // vblanks to wait per flip, 0 = none
 uint32_t gxm_frame_count(void);
+void gxm_prof_report(void);                     // frame timing line, monitor calls it
+void gxm_prof_draws(uint32_t n, uint64_t us);   // us = 0 unless prof=1
 
 // the default framebuffer (current back buffer)
 void gxm_display_target(gxm_target *out);

@@ -61,8 +61,18 @@ static void patch_global_heap(so_module *game) {
   if (ok == 2) L("patch: game global heap 400MB -> %uMB", (unsigned)imm8 * 16);
 }
 
+// VCANDROIDFILEDEVICE::DeleteFile_LowLevel retries unlink() 33 times on any
+// failure, errno never checked. mid match the game sweeps its tr/amb/ts cache
+// files by number and most of them don't exist, so that's ~1100 failed
+// removes a second. nearly free on linux, a real fs call here. one try it is.
+static void patch_delete_retries(so_module *game) {
+  if (!patch_word(game, 0x12CD2C4, 0xE3A04021, 0xE3A04001, "DeleteFile_LowLevel retries"))
+    L("patch: DeleteFile_LowLevel retries 33 -> 1");
+}
+
 void patches_apply(so_module *game) {
   patch_global_heap(game);
+  patch_delete_retries(game);
 }
 
 // --- heap monitor: is the game's own heap actually full? ---
@@ -102,6 +112,8 @@ void game_monitor_tick(void) {
   mem_report();
   L("Cg compiler live %uK", shacc_mem_live() / 1024);
   gpu_mem_log("monitor");  // cdram/lpddr use + free user/cdram/phycont
+  extern void gxm_prof_report(void);
+  gxm_prof_report();
   if (!g_get_heap) return;
   uintptr_t h = g_get_heap();
   if (!h) return;

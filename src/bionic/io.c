@@ -350,7 +350,12 @@ static int b_unlink(const char *path) {
   char fixed[512];
   if (path_fix_checked("unlink", path, fixed, sizeof(fixed)) < 0) return -1;
   int r = sceIoRemove(fixed);
-  L("unlink(%s) -> 0x%X", fixed, r < 0 ? r : 0);
+  // the game sweeps cache files that mostly aren't there, keep a few of those
+  static int missing;
+  int gone = r < 0 && (r & 0xFF) == 0x02;
+  if (gone) missing++;
+  if (!gone || missing <= 8)
+    L("unlink(%s) -> 0x%X%s", fixed, r < 0 ? r : 0, gone && missing == 8 ? " (quiet about missing files now)" : "");
   static int bt_once;
   if (!bt_once++) so_backtrace("first unlink");
   return r < 0 ? sce_fail(r) : 0;
