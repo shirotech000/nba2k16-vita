@@ -87,23 +87,19 @@ static void patch_heap_grow(so_module *game) {
     L("patch: VCHEAP2 grow step 4MB -> %dMB", mb);
 }
 
-// the game's video settings (crowd / crowd2d / stadium / player / shadow /
-// sideline / frontend / reflection / presentation lighting LOD) live in one
-// global struct. the default here is the crowd diet: the 3d crowd sections
-// are what pushes the match load over the line at the tail (hw35/36: ~2MB
-// asks at the floors, dead at 79%), so crowd lod 0 skips them and
-// crowd2d=3 keeps the billboard fans - "billboard is fine" per the owner.
-// quality_max=0 puts the game's own defaults back, quality_max_all=1
-// forces everything to 3 for experiments
+// the crowd diet run bought 3% (hw36/37) but the owner wants crowds back:
+// "compromise on all stage/character textures and maybe be able to fit
+// crowds in". with tex_half freeing the pool, crowd lod 2 (the medium 3d
+// sections) is the target. quality_max=0 restores the game's own defaults
 static int quality_lod_max(void) { return 3; }
-static int quality_lod_crowd0(void) { return 0; }
+static int quality_lod_crowd2(void) { return 2; }
 static int quality_lod_crowd2d(void) { return 3; }
 
 static void patch_video_lods(so_module *game) {
   int all = config_int("quality_max_all", 0);
   if (!config_int("quality_max", 1)) return;
   static const struct { uint32_t off, w0, w1; const char *name; int arena; int (*fn)(void); } lods[] = {
-    { 0x81EF80, 0xE59F3004, 0xE79F0003, "crowd", 1, quality_lod_crowd0 },
+    { 0x81EF80, 0xE59F3004, 0xE79F0003, "crowd", 1, quality_lod_crowd2 },
     { 0x81EFA4, 0xE59F3008, 0xE08F3003, "player", 0, quality_lod_max },
     { 0x81EFCC, 0xE59F3008, 0xE08F3003, "reflection", 0, quality_lod_max },
     { 0x81EFF4, 0xE59F3008, 0xE08F3003, "sideline", 0, quality_lod_max },
@@ -126,7 +122,7 @@ static void patch_video_lods(so_module *game) {
     p[1] = (uint32_t)(uintptr_t)lods[i].fn;
     n++;
   }
-  if (n) L("patch: %d video LOD getters hooked (crowd=0, crowd2d=3)%s", n, all ? " (all)" : "");
+  if (n) L("patch: %d video LOD getters hooked (crowd=2, crowd2d=3)%s", n, all ? " (all)" : "");
 }
 
 void patches_apply(so_module *game) {

@@ -781,7 +781,10 @@ static void hint_check(gl_texture *nt)
 // reduced size instead of eating the last mb and forcing every texture
 // after them into the white dummy (hw: the career load lost 43 textures
 // and the heads + crowd with them). returns the skip level, 0 = store full.
-// tex_budget=0 turns it off
+// tex_half=1 (default): every mipped chain big enough to matter starts at
+// half resolution - stage, character, crowd textures - freeing the pool so
+// the crowd sections fit (owner: "compromise on all stage/character
+// textures"). ui art has no mips and stays full. tex_half=0 puts it back
 static unsigned budget_skip(unsigned w, unsigned h, const shape *full, uint32_t *kb_out)
 {
   static int on = -1;
@@ -791,10 +794,18 @@ static unsigned budget_skip(unsigned w, unsigned h, const shape *full, uint32_t 
   }
   if (!on) return 0;
   if (shape_bytes(full) < 128 * 1024) return 0;   // small ones aren't the problem
+  static int half = -1;
+  if (half < 0) {
+    extern int config_int(const char *key, int def);
+    half = config_int("tex_half", 1);
+  }
   extern uint32_t gxm_pool_free_kb(void);
   uint32_t kb = gxm_pool_free_kb();
   if (kb_out) *kb_out = kb;
-  unsigned sk = kb < 2 * 1024 ? 3 : kb < 4 * 1024 ? 2 : kb < 9 * 1024 ? 1 : 0;
+  unsigned sk = half ? 1 : 0;
+  if (kb < 2 * 1024) { if (sk < 3) sk = 3; }
+  else if (kb < 4 * 1024) { if (sk < 2) sk = 2; }
+  else if (kb < 9 * 1024) { if (sk < 1) sk = 1; }
   if (!sk) return 0;
   unsigned hw = w >> sk, hh = h >> sk;
   if (hw < 8 || hh < 8) return 0;
