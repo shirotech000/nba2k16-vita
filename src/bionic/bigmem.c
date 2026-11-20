@@ -29,13 +29,7 @@ typedef struct {
   SceUID uid;
   int cdram;
   void *borrow;   // set when it's gpu pool space, not a memblock of ours
-  int gpu_mapped; // mapped read-only for the gpu (zero-copy vbos)
 } blk;
-
-int sceGxmMapMemory(void *base, unsigned int size, int attr);
-int sceGxmUnmapMemory(void *base);
-static int g_gpu_map;      // gxm is up: map new blocks for gpu reads
-static int g_heap_mapped;  // newlib's heap memblock is gpu-readable
 
 void *gxm_borrow(uint32_t size, void **handle);  // gles/gxm.c
 void gxm_unborrow(void *handle);
@@ -132,7 +126,7 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
           gxm_unborrow(h);
           return NULL;
         }
-        blocks[n_blocks++] = (blk){ bp, n, sz, -1, 1, h, 0 };
+        blocks[n_blocks++] = (blk){ bp, n, sz, -1, 1, h };
         cdram_live += sz;
         live += sz;
         if ((uintptr_t)bp < lo) lo = (uintptr_t)bp;
@@ -170,8 +164,7 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
     L_ONCE("bigmem: out of block slots");
     return NULL;
   }
-  int gm = g_gpu_map && sceGxmMapMemory(base, sz, 1 /* READ */) >= 0;
-  blocks[n_blocks++] = (blk){ base, n, sz, uid, in_cdram, NULL, gm };
+  blocks[n_blocks++] = (blk){ base, n, sz, uid, in_cdram, NULL };
   if (in_cdram) cdram_live += sz; else main_live += sz;
   if ((uintptr_t)base < lo) lo = (uintptr_t)base;
   if ((uintptr_t)base + sz > hi) hi = (uintptr_t)base + sz;
@@ -187,39 +180,6 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
 }
 
 void *bigmem_alloc(size_t n) { return bigmem_alloc_ex(n, 0); }
-
-// called once gxm is initialized. maps newlib's heap and every block we hold
-// read-only for the gpu, and every block made after this. lets vbos point
-// straight at the game's own vertex data (zero-copy) instead of copying it
-void bigmem_enable_gpu_map(void) {
-  if (g_gpu_map) return;
-  if (heap_hi > heap_lo) {
-    int r = sceGxmMapMemory((void *)heap_lo, (unsigned)(heap_hi - heap_lo), 1);
-    g_heap_mapped = r >= 0;
-    L("bigmem: newlib heap (%uK) gpu-mapped: %s (0x%08X)", (unsigned)((heap_hi - heap_lo) / 1024),
-      g_heap_mapped ? "yes" : "no", r);
-  }
-  sceKernelLockLwMutex(&lock, 1, NULL);
-  for (int i = 0; i < n_blocks; i++)
-    if (!blocks[i].borrow && !blocks[i].gpu_mapped)
-      blocks[i].gpu_mapped = sceGxmMapMemory(blocks[i].base, blocks[i].size, 1) >= 0;
-  g_gpu_map = 1;
-  sceKernelUnlockLwMutex(&lock, 1);
-}
-
-// can the gpu read [p, p+n)? (heap, a mapped block, or borrowed pool space)
-int bigmem_gpu_readable(const void *p, size_t n) {
-  uintptr_t a = (uintptr_t)p, e = a + n;
-  if (g_heap_mapped && a >= heap_lo && e <= heap_hi) return 1;
-  int r = 0;
-  sceKernelLockLwMutex(&lock, 1, NULL);
-  for (int i = 0; i < n_blocks && !r; i++) {
-    uintptr_t b = (uintptr_t)blocks[i].base;
-    if (a >= b && e <= b + blocks[i].size) r = blocks[i].gpu_mapped || blocks[i].borrow;
-  }
-  sceKernelUnlockLwMutex(&lock, 1);
-  return r;
-}
 
 int bigmem_is_borrowed(const void *p) {
   sceKernelLockLwMutex(&lock, 1, NULL);
@@ -255,16 +215,12 @@ void bigmem_free(void *p) {
   }
   SceUID uid = blocks[i].uid;
   void *borrow = blocks[i].borrow;
-  int gm = blocks[i].gpu_mapped;
   live -= blocks[i].size;
   if (blocks[i].cdram) cdram_live -= blocks[i].size; else main_live -= blocks[i].size;
   blocks[i] = blocks[--n_blocks];
   sceKernelUnlockLwMutex(&lock, 1);
   if (borrow) gxm_unborrow(borrow);
-  else {
-    if (gm) sceGxmUnmapMemory(p);
-    sceKernelFreeMemBlock(uid);
-  }
+  else sceKernelFreeMemBlock(uid);
 }
 
 void bigmem_report(void) {
