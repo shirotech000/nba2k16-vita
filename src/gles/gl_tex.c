@@ -801,7 +801,9 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
         // becomes ours, a quarter of the memory and a bit softer, instead of
         // the white dummy (hw: hair, crowd, hoops)
         // half, then quarter, then eighth: blurry beats white
-        for (unsigned sk = 1; sk <= 3 && pow2 && (w >> sk) >= 8 && (h >> sk) >= 8 && is_mip_filter(t->min_filter); sk++) {
+        // no is_mip_filter gate: the game sets the filter after uploading (tex 227,
+        // the hoop, never fell back). no mips coming = same white dummy as before
+        for (unsigned sk = 1; sk <= 3 && pow2 && (w >> sk) >= 8 && (h >> sk) >= 8; sk++) {
           unsigned hw = w >> sk, hh = h >> sk;
           shape hs = make_shape(hw, hh, fi->bpp, 0, chain_len(hw, hh), fi->bc != 0);
           if (tex_realloc(t, &hs, fi, 0, 0, 0) == 0) {

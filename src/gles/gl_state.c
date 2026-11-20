@@ -119,17 +119,19 @@ GLboolean glIsEnabled(GLenum cap)
 
 // ============================================================ blend / masks / depth / stencil
 
-void glBlendEquation(GLenum m) { G.beq_rgb = G.beq_a = m; }
-void glBlendEquationSeparate(GLenum rgb, GLenum a) { G.beq_rgb = rgb; G.beq_a = a; }
-void glBlendFunc(GLenum s, GLenum d) { G.bsrc_rgb = G.bsrc_a = s; G.bdst_rgb = G.bdst_a = d; }
+void glBlendEquation(GLenum m) { G.beq_rgb = G.beq_a = m; G.dirty = 1; }
+void glBlendEquationSeparate(GLenum rgb, GLenum a) { G.beq_rgb = rgb; G.beq_a = a; G.dirty = 1; }
+void glBlendFunc(GLenum s, GLenum d) { G.bsrc_rgb = G.bsrc_a = s; G.bdst_rgb = G.bdst_a = d; G.dirty = 1; }
 void glBlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da)
 {
   G.bsrc_rgb = sr; G.bdst_rgb = dr; G.bsrc_a = sa; G.bdst_a = da;
+  G.dirty = 1;
 }
 
 void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a)
 {
   G.cmask[0] = r; G.cmask[1] = g; G.cmask[2] = b; G.cmask[3] = a;
+  G.dirty = 1;
 }
 
 void glDepthFunc(GLenum f) { G.depth_func = f; G.dirty = 1; }
