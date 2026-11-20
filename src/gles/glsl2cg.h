@@ -41,12 +41,14 @@ typedef enum {
 
 typedef struct {
   char name[GLSL2CG_NAME_LEN];
+  char cg_name[GLSL2CG_NAME_LEN]; // name in the gxp, differs if the GLSL one clashes with Cg
   g2c_type type;
   int location;        // layout(location=N) if given, else -1
 } g2c_attrib;
 
 typedef struct {
   char name[GLSL2CG_NAME_LEN];
+  char cg_name[GLSL2CG_NAME_LEN]; // look the gxp param up by THIS one (e.g. "Texture" -> "g2cu_Texture")
   g2c_type type;
   int array_size;      // 1 if not an array
   int vec4_slots;      // 1 = native layout, >1 = float4 slot array (matrices / arrays)

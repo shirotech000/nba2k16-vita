@@ -26,6 +26,10 @@ if (-not $pref) { $pref = Join-Path $appDir '' }
 $dataDir = Join-Path $pref 'ux0\data\nba2k16'
 New-Item -ItemType Directory -Force -Path $dataDir, (Join-Path $dataDir 'obb'), (Join-Path $pref 'ur0\data') | Out-Null
 
+if (-not $GameFiles -and (Test-Path (Join-Path $repo 'gamefiles\libnba2k16_clean_opt.so'))) {
+    $GameFiles = Join-Path $repo 'gamefiles'
+}
+if (-not $Obb -and (Test-Path (Join-Path $repo 'gamefiles\obb'))) { $Obb = Join-Path $repo 'gamefiles\obb' }
 if ($GameFiles) {
     foreach ($so in 'libnba2k16_clean_opt.so', 'libgnustl_shared.so') {
         Copy-Item (Join-Path $GameFiles $so) $dataDir -Force

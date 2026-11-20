@@ -865,6 +865,11 @@ static const char *const cg_words[] = {
   "vertexshader", "virtual", "volatile", "point", "line", "triangle", "lineadj", "triangleadj",
   "snorm", "unorm", "packoffset", "cbuffer", "tbuffer", "nointerpolation", "precise", "main",
   "uint", "switch", "in", "out", "inout", "uniform", "varying", "attribute", "const", "struct",
+  // hlsl-ish object types sony's cg knows about (a game shader names a sampler "Texture")
+  "Texture", "Texture1D", "Texture2D", "Texture3D", "TextureCube", "Texture1DArray",
+  "Texture2DArray", "TextureCubeArray", "Texture2DMS", "Texture2DMSArray", "Buffer",
+  "Sampler", "SamplerState", "SamplerComparisonState", "PixelShader", "VertexShader",
+  "BlendState", "DepthStencilState", "RasterizerState", "String", "Vector",
   // stdlib
   "abs", "acos", "all", "any", "asin", "atan", "atan2", "ceil", "clamp", "clip", "cos", "cosh",
   "cross", "ddx", "ddy", "debug", "degrees", "determinant", "distance", "dot", "exp", "exp2",
@@ -936,9 +941,11 @@ static const char *local_cg(ctx *c, const char *name) {
   return cg;
 }
 
-static void check_api_name(ctx *c, const char *name, const char *what) {
-  if (strlen(name) >= GLSL2CG_NAME_LEN) fail(c, "%s name '%s' is too long", what, name);
-  if (is_cg_reserved(name)) fail(c, "%s name '%s' is reserved in Cg", what, name);
+// api-visible names (uniforms/attribs) keep their GLSL name unless Cg
+// reserves it, then they get a prefix and the GL side looks up cg_name
+static const char *api_cg_name(ctx *c, const char *name, const char *what) {
+  if (strlen(name) + 5 >= GLSL2CG_NAME_LEN) fail(c, "%s name '%s' is too long", what, name);
+  return is_cg_reserved(name) ? PS("g2cu_%s", name) : name;
 }
 
 // ---- symbols ----
@@ -2015,7 +2022,7 @@ static void parse_quals(ctx *c, quals *q) {
   }
 }
 
-static void add_uniform(ctx *c, const char *name, gty t, int slots) {
+static void add_uniform(ctx *c, const char *name, const char *cgn, gty t, int slots) {
   g2c_result *r = c->res;
   g2c_type gt = gtype_enum(t);
   int asz = t.arr ? t.arr : 1;
@@ -2032,6 +2039,7 @@ static void add_uniform(ctx *c, const char *name, gty t, int slots) {
   g2c_uniform *u = &r->uniforms[r->n_uniforms++];
   memset(u, 0, sizeof *u);
   strcpy(u->name, name);
+  strcpy(u->cg_name, cgn);
   u->type = gt;
   u->array_size = asz;
   u->vec4_slots = slots;
@@ -2043,39 +2051,39 @@ static void declare_uniform(ctx *c, const char *name, gty t) {
   if (t.b == B_STRUCT) fail(c, "uniform '%s': struct uniforms are not supported", name);
   if (t.arr < 0) fail(c, "uniform '%s': unsized array", name);
   if ((t.b == B_S2D || t.b == B_SCUBE) && t.arr) fail(c, "uniform '%s': sampler arrays are not supported", name);
-  check_api_name(c, name, "uniform");
-  sym *s = add_sym(c, name, name, t, K_UNIFORM);
+  const char *cgn = api_cg_name(c, name, "uniform");
+  sym *s = add_sym(c, name, cgn, t, K_UNIFORM);
   int n = t.arr ? t.arr : 1, slots = 1;
   if (t.c > 1) {
     // matrices: one float4 per column, rebuilt in the shader
     slots = n * t.c;
     s->store = t.arr ? ST_MATARR : ST_MAT;
-    OUT("uniform float4 %s[%d];\n", name, slots);
+    OUT("uniform float4 %s[%d];\n", cgn, slots);
     if (t.arr) {
       const char *sw = t.r == 4 ? "" : t.r == 3 ? ".xyz" : ".xy";
       const char *l = "";
-      for (int j = 0; j < t.c; j++) l = TS("%s%s%s[i * %d + %d]%s", l, j ? ", " : "", name, t.c, j, sw);
+      for (int j = 0; j < t.c; j++) l = TS("%s%s%s[i * %d + %d]%s", l, j ? ", " : "", cgn, t.c, j, sw);
       OUT("float%dx%d _g2c_mu_%s(int i) { return float%dx%d(%s); }\n", t.c, t.r, name, t.c, t.r, l);
     }
   } else if (t.arr) {
     slots = n;
     s->store = (t.b == B_FLOAT && t.r == 4) ? ST_NATIVE : ST_SLOT;
-    OUT("uniform float4 %s[%d];\n", name, n);
+    OUT("uniform float4 %s[%d];\n", cgn, n);
   } else {
-    OUT("uniform %s %s;\n", cgty(c, t), name);
+    OUT("uniform %s %s;\n", cgty(c, t), cgn);
   }
-  add_uniform(c, name, t, slots);
+  add_uniform(c, name, cgn, t, slots);
 }
 
 static void declare_attrib(ctx *c, const char *name, gty t, int loc) {
   stage *st = c->S;
   if (t.arr || t.c > 1 || (t.b != B_FLOAT && t.b != B_INT))
     fail(c, "attribute '%s': unsupported type %s", name, tname(c, t));
-  check_api_name(c, name, "attribute");
+  const char *cgn = api_cg_name(c, name, "attribute");
   if (st->nin >= MAX_IO || c->res->n_attribs >= GLSL2CG_MAX_ATTRIBS) fail(c, "too many attributes");
   sym *s = add_sym(c, name, PS("_g2c_in_%s", name), t, K_IN);
   iovar *v = &st->in[st->nin++];
-  v->name = name;
+  v->name = cgn;  // for attribs this is only the entry param name
   v->cg = s->cg;
   v->t = t;
   v->loc = loc;
@@ -2083,6 +2091,7 @@ static void declare_attrib(ctx *c, const char *name, gty t, int loc) {
   g2c_attrib *a = &c->res->attribs[c->res->n_attribs++];
   memset(a, 0, sizeof *a);
   strcpy(a->name, name);
+  strcpy(a->cg_name, cgn);
   a->type = gtype_enum(t);
   a->location = loc;
   OUT("static %s %s;\n", cgty(c, t), s->cg);

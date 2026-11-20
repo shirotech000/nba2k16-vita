@@ -169,6 +169,15 @@ typedef struct {
   int (*check)(const g2c_result *r, char *why);  // why has room for 600 chars
 } selftest;
 
+static const g2c_uniform *find_uniform(const g2c_result *r, const char *n);
+
+static int check_reserved_renamed(const g2c_result *r, char *why) {
+  const g2c_uniform *m = find_uniform(r, "matrix"), *t = find_uniform(r, "Texture");
+  if (!m || strcmp(m->cg_name, "g2cu_matrix")) { strcpy(why, "matrix cg_name wrong"); return 0; }
+  if (!t || strcmp(t->cg_name, "g2cu_Texture")) { strcpy(why, "Texture cg_name wrong"); return 0; }
+  return 1;
+}
+
 static const g2c_uniform *find_uniform(const g2c_result *r, const char *n) {
   for (int i = 0; i < r->n_uniforms; i++)
     if (!strcmp(r->uniforms[i].name, n)) return &r->uniforms[i];
@@ -527,10 +536,13 @@ static const selftest tests[] = {
     "void main() { switch (u_m) { case 0: o = vec4(0.0); break; default: o = vec4(1.0); } }\n",
     "switch", { NULL }, { NULL }, NULL },
 
+  // reserved api names get renamed, cg_name tells the GL side what to look up
   { "reserved_uniform",
     NULL,
-    "#version 300 es\nprecision mediump float;\nuniform vec4 matrix;\nout vec4 o;\nvoid main() { o = matrix; }\n",
-    "reserved", { NULL }, { NULL }, NULL },
+    "#version 300 es\nprecision mediump float;\nuniform vec4 matrix;\nuniform sampler2D Texture;\n"
+    "in vec2 uv;\nout vec4 o;\nvoid main() { o = matrix * texture(Texture, uv); }\n",
+    NULL, { NULL }, { "uniform float4 g2cu_matrix;", "uniform sampler2D g2cu_Texture;", NULL },
+    check_reserved_renamed },
 
   { "unknown_function",
     NULL,
