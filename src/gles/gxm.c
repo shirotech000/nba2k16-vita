@@ -148,11 +148,70 @@ typedef struct {
   fl_node *free;
 } range_heap;
 
+// pool lock. the gl thread owns the pool, but bigmem borrows free space out
+// of it from whatever thread malloc fails on. owner + depth instead of a
+// recursive mutex: gpu_alloc -> calloc -> bigmem -> borrow can nest
+static SceKernelLwMutexWork g_pool_lock;
+static volatile SceUID g_pool_owner;
+static int g_pool_depth, g_pool_lock_ok;
+
+static void pool_lock(void)
+{
+  if (!g_pool_lock_ok) return;
+  SceUID me = sceKernelGetThreadId();
+  if (g_pool_owner == me) { g_pool_depth++; return; }
+  sceKernelLockLwMutex(&g_pool_lock, 1, NULL);
+  g_pool_owner = me;
+  g_pool_depth = 1;
+}
+
+static void pool_unlock(void)
+{
+  if (!g_pool_lock_ok) return;
+  if (--g_pool_depth == 0) {
+    g_pool_owner = 0;
+    sceKernelUnlockLwMutex(&g_pool_lock, 1);
+  }
+}
+
+// free-list nodes from a static pool, never malloc: the pool gets used right
+// when malloc already failed (gpu frees under oom, bigmem borrowing), and
+// the old unchecked malloc here would just crash then
+#define FL_NODES 8192
+static fl_node g_fl_nodes[FL_NODES];
+static fl_node *g_fl_free;
+static int g_fl_init;
+
+static fl_node *fl_get(void)
+{
+  pool_lock();
+  if (!g_fl_init) {
+    for (int i = 0; i < FL_NODES - 1; i++) g_fl_nodes[i].next = &g_fl_nodes[i + 1];
+    g_fl_nodes[FL_NODES - 1].next = NULL;
+    g_fl_free = g_fl_nodes;
+    g_fl_init = 1;
+  }
+  fl_node *n = g_fl_free;
+  if (n) g_fl_free = n->next;
+  pool_unlock();
+  if (!n) L_ONCE("gxm: out of free-list nodes (FL_NODES)");
+  return n;
+}
+
+static void fl_put(fl_node *n)
+{
+  pool_lock();
+  n->next = g_fl_free;
+  g_fl_free = n;
+  pool_unlock();
+}
+
 static void rh_init(range_heap *h, uint32_t size)
 {
   h->size = size;
   h->used = 0;
-  h->free = malloc(sizeof(fl_node));
+  h->free = fl_get();
+  if (!h->free) { h->used = size; return; }  // nothing allocatable, but valid
   h->free->off = 0;
   h->free->size = size;
   h->free->next = NULL;
@@ -160,7 +219,7 @@ static void rh_init(range_heap *h, uint32_t size)
 
 static void rh_destroy(range_heap *h)
 {
-  while (h->free) { fl_node *n = h->free->next; free(h->free); h->free = n; }
+  while (h->free) { fl_node *n = h->free->next; fl_put(h->free); h->free = n; }
 }
 
 // returns 0 + *out on success
@@ -174,7 +233,8 @@ static int rh_alloc(range_heap *h, uint32_t size, uint32_t align, uint32_t *out)
     uint32_t tail = n->size - pad - size;
     if (pad && tail) {
       // split in two, keep the front pad as this node
-      fl_node *t = malloc(sizeof(fl_node));
+      fl_node *t = fl_get();
+      if (!t) return -1;
       t->off = start + size;
       t->size = tail;
       t->next = n->next;
@@ -187,7 +247,7 @@ static int rh_alloc(range_heap *h, uint32_t size, uint32_t align, uint32_t *out)
       n->size = tail;
     } else {
       *pp = n->next;
-      free(n);
+      fl_put(n);
     }
     h->used += size;
     *out = start;
@@ -207,7 +267,7 @@ static void rh_free(range_heap *h, uint32_t off, uint32_t size)
     if (n && prev->off + prev->size == n->off) {
       prev->size += n->size;
       prev->next = n->next;
-      free(n);
+      fl_put(n);
     }
     return;
   }
@@ -216,7 +276,8 @@ static void rh_free(range_heap *h, uint32_t off, uint32_t size)
     n->size += size;
     return;
   }
-  fl_node *x = malloc(sizeof(fl_node));
+  fl_node *x = fl_get();
+  if (!x) return;  // leaks the range, better than a crash
   x->off = off;
   x->size = size;
   x->next = n;
@@ -312,6 +373,8 @@ gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref)
   if (align < 16) align = 16;
   size = ALIGN_UP(size, 16);
   gpu_block *b = calloc(1, sizeof(*b));
+  if (!b) return NULL;
+  pool_lock();
   int ok = -1;
   if (pref == GPU_PREF_CDRAM) {
     ok = pool_try(b, size, align, 1);
@@ -325,6 +388,7 @@ gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref)
   if (ok < 0) {
     L("gxm: OUT OF GPU MEMORY, %u bytes", size);
     gpu_mem_log("oom");
+    pool_unlock();
     free(b);
     return NULL;
   }
@@ -338,16 +402,13 @@ gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref)
       L("gxm: new %s peak %u KiB", ti ? "lpddr" : "cdram", (unsigned)(st.used[ti] >> 10));
     st.used_peak[ti] = st.used[ti];
   }
+  pool_unlock();
   return b;
 }
 
-void gpu_free(gpu_block *b)
+// caller holds the pool lock
+static void chunk_maybe_release(gpu_chunk *c, int ti)
 {
-  if (!b) return;
-  gpu_chunk *c = b->chunk;
-  int ti = c->mb.cdram ? 0 : 1;
-  st.used[ti] -= b->size;
-  rh_free(&c->heap, b->off, b->size);
   int release = c->dedicated;
   if (!release && c->heap.used == 0) {
     // empty shared chunk: give it back unless it's the only spare left.
@@ -361,7 +422,76 @@ void gpu_free(gpu_block *b)
     blk_free(&c->mb);
     free(c);
   }
+}
+
+void gpu_free(gpu_block *b)
+{
+  if (!b) return;
+  pool_lock();
+  gpu_chunk *c = b->chunk;
+  int ti = c->mb.cdram ? 0 : 1;
+  st.used[ti] -= b->size;
+  rh_free(&c->heap, b->off, b->size);
+  chunk_maybe_release(c, ti);
+  pool_unlock();
   free(b);
+}
+
+// ---- lending pool space to the cpu ----
+// bigmem's very last resort before the game gets a NULL: free space inside
+// chunks the pool already has (the match load had ~12MB idle in there). it
+// never makes new chunks, and no malloc in here, we're called because malloc
+// already failed. cpu reads from cdram are slow, still beats a crash.
+#define BORROW_MAX 256
+static gpu_block g_borrow[BORROW_MAX];
+static uint8_t g_borrow_used[BORROW_MAX];
+static uint32_t g_borrowed;
+
+void *gxm_borrow(uint32_t size, void **handle)
+{
+  if (!g_ready || !g_pool_lock_ok || g_pool_owner == sceKernelGetThreadId()) return NULL;
+  size = ALIGN_UP(size, 16);
+  void *ptr = NULL;
+  pool_lock();
+  int slot = -1;
+  for (int i = 0; i < BORROW_MAX; i++) if (!g_borrow_used[i]) { slot = i; break; }
+  for (int ti = 1; slot >= 0 && ti >= 0 && !ptr; ti--) {   // lpddr first, then cdram
+    for (gpu_chunk *c = g_chunks[ti]; c && !ptr; c = c->next) {
+      uint32_t off;
+      if (c->dedicated || c->heap.size - c->heap.used < size) continue;
+      if (rh_alloc(&c->heap, size, 64, &off) != 0) continue;
+      gpu_block *b = &g_borrow[slot];
+      b->chunk = c;
+      b->off = off;
+      b->size = size;
+      b->ptr = c->mb.base + off;
+      g_borrow_used[slot] = 1;
+      st.used[ti] += size;
+      g_borrowed += size;
+      ptr = b->ptr;
+      *handle = b;
+    }
+  }
+  uint32_t total = g_borrowed;
+  pool_unlock();
+  static int logged;
+  if (ptr && logged++ < 16) L("gxm: lent %u KiB of pool space to the cpu side (%u KiB out now)", size >> 10, total >> 10);
+  return ptr;
+}
+
+void gxm_unborrow(void *handle)
+{
+  gpu_block *b = handle;
+  if (!b) return;
+  pool_lock();
+  gpu_chunk *c = b->chunk;
+  int ti = c->mb.cdram ? 0 : 1;
+  st.used[ti] -= b->size;
+  g_borrowed -= b->size;
+  rh_free(&c->heap, b->off, b->size);
+  chunk_maybe_release(c, ti);
+  g_borrow_used[b - g_borrow] = 0;
+  pool_unlock();
 }
 
 static void gpu_free_cb(void *p) { gpu_free(p); }
@@ -1043,6 +1173,10 @@ static memblk g_vdm_mb, g_vtx_mb, g_frag_mb, g_fusse_mb;
 
 int gxm_init(void)
 {
+  if (!g_pool_lock_ok) {
+    sceKernelCreateLwMutex(&g_pool_lock, "gpu_pool", 0, 0, NULL);
+    g_pool_lock_ok = 1;
+  }
   if (g_ready) return 0;
   int r;
   gpu_mem_log("before gxm init");

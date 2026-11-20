@@ -28,7 +28,11 @@ typedef struct {
   size_t req, size;
   SceUID uid;
   int cdram;
+  void *borrow;   // set when it's gpu pool space, not a memblock of ours
 } blk;
+
+void *gxm_borrow(uint32_t size, void **handle);  // gles/gxm.c
+void gxm_unborrow(void *handle);
 
 static blk blocks[MAX_BLOCKS];
 static int n_blocks;
@@ -74,8 +78,8 @@ static size_t main_live, cdram_live;
 // on). then the reserves shrink to small floors: a texture or thread
 // failing later beats a crash right now
 #define MAIN_FLOOR  (2 * 1024 * 1024)
-#define PC_FLOOR    (1 * 1024 * 1024)
-#define CDRAM_FLOOR (1 * 1024 * 1024)
+#define PC_FLOOR    0                    // gxm's own chunks are 2MB, a 1MB floor saved nothing
+#define CDRAM_FLOOR (256 * 1024)
 
 void *bigmem_alloc_ex(size_t n, int urgent) {
   if (!ready) return NULL;
@@ -111,6 +115,25 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
   if (uid < 0) {
     sz = ALIGN_UP(n, CDRAM_GRAN);
     if ((size_t)fi.size_cdram < sz + gl_res) {
+      // last stop: idle space inside the gpu pool's chunks
+      void *h = NULL;
+      void *bp = urgent && n <= 2 * 1024 * 1024 ? gxm_borrow((uint32_t)n, &h) : NULL;
+      if (bp) {
+        sz = ALIGN_UP(n, 16);
+        sceKernelLockLwMutex(&lock, 1, NULL);
+        if (n_blocks >= MAX_BLOCKS) {
+          sceKernelUnlockLwMutex(&lock, 1);
+          gxm_unborrow(h);
+          return NULL;
+        }
+        blocks[n_blocks++] = (blk){ bp, n, sz, -1, 1, h };
+        cdram_live += sz;
+        live += sz;
+        if ((uintptr_t)bp < lo) lo = (uintptr_t)bp;
+        if ((uintptr_t)bp + sz > hi) hi = (uintptr_t)bp + sz;
+        sceKernelUnlockLwMutex(&lock, 1);
+        return bp;
+      }
       if (urgent)
         L("bigmem: even the floors are hit (user %uK, cdram %uK, phycont %uK), %uK has nowhere to go",
           fi.size_user / 1024, fi.size_cdram / 1024, fi.size_phycont / 1024, (unsigned)(n / 1024));
@@ -141,7 +164,7 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
     L_ONCE("bigmem: out of block slots");
     return NULL;
   }
-  blocks[n_blocks++] = (blk){ base, n, sz, uid, in_cdram };
+  blocks[n_blocks++] = (blk){ base, n, sz, uid, in_cdram, NULL };
   if (in_cdram) cdram_live += sz; else main_live += sz;
   if ((uintptr_t)base < lo) lo = (uintptr_t)base;
   if ((uintptr_t)base + sz > hi) hi = (uintptr_t)base + sz;
@@ -183,11 +206,13 @@ void bigmem_free(void *p) {
     return;
   }
   SceUID uid = blocks[i].uid;
+  void *borrow = blocks[i].borrow;
   live -= blocks[i].size;
   if (blocks[i].cdram) cdram_live -= blocks[i].size; else main_live -= blocks[i].size;
   blocks[i] = blocks[--n_blocks];
   sceKernelUnlockLwMutex(&lock, 1);
-  sceKernelFreeMemBlock(uid);
+  if (borrow) gxm_unborrow(borrow);
+  else sceKernelFreeMemBlock(uid);
 }
 
 void bigmem_report(void) {

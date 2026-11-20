@@ -45,6 +45,9 @@ typedef struct gpu_block {
 
 gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref);
 void gpu_free(gpu_block *b);
+// bigmem's last resort: free space inside existing pool chunks, for the cpu
+void *gxm_borrow(uint32_t size, void **handle);
+void gxm_unborrow(void *handle);
 // free once every scene submitted so far is done on the gpu
 void gpu_free_deferred(gpu_block *b);
 int gpu_is_cdram(const gpu_block *b);
