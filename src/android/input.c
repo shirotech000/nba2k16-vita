@@ -197,7 +197,14 @@ void input_poll(void) {
   // the vita has no l2/r2: rear touch, left half = l2 (brake), right half =
   // r2 (gas). the game reads both trigger axes. also sent as key presses
   // (BUTTON_L2 104 / BUTTON_R2 105) in case a menu wants buttons
-  {
+  // opt-in: fingers resting on the back held l2/r2 down and the game stopped
+  // taking any other input (hw)
+  static int rear = -1;
+  if (rear < 0) {
+    extern int config_int(const char *key, int def);
+    rear = config_int("rear_triggers", 0) != 0;
+  }
+  if (rear) {
     SceTouchData bt;
     memset(&bt, 0, sizeof(bt));
     sceTouchPeek(SCE_TOUCH_PORT_BACK, &bt, 1);
