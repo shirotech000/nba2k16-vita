@@ -103,8 +103,8 @@ typedef struct {
 
 static int try_vp(gl_program *p, stream_t *st, int ns, int const_via_instance, SceGxmVertexProgram **out)
 {
-  SceGxmVertexAttribute attrs[MAX_ATTRIBS];
-  SceGxmVertexStream streams[MAX_ATTRIBS];
+  SceGxmVertexAttribute attrs[MAX_ATTRIBS + 1];
+  SceGxmVertexStream streams[MAX_ATTRIBS + 1];
   for (int i = 0; i < ns; i++) {
     attrs[i].streamIndex = i;
     attrs[i].offset = 0;
@@ -119,7 +119,23 @@ static int try_vp(gl_program *p, stream_t *st, int ns, int const_via_instance, S
       streams[i].indexSource = SCE_GXM_INDEX_SOURCE_INSTANCE_16BIT;
     }
   }
-  return sceGxmShaderPatcherCreateVertexProgram(gxm_patcher, p->vid, attrs, ns, streams, ns, out);
+  int extra = 0;
+  if (p->uses_iid && p->iid_reg >= 0 && ns < MAX_ATTRIBS) {
+    // gl_InstanceID: the hardware indexes this stream by the instance
+    // number, the ramp buffer it points at holds 0,1,2,3... so the shader
+    // reads the instance index itself. non-instanced draws read element 0
+    attrs[ns].streamIndex = ns;
+    attrs[ns].offset = 0;
+    attrs[ns].format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+    attrs[ns].componentCount = 1;
+    attrs[ns].regIndex = p->iid_reg;
+    streams[ns].stride = 4;
+    streams[ns].indexSource = SCE_GXM_INDEX_SOURCE_INSTANCE_16BIT;
+    extra = 1;
+  } else if (p->uses_iid && p->iid_reg >= 0) {
+    L_ONCE("gl: prog %u has %d attribs, no stream slot left for the instance id", p->name, ns);
+  }
+  return sceGxmShaderPatcherCreateVertexProgram(gxm_patcher, p->vid, attrs, ns + extra, streams, ns + extra, out);
 }
 
 static SceGxmVertexProgram *get_vp(gl_program *p, stream_t *st, int ns)
@@ -203,6 +219,25 @@ static SceGxmFragmentProgram *get_fp(gl_program *p)
 }
 
 // ============================================================ draw
+
+// gl_InstanceID's data source. the instance stream's indexSource is
+// INSTANCE_16BIT, so the hardware reads ramp[instance] - a ramp of
+// 0,1,2,3... hands the shader the instance index as a float
+static float *g_iid_ramp;
+#define IID_RAMP_N 64000
+
+static void iid_ramp_init(void)
+{
+  if (g_iid_ramp) return;
+  gpu_block *b = gpu_alloc(IID_RAMP_N * 4, 16, 0);
+  if (!b) {
+    L_ONCE("gl: no room for the instance ramp, instanced ids read as 0");
+    return;
+  }
+  float *f = (float *)b->ptr;
+  for (int i = 0; i < IID_RAMP_N; i++) f[i] = (float)i;
+  g_iid_ramp = f;
+}
 
 static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *indices, GLint first,
                           GLsizei inst, int arrays);
@@ -425,6 +460,10 @@ static void do_draw_inner(GLenum mode, GLsizei count, GLenum itype, const void *
   sceGxmSetFragmentProgram(gxm_ctx, fp);
   prog_bind_textures(p, sc);
   for (int i = 0; i < ns; i++) sceGxmSetVertexStream(gxm_ctx, i, st[i].ptr);
+  if (p->uses_iid && p->iid_reg >= 0 && ns < MAX_ATTRIBS) {
+    if (!g_iid_ramp) iid_ramp_init();
+    if (g_iid_ramp) sceGxmSetVertexStream(gxm_ctx, ns, g_iid_ramp);
+  }
 
   prog_upload_uniforms(p);
   int r;

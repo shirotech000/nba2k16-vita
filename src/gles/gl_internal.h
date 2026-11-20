@@ -216,7 +216,8 @@ typedef struct gl_program {
   prog_sampler samplers[32];
   int n_samplers;
 
-  int uses_iid;            // reads gl_InstanceID (hardware INSTANCE param)
+  int uses_iid;            // reads gl_InstanceID (fed by the instance ramp stream)
+  int iid_reg;             // gxp register of _g2c_iid, -1 = not resolvable
 
   vp_variant *vps;
   fp_variant *fps;

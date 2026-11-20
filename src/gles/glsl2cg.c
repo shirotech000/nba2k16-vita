@@ -2656,7 +2656,7 @@ static void emit_stage(ctx *c, stage *st, sb *o) {
   if (st->vs) {
     // attribs come in as float params named exactly like the GLSL ones
     for (int i = 0; i < st->nin; i++) add_param(c, ps, "%s %s", ftype(c, st->in[i].t), st->in[i].name);
-    if (u & U_IID) add_param(c, ps, "int _g2c_iid : INSTANCE");
+    if (u & U_IID) add_param(c, ps, "float _g2c_iid");   // fed by the port's instance ramp stream
     if (u & U_VID) add_param(c, ps, "int _g2c_vid : INDEX");
     add_param(c, ps, "out float4 _g2c_opos : POSITION");
     if (u & U_PSIZE) add_param(c, ps, "out float _g2c_opsize : PSIZE");
@@ -2669,7 +2669,7 @@ static void emit_stage(ctx *c, stage *st, sb *o) {
       if (v->t.b == B_FLOAT) sb_printf(c, o, "\t%s = %s;\n", v->cg, v->name);
       else sb_printf(c, o, "\t%s = (%s)(%s);\n", v->cg, cgty(c, v->t), v->name);
     }
-    if (u & U_IID) sb_puts(c, o, "\t_g2c_InstanceID = _g2c_iid;\n");
+    if (u & U_IID) sb_puts(c, o, "\t_g2c_InstanceID = (int)_g2c_iid;\n");
     if (u & U_VID) sb_puts(c, o, "\t_g2c_VertexID = _g2c_vid;\n");
     sb_puts(c, o, "\t_g2c_Position = (float4)0;\n");
     if (u & U_PSIZE) sb_puts(c, o, "\t_g2c_PointSize = 1.0;\n");

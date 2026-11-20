@@ -1053,6 +1053,13 @@ static int link_back(gl_program *p, char **log)
   p->vbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->vgxp);
   p->fbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->fgxp);
 
+  if (p->uses_iid) {
+    p->iid_reg = -1;
+    const SceGxmProgramParameter *prm = sceGxmProgramFindParameterByName(p->vgxp, "_g2c_iid");
+    if (prm && sceGxmProgramParameterGetCategory(prm) == SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE)
+      p->iid_reg = sceGxmProgramParameterGetResourceIndex(prm);
+  }
+
   for (int i = 0; i < p->n_attribs; i++) {
     prog_attrib *a = &p->attribs[i];
     const SceGxmProgramParameter *prm = sceGxmProgramFindParameterByName(p->vgxp, a->cg_name);
