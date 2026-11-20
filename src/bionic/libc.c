@@ -124,7 +124,7 @@ static void *alloc_any(size_t n) {
   // handing the game a NULL it'll probably crash on
   static volatile int waits;
   if (__sync_add_and_fetch(&waits, 1) <= 8) L("mem: %uK didn't fit anywhere, waiting for memory to free up", (unsigned)(n / 1024));
-  for (int i = 0; i < 25 && !p; i++) {
+  for (int i = 0; i < 10 && !p; i++) {
     sceKernelDelayThread(20 * 1000);
     p = alloc_once(n);
   }
@@ -188,6 +188,30 @@ void *__wrap_realloc(void *p, size_t n) { return b_realloc(p, n); }
 void __wrap_free(void *p) { if (p) b_free(p); }
 void *__wrap_memalign(size_t a, size_t n) { return b_memalign(a, n); }
 size_t port_usable_size(void *p) { return p ? usable(p) : 0; }
+// newlib's strdup allocates with _malloc_r, which --wrap=malloc never sees,
+// so a full heap handed our compile jobs NULL strings. ours go through b_malloc
+char *__wrap_strdup(const char *s) {
+  size_t n = strlen(s) + 1;
+  char *d = b_malloc(n);
+  if (d) memcpy(d, s, n);
+  return d;
+}
+char *__wrap_strndup(const char *s, size_t max) {
+  size_t n = strnlen(s, max);
+  char *d = b_malloc(n + 1);
+  if (d) { memcpy(d, s, n); d[n] = 0; }
+  return d;
+}
+
+// a little room kept inside newlib's heap for the stuff that allocates with
+// _malloc_r directly (FILE buffers, printf internals...): handed back the
+// first time the heap fills up and small allocs start spilling
+static void *rainy_day;
+void mem_rainy_day_init(void) { if (!rainy_day) rainy_day = __real_malloc(512 * 1024); }
+void mem_rainy_day_release(void) {
+  void *p = __sync_lock_test_and_set(&rainy_day, NULL);
+  if (p) { __real_free(p); L("mem: newlib heap full, released its 512K rainy-day block"); }
+}
 
 // --- ctype: bionic reads _ctype_ as a pointer to a 1+256 BSD style table ---
 static char ctype_table[257];
@@ -367,6 +391,8 @@ static uintptr_t b_gnu_unwind_find_exidx(uintptr_t pc, int *count) {
 
 void libc_init(void) {
   bigmem_init();
+  extern void mem_rainy_day_init(void);
+  mem_rainy_day_init();
   ctype_init();
 }
 

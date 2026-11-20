@@ -11,6 +11,8 @@
 #include "bionic/bigmem.h"
 #include "util/log.h"
 
+void mem_rainy_day_release(void);  // libc.c
+
 #define SP_CHUNK   (1024 * 1024)
 #define SP_CHUNKS  64
 #define SP_HDR     16
@@ -80,6 +82,7 @@ void *spill_alloc(size_t n) {
   void *p = NULL;
   for (int i = 0; i < n_chunks && !p; i++) p = fit(chunks[i], need, n);
   if (!p && n_chunks < SP_CHUNKS) {
+    if (!n_chunks) mem_rainy_day_release();
     uint8_t *c = bigmem_alloc_ex(SP_CHUNK, 1);
     if (c) {
       sp_hdr *h = (sp_hdr *)c;
@@ -121,13 +124,14 @@ void spill_free(void *p) {
   }
   h->tag = SP_FREE;
   live -= h->size;
-  // whole chunk empty again? hand it back, but keep the last one around
+  // whole chunk empty again? hand it back, but keep two around (the heap
+  // stays full once it's full, and a chunk per alloc/free pair is churn)
   uint8_t *c = chunks[i];
   sp_hdr *first = (sp_hdr *)c;
   for (uint8_t *nx = c + first->size; first->tag == SP_FREE && nx < c + SP_CHUNK && ((sp_hdr *)nx)->tag == SP_FREE;
        nx = c + first->size)
     first->size += ((sp_hdr *)nx)->size;
-  if (first->tag == SP_FREE && first->size == SP_CHUNK && n_chunks > 1) {
+  if (first->tag == SP_FREE && first->size == SP_CHUNK && n_chunks > 2) {
     chunks[i] = chunks[--n_chunks];
     sceKernelUnlockLwMutex(&lock, 1);
     bigmem_free(c);

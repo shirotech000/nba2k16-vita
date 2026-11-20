@@ -15,9 +15,11 @@
 // out of cdram on hw and a full match load needs every MB; if it ever fills
 // the gpu just does a partial render, nothing breaks
 #define GXM_PARAM_BUF_MB_DEFAULT 4
-#define GXM_VDM_RING_SIZE      (256 * 1024)
-#define GXM_VERTEX_RING_SIZE   (4 * 1024 * 1024)
-#define GXM_FRAGMENT_RING_SIZE (1 * 1024 * 1024)  // fragment uniforms are small
+// sdk default ring sizes. we had 2x and more, which is 2.6MB of phycont the
+// match load ran short of
+#define GXM_VDM_RING_SIZE      (128 * 1024)
+#define GXM_VERTEX_RING_SIZE   (2 * 1024 * 1024)
+#define GXM_FRAGMENT_RING_SIZE (512 * 1024)
 #define GXM_FRAG_USSE_RING_SIZE (16 * 1024)
 // transient ring for client arrays etc, 1MB (ring_mb= in config.txt). the
 // game only draws from vbos (peak 0 on hw); the monitor prints the peak

@@ -239,7 +239,9 @@ static void cache_path(char *out, int n, uint64_t h, int frag)
   snprintf(out, n, "%s/%c%016llx.gxp", SHADER_CACHE, frag ? 'f' : 'v', (unsigned long long)h);
 }
 
-static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2)
+// *oom gets set when the file was there but we had no memory to read it:
+// that's "try again later", not "compile it" (loading the compiler then is worse)
+static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2, int *oom)
 {
   SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
   if (fd < 0) return NULL;
@@ -249,6 +251,11 @@ static SceGxmProgram *cache_load(const char *path, uint32_t cg_len, uint32_t h2)
       hd.version == CACHE_VER && hd.cg_len == cg_len && hd.cg_hash2 == h2 &&
       hd.gxp_size > 0 && hd.gxp_size < 4 * 1024 * 1024) {
     p = malloc(hd.gxp_size);
+    if (!p) {
+      if (oom) *oom = 1;
+      sceIoClose(fd);
+      return NULL;
+    }
     if (sceIoRead(fd, p, hd.gxp_size) != (SceSSize)hd.gxp_size || sceGxmProgramCheck(p) < 0) {
       L("shader: bad cache file %s, ignoring", path);
       free(p);
@@ -292,19 +299,29 @@ static SceGxmProgram *shacc_lookup(const char *cg, int frag)
   uint32_t h2 = fnv1a(cg, len, 2166136261u);
   char path[128];
   cache_path(path, sizeof(path), h, frag);
-  return cache_load(path, (uint32_t)len, h2);
+  return cache_load(path, (uint32_t)len, h2, NULL);
 }
 
 SceGxmProgram *shacc_compile(const char *cg, int frag, char **log)
 {
+  if (!cg) {
+    log_append(log, "out of memory (no cg source)");
+    return NULL;
+  }
   size_t len = strlen(cg);
   uint64_t h = hash64(cg, len) ^ (frag ? 0x9E3779B97F4A7C15ull : 0);
   uint32_t h2 = fnv1a(cg, len, 2166136261u);
   char path[128];
   cache_path(path, sizeof(path), h, frag);
 
-  SceGxmProgram *p = cache_load(path, (uint32_t)len, h2);
+  int oom = 0;
+  SceGxmProgram *p = cache_load(path, (uint32_t)len, h2, &oom);
   if (p) return p;
+  if (oom) {
+    // the "out of memory" text is what the retry logic looks for
+    log_append(log, "out of memory reading the cached gxp");
+    return NULL;
+  }
 
   if (!shacc_ready()) {
     log_append(log, "libshacccg not available");
@@ -1243,9 +1260,19 @@ static void link_with(link_job *lj, gl_program *p, gl_shader *vs, gl_shader *fs,
     lj->ok = link_back(p, log);
   } else if (async_ready()) {
     compile_job *j = calloc(1, sizeof(*j));
+    if (j) {
+      j->vcg = strdup(r->vs_cg); j->fcg = strdup(r->fs_cg);
+      j->vsrc = strdup(vs->src); j->fsrc = strdup(fs->src);
+    }
+    if (!j || !j->vcg || !j->fcg || !j->vsrc || !j->fsrc) {
+      // heap's full. fail this link, the game relinks or skips those draws
+      if (j) { free(j->vcg); free(j->fcg); free(j->vsrc); free(j->fsrc); free(j); }
+      free(vg); free(fg);
+      log_append(log, "out of memory queueing the compile");
+      lj->ok = 0;
+      return;
+    }
     j->prog = p->name;
-    j->vcg = strdup(r->vs_cg); j->fcg = strdup(r->fs_cg);
-    j->vsrc = strdup(vs->src); j->fsrc = strdup(fs->src);
     j->vgxp = vg; j->fgxp = fg;
     p->job = j;
     p->pending = 1;

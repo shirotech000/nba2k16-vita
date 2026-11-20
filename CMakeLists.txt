@@ -45,7 +45,7 @@ add_executable(nba2k16 ${PORT_SOURCES})
 target_link_options(nba2k16 PRIVATE -Wl,--pic-veneer)
 # every malloc in the eboot goes through bionic/libc.c's fallbacks
 target_link_options(nba2k16 PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
-                    -Wl,--wrap=free -Wl,--wrap=memalign)
+                    -Wl,--wrap=free -Wl,--wrap=memalign -Wl,--wrap=strdup -Wl,--wrap=strndup)
 
 target_link_libraries(nba2k16
   kubridge_stub
