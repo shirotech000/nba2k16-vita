@@ -90,6 +90,8 @@ Every patch checks the original bytes first.
 - `no_audio=1`: never open an audio port. The OpenSL mixer runs on a silent clock.
 - `frame_log=1`: log draw/clear counts for every frame
 - `game_heap_mb=N`, `version_code=N`
+- `msaa=0/2/4` (default 4, main 3D target), `msaa_display=1`, `cube_dummy=1`, `async_shaders=0`
+- `fbo_cull_flip=0`, `stencil_swap=1`: winding/stencil checks
 - `capunlocker=0`: don't use core 3 even if CapUnlocker is loaded
 
 ## CPU cores
@@ -134,4 +136,21 @@ The game wipes files in what it thinks are android's data dirs on boot. The firs
   - `vita3k.flag` plumbing (run.ps1 + `emu_is_vita3k()`)
   - JNI `Settings.Secure.getString` (android_id) now returns a fixed fake id instead of NULL. With NULL, Vita3K logged 6 guest null reads (host `0x400000000`) at ~30 s. Those are gone now. Real hardware would have taken a data abort there.
   - With a 316 MB heap test build, the game runs 120 s+ in Vita3K, rendering menus (up to ~117 draws/frame). **Next blocker: memory** (see Memory), and the AAC decoder player.
+- **2026-11-20, gameplay reached:**
+  - **Memory:**
+    - The overflow allocator (`src/bionic/bigmem.c`) puts the game's big blocks in free main memory first, then cached CDRAM.
+    - Its reserves are 4 MB main / 6 MB CDRAM.
+    - A big allocation that fits nowhere waits up to 2 s before failing.
+    - The GL pool uses 2 MB chunks and hands empty ones back.
+    - Result: quick match loads and plays, ~30-48 fps in Vita3K. Live memory sits flat at ~329 MB in a match (no leak). One run still died after ~8 min on a sudden 4 MB request. **Next memory lever: ETC2 -> BC1/BC3 transcoding** (we expand ETC to RGBA8 today, 4-8x the size). That's in progress.
+  - **Shaders:**
+    - compile on a background worker (draws with a still-compiling program get skipped);
+    - the Cg compiler gets an 8 MB fallback arena when malloc fails;
+    - "out of memory" / "fatal internal error" compiles retry;
+    - glsl2cg output is cached (`shadercache/t*.g2c`, keyed by the GLSL pair + the translator build stamp), so cached links run inline. That fixed the laggy intro logo fade (the game links ~200 programs there).
+  - **Rendering:**
+    - real cube maps, mip chains, sRGB, stencil only where the target has one;
+    - **4x MSAA on the main 3D target** (mbaavita-style: sample-mode fragment programs, downscale-on-store color, sample-sized depth twin, +8 MB CDRAM). `msaa=0/2/4`, `msaa_display=1`.
+  - **Open: player skin renders green** (only the skin shader; jerseys/court/UI fine). Bisect switch `cube_dummy=1`.
+  - **Screenshots:** `shot.flag` dumps the back buffer, but Vita3K doesn't write rendered frames back to guest memory, so it comes out black there (works on hw). In Vita3K, PrintWindow on the Vita3K window works instead.
 - OpenSL: PCM buffer-queue players work. The game also wants an AAC-ADTS decoder player (probably music/commentary streams), which gets refused for now. sceAudiodec can do AAC, that's for later. Took ALC-off and core pinning from PSPMania's audio driver.
