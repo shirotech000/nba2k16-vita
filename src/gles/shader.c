@@ -608,6 +608,8 @@ SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fm
 // the game retranslating each pair lazily mid-match
 static void stamp_check(void);
 
+static void gxp_cache_init(void);   // shared-binary cache, defined below prog_reset
+
 void shader_init(void)
 {
   static int done;
@@ -617,6 +619,7 @@ void shader_init(void)
   sceIoMkdir(SHADER_CACHE, 0777);
   sceIoMkdir(SHADERFAIL_DIR, 0777);
   pack_init();   // warm boots + menu links read through the pack
+  gxp_cache_init();
   stamp_check();
   // no shacc_ready() here anymore, the compiler loads on the first cache miss
   if (gxm_ready()) run_on_big_stack(clear_init_job, NULL);
@@ -730,10 +733,85 @@ void glBindAttribLocation(GLuint prog, GLuint idx, const GLchar *name)
   p->n_binds++;
 }
 
+// ---- shared compiled binaries ----
+// the game relinks whole program sets per screen change and every warm
+// link paid a pack read + sceGxmProgramCheck + RegisterProgram for binaries
+// that were already registered this boot (~12ms each, hundreds per screen
+// transition). one entry per unique binary, refcounted per gl_program.
+typedef struct gxp_ent {
+  uint32_t h2, cg_len;         // the same identity pair the disk cache trusts
+  int frag, refs;
+  SceGxmProgram *gxp;
+  SceGxmShaderPatcherId id;
+  struct gxp_ent *next;
+} gxp_ent;
+static gxp_ent *g_gxps;
+static SceKernelLwMutexWork g_gxp_lock;
+static int g_gxp_ok;
+
+static void gxp_cache_init(void)
+{
+  if (g_gxp_ok) return;
+  sceKernelCreateLwMutex(&g_gxp_lock, "gxp", 0, 0, NULL);
+  g_gxp_ok = 1;
+}
+
+// refs taken on return, NULL = not registered this boot
+static gxp_ent *gxp_cache_get(const char *cg, int frag)
+{
+  if (!g_gxp_ok) return NULL;
+  uint32_t len = (uint32_t)strlen(cg);
+  uint32_t h2 = fnv1a(cg, len, 2166136261u);
+  sceKernelLockLwMutex(&g_gxp_lock, 1, NULL);
+  for (gxp_ent *e = g_gxps; e; e = e->next)
+    if (e->frag == frag && e->h2 == h2 && e->cg_len == len) {
+      e->refs++;
+      sceKernelUnlockLwMutex(&g_gxp_lock, 1);
+      return e;
+    }
+  sceKernelUnlockLwMutex(&g_gxp_lock, 1);
+  return NULL;
+}
+
+// hand a freshly registered binary to the cache. on any failure the caller
+// keeps owning it the old way
+static void gxp_cache_adopt(const char *cg, int frag, SceGxmProgram *gxp, SceGxmShaderPatcherId id, gxp_ent **out)
+{
+  *out = NULL;
+  if (!g_gxp_ok || !gxp || !id) return;
+  uint32_t len = (uint32_t)strlen(cg);
+  uint32_t h2 = fnv1a(cg, len, 2166136261u);
+  gxp_ent *e = malloc(sizeof(*e));
+  if (!e) return;
+  e->h2 = h2; e->cg_len = len; e->frag = frag;
+  e->refs = 1; e->gxp = gxp; e->id = id;
+  sceKernelLockLwMutex(&g_gxp_lock, 1, NULL);
+  e->next = g_gxps;
+  g_gxps = e;
+  sceKernelUnlockLwMutex(&g_gxp_lock, 1);
+  *out = e;
+}
+
+// the binary and its registration die with the last reference
+static void gxp_cache_release(gxp_ent *e)
+{
+  if (!e) return;
+  sceKernelLockLwMutex(&g_gxp_lock, 1, NULL);
+  if (--e->refs > 0) { sceKernelUnlockLwMutex(&g_gxp_lock, 1); return; }
+  gxp_ent **pp = &g_gxps;
+  while (*pp && *pp != e) pp = &(*pp)->next;
+  if (*pp) *pp = e->next;
+  sceKernelUnlockLwMutex(&g_gxp_lock, 1);
+  sceGxmShaderPatcherUnregisterProgram(gxm_patcher, e->id);
+  free(e->gxp);
+  free(e);
+}
+
 // tear down everything link produced. deferred so the gpu is done with it.
 typedef struct {
   SceGxmProgram *vgxp, *fgxp;
   SceGxmShaderPatcherId vid, fid;
+  gxp_ent *refs[2];   // set when the gxps are shared: vid/vgxp are ignored
   vp_variant *vps;
   fp_variant *fps;
 } prog_garbage;
@@ -753,6 +831,8 @@ static void prog_garbage_free(void *arg)
     if (v->fp) sceGxmShaderPatcherReleaseFragmentProgram(gxm_patcher, v->fp);
     free(v);
   }
+  if (g->refs[0]) gxp_cache_release(g->refs[0]);
+  if (g->refs[1]) gxp_cache_release(g->refs[1]);
   if (g->vid) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, g->vid);
   if (g->fid) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, g->fid);
   free(g->vgxp);
@@ -763,11 +843,14 @@ static void prog_garbage_free(void *arg)
 static void prog_reset(gl_program *p)
 {
   job_detach(p);
-  if (p->vgxp || p->fgxp || p->vps || p->fps) {
+  if (p->vgxp || p->fgxp || p->vps || p->fps || p->gxp_ref[0] || p->gxp_ref[1]) {
     prog_garbage *g = calloc(1, sizeof(*g));
-    g->vgxp = p->vgxp; g->fgxp = p->fgxp;
-    g->vid = p->vid; g->fid = p->fid;
     g->vps = p->vps; g->fps = p->fps;
+    if (p->gxp_ref[0]) { g->refs[0] = p->gxp_ref[0]; p->vgxp = NULL; p->vid = NULL; }
+    else { g->vgxp = p->vgxp; g->vid = p->vid; }
+    if (p->gxp_ref[1]) { g->refs[1] = p->gxp_ref[1]; p->fgxp = NULL; p->fid = NULL; }
+    else { g->fgxp = p->fgxp; g->fid = p->fid; }
+    p->gxp_ref[0] = p->gxp_ref[1] = NULL;
     gxm_defer(prog_garbage_free, g);
   }
   p->vgxp = p->fgxp = NULL;
@@ -1030,25 +1113,29 @@ static int gxp_fix_imm_swizzle(SceGxmProgram *gxp)
   return fixed;
 }
 
-// p->vgxp / p->fgxp are set. patcher + gxp lookups, render thread only
+// p->vgxp / p->fgxp are set. patcher + gxp lookups, render thread only.
+// if gxp_ref[] is set the binaries are shared with an earlier link this
+// boot: registration (and the vita3k fix) already happened, skip both
 static int link_back(gl_program *p, char **log)
 {
-  static int v3k_fix = -1;
-  if (v3k_fix < 0) v3k_fix = emu_is_vita3k() && config_int("v3k_gxp_fix", 1);
-  if (v3k_fix) {
-    int n = gxp_fix_imm_swizzle(p->vgxp) + gxp_fix_imm_swizzle(p->fgxp);
-    static int total, logged;
-    total += n;
-    if (n && logged++ < 4) L("shader: vita3k immediate-swizzle fix: %d instr in prog %u (%d so far)", n, p->name, total);
-  }
-  int e1 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->vgxp, &p->vid);
-  int e2 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->fgxp, &p->fid);
-  if (e1 < 0 || e2 < 0) {
-    log_append(log, "sceGxmShaderPatcherRegisterProgram failed 0x%08X 0x%08X", e1, e2);
-    if (e1 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->vid);
-    if (e2 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->fid);
-    p->vid = p->fid = NULL;
-    return 0;
+  if (!p->gxp_ref[0] && !p->gxp_ref[1]) {
+    static int v3k_fix = -1;
+    if (v3k_fix < 0) v3k_fix = emu_is_vita3k() && config_int("v3k_gxp_fix", 1);
+    if (v3k_fix) {
+      int n = gxp_fix_imm_swizzle(p->vgxp) + gxp_fix_imm_swizzle(p->fgxp);
+      static int total, logged;
+      total += n;
+      if (n && logged++ < 4) L("shader: vita3k immediate-swizzle fix: %d instr in prog %u (%d so far)", n, p->name, total);
+    }
+    int e1 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->vgxp, &p->vid);
+    int e2 = sceGxmShaderPatcherRegisterProgram(gxm_patcher, p->fgxp, &p->fid);
+    if (e1 < 0 || e2 < 0) {
+      log_append(log, "sceGxmShaderPatcherRegisterProgram failed 0x%08X 0x%08X", e1, e2);
+      if (e1 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->vid);
+      if (e2 >= 0) sceGxmShaderPatcherUnregisterProgram(gxm_patcher, p->fid);
+      p->vid = p->fid = NULL;
+      return 0;
+    }
   }
   p->vbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->vgxp);
   p->fbuf_size = sceGxmProgramGetDefaultUniformBufferSize(p->fgxp);
@@ -1211,6 +1298,15 @@ int prog_try_finish(gl_program *p)
   p->fgxp = j->fgxp; j->fgxp = NULL;
   char *log = j->log; j->log = NULL;
   int ok = p->vgxp && p->fgxp && link_back(p, &log);
+  // registered fine: share the binaries from here on (before job_free drops
+  // the cg strings the cache keys on)
+  if (ok) {
+    gxp_ent *a = NULL, *b = NULL;
+    gxp_cache_adopt(j->vcg, 0, p->vgxp, p->vid, &a);
+    gxp_cache_adopt(j->fcg, 1, p->fgxp, p->fid, &b);
+    p->gxp_ref[0] = a;
+    p->gxp_ref[1] = b;
+  }
   // out of memory (and the compiler's "fatal internal error", which is
   // usually the same thing) isn't the shader's fault: try again later
   if (!ok && log && j->attempts < 3 &&
@@ -1504,6 +1600,18 @@ static void link_with(link_job *lj, gl_program *p, gl_shader *vs, gl_shader *fs,
   char **log = &lj->log;
   link_front(p, r);
 
+  // both binaries registered earlier this boot: adopt them, skip the reads,
+  // the checks and the registration. this is the whole point of the cache
+  gxp_ent *ev = gxp_cache_get(r->vs_cg, 0);
+  gxp_ent *ef = ev ? gxp_cache_get(r->fs_cg, 1) : NULL;
+  if (ev && ef) {
+    p->gxp_ref[0] = ev; p->vgxp = ev->gxp; p->vid = ev->id;
+    p->gxp_ref[1] = ef; p->fgxp = ef->gxp; p->fid = ef->id;
+    lj->ok = link_back(p, log);
+    return;
+  }
+  if (ev) gxp_cache_release(ev);   // half hit, put the ref back
+
   SceGxmProgram *vg = shacc_lookup(r->vs_cg, 0);
   SceGxmProgram *fg = shacc_lookup(r->fs_cg, 1);
   if (vg && fg) {
@@ -1511,6 +1619,15 @@ static void link_with(link_job *lj, gl_program *p, gl_shader *vs, gl_shader *fs,
     p->vgxp = vg;
     p->fgxp = fg;
     lj->ok = link_back(p, log);
+    // registration succeeded: share them from now on. on adopt the entry
+    // takes ownership, the program keeps a ref
+    if (lj->ok) {
+      gxp_ent *a = NULL, *b = NULL;
+      gxp_cache_adopt(r->vs_cg, 0, p->vgxp, p->vid, &a);
+      gxp_cache_adopt(r->fs_cg, 1, p->fgxp, p->fid, &b);
+      p->gxp_ref[0] = a;
+      p->gxp_ref[1] = b;
+    }
   } else if (async_ready()) {
     compile_job *j = calloc(1, sizeof(*j));
     if (j) {
@@ -1536,7 +1653,16 @@ static void link_with(link_job *lj, gl_program *p, gl_shader *vs, gl_shader *fs,
     p->vgxp = shacc_compile(r->vs_cg, 0, log);
     p->fgxp = p->vgxp ? shacc_compile(r->fs_cg, 1, log) : NULL;
     if (!p->vgxp || !p->fgxp) dump_fail(p, vs->src, fs->src, r->vs_cg, r->fs_cg, *log);
-    else lj->ok = link_back(p, log);
+    else {
+      lj->ok = link_back(p, log);
+      if (lj->ok) {
+        gxp_ent *a = NULL, *b = NULL;
+        gxp_cache_adopt(r->vs_cg, 0, p->vgxp, p->vid, &a);
+        gxp_cache_adopt(r->fs_cg, 1, p->fgxp, p->fid, &b);
+        p->gxp_ref[0] = a;
+        p->gxp_ref[1] = b;
+      }
+    }
   }
 }
 

@@ -192,6 +192,8 @@ typedef struct fp_variant {
 
 struct compile_job;
 
+struct gxp_ent;               // shader.c: shared compiled binary, refcounted
+
 typedef struct gl_program {
   GLuint name;
   GLuint vs, fs;
@@ -218,6 +220,7 @@ typedef struct gl_program {
 
   int uses_iid;            // reads gl_InstanceID (fed by the instance ramp stream)
   int iid_reg;             // gxp register of _g2c_iid, -1 = not resolvable
+  struct gxp_ent *gxp_ref[2];   // non-NULL = vgxp/fgxp live in the shared cache
 
   vp_variant *vps;
   fp_variant *fps;
