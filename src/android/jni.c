@@ -99,7 +99,7 @@ static jvalue h_package(jobj *self, const jvalue *a, jmeth *m) { (void)self; (vo
 static jvalue h_files_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(FILES_DIR) }; }
 static jvalue h_cache_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(CACHE_DIR) }; }
 static jvalue h_obb_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(OBB_DIR) }; }
-static jvalue h_ext_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(DATA_PATH) }; }
+static jvalue h_ext_dir(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .l = new_file(EXTERNAL_DIR) }; }
 static jvalue h_path(jobj *self, const jvalue *a, jmeth *m) {
   (void)a; (void)m;
   return (jvalue){ .l = new_string(is_jobj(self) && self->str ? self->str : "") };

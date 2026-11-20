@@ -67,8 +67,26 @@ Every patch checks the original bytes first.
 
 - kubridge HLE supports reserve/commit/protect. `kuKernelFlushCaches` is a missing NID (harmless there). Only data aborts reach our exception handler.
 - `port.log` loses its tail when Vita3K is killed. `tools/vita3k/run.ps1` reads the `sceClibPrintf` copy out of Vita3K's stdout instead. If Vita3K dies hard, even that loses the tail, so put `sync_log=1` in config.txt (slow, reopens the log per line).
-- **libshacccg crashes Vita3K on some shaders.** This is the same class of problem seen in PSPMania/mbaavita. `shader.c` has a crash guard: it writes `<key>.compiling` + `<key>.cg` before compiling and deletes the marker after. A marker left over from a dead run turns into `<key>.bad`, and that shader gets skipped from then on. Delete the `.bad` files to retry them. Caveat: if the compiler died because the heap was empty, the shader gets blamed anyway.
-- Run `tools/vita3k/run.ps1` from the repo. It defaults to `gamefiles/` for the libs + obb.
+- **libshacccg crash guard:** the first runs died right after a shader cache miss, so `shader.c` writes `<key>.compiling` + `<key>.cg` before compiling and deletes the marker after. A marker left over from a dead run turns into `<key>.bad`, and that shader gets skipped from then on. Delete the `.bad` files to retry them. That crash hasn't come back since. The `.bad` files we did get were false positives: the test script had killed Vita3K mid-compile. run.ps1 now wipes `*.compiling` after a timeout kill. Also, if the compiler dies because the heap ran dry, the shader gets blamed anyway.
+- Run `tools/vita3k/run.ps1` from the repo. It defaults to `gamefiles/` for the libs + obb. Set `NBA_VITA3K` (path to Vita3K.exe) and `NBA_SHACCCG` (your dumped libshacccg.suprx).
+
+## Debug switches (ux0:data/nba2k16/config.txt, key=value)
+
+- `sync_log=1`: reopen port.log after every line, so it survives a hard emulator death
+- `no_crash_handler=1`: don't hook exceptions, let Vita3K / the Vita report faults itself
+- `no_draw=1`: skip every draw. Clears and swaps still happen.
+- `no_audio=1`: never open an audio port. The OpenSL mixer runs on a silent clock.
+- `frame_log=1`: log draw/clear counts for every frame
+- `game_heap_mb=N`, `version_code=N`
+
+## Directory layout on the Vita
+
+The game wipes files in what it thinks are android's data dirs on boot. The first OBB run took our .so files and config.txt with it. So it gets its own subfolders:
+- `internal/`: /data/data/<pkg>, with files/ and cache/ inside
+- `external/`: /sdcard/Android/data/<pkg>
+- `root/`: any other absolute path, e.g. /proc/cpuinfo
+- `obb/`: /sdcard/Android/obb/<pkg>
+- our own files sit at the top level: the libs, config.txt, port.log, shadercache/
 
 ## Log
 
@@ -81,5 +99,9 @@ Every patch checks the original bytes first.
   - loads data from the obb
   - sets up audio, reaches IAP init and its Config.cfg lookup at ~14 s (shaders cached)
   
-  Then Vita3K itself dies hard with no log, right after `IAPBridge.getInstance` (returns NULL from our fake JNI) while the game polls `files/Config.cfg`. **Next:** figure out whether that's a guest bug (probably IAP / config handling) or an emulator issue, and check on real hardware.
+  Then, ~15 s in with a warm shader cache (~58 frames rendered), Vita3K itself exits hard with no log. That's right after the game's file layer runs its 33x retry on `files/Config.cfg` (open + `VCANDROIDFILEDEVICE::DeleteFile_LowLevel`). That retry is normal: `vcfeaturecodes.dbg` gets the same 32 tries earlier and the game moves on. So the death is in whatever comes next.
+  - not draws: `no_draw=1` still dies
+  - not audio output: `no_audio=1` still dies
+  - not our crash handler: `no_crash_handler=1` still dies
+  - **Next:** trace imports right before the death, and check on real hardware.
 - OpenSL: PCM buffer-queue players work. The game also wants an AAC-ADTS decoder player (probably music/commentary streams), which gets refused for now. sceAudiodec can do AAC, that's for later. Took ALC-off and core pinning from PSPMania's audio driver.

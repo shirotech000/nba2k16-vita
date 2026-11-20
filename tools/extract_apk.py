@@ -4,8 +4,10 @@
 usage: python tools/extract_apk.py path/to/nba2k16.apk [out_dir]
 
 copy everything in out_dir to ux0:data/nba2k16/ on the vita afterwards.
-the hashes are for v0.0.29, anything else will probably still load but
-any game-specific patches will be pointing at the wrong offsets.
+the hashes are from the v0.0.29 copy this port was developed against. a
+different dump of the same version could differ if that apk was modified.
+on a mismatch it still extracts, but game-specific patches check their
+bytes first and just get skipped if they don't match.
 """
 import hashlib
 import os

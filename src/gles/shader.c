@@ -50,6 +50,8 @@ static void *shacc_malloc(unsigned int n) {
   }
   return p;
 }
+unsigned shacc_mem_live(void) { return (unsigned)shacc_live; }
+
 static void shacc_free(void *p) {
   if (p) __sync_sub_and_fetch(&shacc_live, (int)malloc_usable_size(p));
   free(p);

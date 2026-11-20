@@ -1,12 +1,14 @@
 # installs the vpk into vita3k, copies the game libs in, runs it for a bit
 # and prints the tail of port.log.
-#   .\tools\vita3k\run.ps1 -GameFiles C:\path\to\extracted_libs [-Obb C:\path\to\obb_dir] [-Play]
+#   .\tools\vita3k\run.ps1 [-Vita3KExe path\to\Vita3K.exe] [-GameFiles dir] [-Obb dir] [-Play]
+# set NBA_VITA3K / NBA_SHACCCG once instead of passing paths every time.
+# game files default to gamefiles\ (libs) and gamefiles\obb\ in the repo.
 param(
-    [string]$Vita3KExe = 'C:\Users\Shiro\mbaavita\tools\vita3k\app\Vita3K.exe',
+    [string]$Vita3KExe = $env:NBA_VITA3K,
     [string]$Vpk,
     [string]$GameFiles,          # folder with libnba2k16_clean_opt.so + libgnustl_shared.so
     [string]$Obb,                # folder with the .obb file(s), optional
-    [string]$Shacccg = 'C:\Users\Shiro\mbaavita\tools\libshacccg.suprx',
+    [string]$Shacccg = $env:NBA_SHACCCG,  # your dumped libshacccg.suprx
     [int]$TimeoutSeconds = 40,
     [int]$TailLines = 80,
     [switch]$Play                # leave it running in a normal window
@@ -16,7 +18,7 @@ $titleId = 'NBAK00016'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $Vpk) { $Vpk = Join-Path $repo 'build\nba2k16_vita.vpk' }
 if (-not (Test-Path $Vpk)) { throw "no vpk at $Vpk, build first" }
-if (-not (Test-Path $Vita3KExe)) { throw "vita3k not found: $Vita3KExe" }
+if (-not $Vita3KExe -or -not (Test-Path $Vita3KExe)) { throw "vita3k not found, pass -Vita3KExe or set NBA_VITA3K" }
 
 # figure out where vita3k keeps its ux0/ur0
 $appDir = Split-Path -Parent $Vita3KExe
@@ -45,7 +47,7 @@ if ($Obb) {
         }
     }
 }
-if ((Test-Path $Shacccg) -and -not (Test-Path (Join-Path $pref 'ur0\data\libshacccg.suprx'))) {
+if ($Shacccg -and (Test-Path $Shacccg) -and -not (Test-Path (Join-Path $pref 'ur0\data\libshacccg.suprx'))) {
     Copy-Item $Shacccg (Join-Path $pref 'ur0\data\libshacccg.suprx')
 }
 
@@ -79,7 +81,12 @@ $p = Start-Process $Vita3KExe -ArgumentList @('-r', $titleId) -WorkingDirectory 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while ((Get-Date) -lt $deadline -and -not $p.HasExited) { Start-Sleep -Milliseconds 500 }
 $exited = $p.HasExited
-if (-not $exited) { Stop-Process -Id $p.Id -Force }
+if (-not $exited) {
+    Stop-Process -Id $p.Id -Force
+    # we killed it, maybe mid shader compile. don't let the crash guard
+    # blame that shader on the next boot.
+    Remove-Item (Join-Path $dataDir 'shadercache\*.compiling') -ErrorAction SilentlyContinue
+}
 
 Write-Host "--- vita3k $(if ($exited) { 'exited on its own' } else { 'killed after timeout' }) ---"
 # vita3k buffers port.log on the host side and loses the end when killed,

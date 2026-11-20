@@ -91,7 +91,9 @@ void game_monitor_tick(void) {
   next = now + 5 * 1000 * 1000;
 
   extern void mem_report(void);
+  extern unsigned shacc_mem_live(void);
   mem_report();
+  L("Cg compiler live %uK", shacc_mem_live() / 1024);
   if (!g_get_heap) return;
   uintptr_t h = g_get_heap();
   if (!h) return;

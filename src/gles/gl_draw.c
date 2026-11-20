@@ -43,11 +43,17 @@ static void draw_init(void)
 
 static struct { uint32_t frame, draws, clears, skipped; } g_st;
 
+// debug switches from config.txt: no_draw=1 skips every draw (clears and
+// swaps still happen), frame_log=1 logs every frame's counts
+extern int config_int(const char *key, int def);
+static int dbg_no_draw = -1, dbg_frame_log = -1;
+
 static void stat_tick(void)
 {
   uint32_t f = gxm_frame_count();
   if (f == g_st.frame) return;
-  if (g_st.frame < 5 || (g_st.frame % 1800) == 0)
+  if (dbg_frame_log < 0) dbg_frame_log = config_int("frame_log", 0);
+  if (g_st.frame < 5 || (g_st.frame % 1800) == 0 || dbg_frame_log)
     L("gl: frame %u: %u draws, %u clears, %u skipped", g_st.frame, g_st.draws, g_st.clears, g_st.skipped);
   g_st.frame = f;
   g_st.draws = g_st.clears = g_st.skipped = 0;
@@ -199,6 +205,8 @@ static void do_draw(GLenum mode, GLsizei count, GLenum itype, const void *indice
 {
   stat_tick();
   if (count <= 0 || inst <= 0 || !gxm_ready()) return;
+  if (dbg_no_draw < 0) dbg_no_draw = config_int("no_draw", 0);
+  if (dbg_no_draw) { g_st.skipped++; return; }
   draw_init();
   gl_program *p = prog_current();
   if (!p || !p->linked) {

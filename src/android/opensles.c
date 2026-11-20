@@ -379,7 +379,15 @@ static void mix_grain(void) {
   if (too_many_rounds) L_ONCE("opensles: player burned through %d buffers in one grain, tiny buffers?", CB_ROUNDS);
 }
 
+extern int config_int(const char *key, int def);
+
 static int open_port(int quiet) {
+  // no_audio=1 in config.txt: never touch sceAudioOut, run on a silent
+  // clock instead (callbacks still fire). handy for bisecting emulator crashes
+  if (config_int("no_audio", 0)) {
+    if (!quiet) L("opensles: no_audio set, running silent");
+    return -1;
+  }
   int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, GRAIN, OUT_RATE, SCE_AUDIO_OUT_MODE_STEREO);
   if (port >= 0) {
     // auto level control squashes the mix, turn it off (same as pspmania)

@@ -4,8 +4,12 @@
 #define GAME_SO_PATH  DATA_PATH "/libnba2k16_clean_opt.so"
 #define STL_SO_PATH   DATA_PATH "/libgnustl_shared.so"
 #define OBB_DIR       DATA_PATH "/obb"
-#define FILES_DIR     DATA_PATH "/files"
-#define CACHE_DIR     DATA_PATH "/cache"
+// the game gets its own subfolders. it cleans out android's data dirs on
+// boot, and that used to take our .so files + config.txt with it.
+#define INTERNAL_DIR  DATA_PATH "/internal"   // /data/data/<pkg>
+#define EXTERNAL_DIR  DATA_PATH "/external"   // /sdcard/Android/data/<pkg>
+#define FILES_DIR     INTERNAL_DIR "/files"
+#define CACHE_DIR     INTERNAL_DIR "/cache"
 #define SHADER_CACHE  DATA_PATH "/shadercache"
 #define LOG_PATH      DATA_PATH "/port.log"
 #define SHACCCG_PATH  "ur0:data/libshacccg.suprx"

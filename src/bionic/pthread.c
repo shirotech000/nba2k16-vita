@@ -179,7 +179,8 @@ static int b_pthread_create(pthread_t *t, const b_attr_t *battr, void *(*fn)(voi
   pthread_attr_t a;
   pthread_attr_init(&a);
   size_t stack = battr && battr->stack_size ? battr->stack_size : DEFAULT_STACK;
-  if (stack < 64 * 1024) stack = 64 * 1024;
+  // our shims put a few KB of buffers on game stacks, so don't go tiny
+  if (stack < 256 * 1024) stack = 256 * 1024;
   pthread_attr_setstacksize(&a, stack);
   if (battr && (battr->flags & B_ATTR_DETACHED))
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);

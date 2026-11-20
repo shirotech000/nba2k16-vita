@@ -31,7 +31,7 @@ void activity_boot(void *onCreate) {
   g_activity.env = jni_env();
   g_activity.clazz = jni_activity_object();
   g_activity.internalDataPath = FILES_DIR;
-  g_activity.externalDataPath = DATA_PATH;
+  g_activity.externalDataPath = EXTERNAL_DIR;
   g_activity.sdkVersion = 19;
   g_activity.assetManager = &fake_asset_manager;
   g_activity.obbPath = OBB_DIR;

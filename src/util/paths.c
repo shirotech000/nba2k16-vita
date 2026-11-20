@@ -7,12 +7,12 @@ static const struct { const char *from; const char *to; } path_map[] = {
   { "/sdcard/Android/obb/" PACKAGE_NAME,           OBB_DIR },
   { "/storage/emulated/0/Android/obb/" PACKAGE_NAME, OBB_DIR },
   { "/mnt/sdcard/Android/obb/" PACKAGE_NAME,       OBB_DIR },
-  { "/sdcard/Android/data/" PACKAGE_NAME,          DATA_PATH },
-  { "/storage/emulated/0/Android/data/" PACKAGE_NAME, DATA_PATH },
+  { "/sdcard/Android/data/" PACKAGE_NAME,          EXTERNAL_DIR },
+  { "/storage/emulated/0/Android/data/" PACKAGE_NAME, EXTERNAL_DIR },
   { "/data/data/" PACKAGE_NAME "/files",           FILES_DIR },
   { "/data/data/" PACKAGE_NAME "/cache",           CACHE_DIR },
-  { "/data/data/" PACKAGE_NAME,                    DATA_PATH },
-  { "/data/user/0/" PACKAGE_NAME,                  DATA_PATH },
+  { "/data/data/" PACKAGE_NAME,                    INTERNAL_DIR },
+  { "/data/user/0/" PACKAGE_NAME,                  INTERNAL_DIR },
   { "/sdcard",                                     DATA_PATH "/sdcard" },
   { "/storage/emulated/0",                         DATA_PATH "/sdcard" },
   { "/mnt/sdcard",                                 DATA_PATH "/sdcard" },
@@ -32,7 +32,7 @@ char *path_fix(const char *in, char *out, int outlen) {
       return out;
     }
   }
-  // anything else absolute just gets dumped under our data dir
-  snprintf(out, outlen, "%s%s", DATA_PATH, in);
+  // anything else absolute goes under root/, never next to our own files
+  snprintf(out, outlen, "%s/root%s", DATA_PATH, in);
   return out;
 }

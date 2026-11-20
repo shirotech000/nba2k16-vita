@@ -41,7 +41,7 @@ static void need_file(const char *p, const char *what) {
   if (!file_exists(p)) fatal("missing %s: %s (see README)", what, p);
 }
 
-// the game reads /proc/cpuinfo (maps to DATA_PATH/proc/cpuinfo), give it a
+// the game reads /proc/cpuinfo (maps to DATA_PATH/root/proc/cpuinfo), give it a
 // plausible one: 3 usable cortex-a9 cores with neon
 static void write_fake_cpuinfo(void) {
   static const char info[] =
@@ -53,8 +53,9 @@ static void write_fake_cpuinfo(void) {
     "CPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x4\n"
     "CPU part\t: 0xc09\nCPU revision\t: 0\n\n"
     "Hardware\t: PS Vita\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n";
-  sceIoMkdir(DATA_PATH "/proc", 0777);
-  SceUID fd = sceIoOpen(DATA_PATH "/proc/cpuinfo", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+  sceIoMkdir(DATA_PATH "/root", 0777);
+  sceIoMkdir(DATA_PATH "/root/proc", 0777);
+  SceUID fd = sceIoOpen(DATA_PATH "/root/proc/cpuinfo", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
   if (fd >= 0) {
     sceIoWrite(fd, info, sizeof(info) - 1);
     sceIoClose(fd);
@@ -70,13 +71,17 @@ int main(void) {
   scePowerSetGpuClockFrequency(222);
   scePowerSetGpuXbarClockFrequency(166);
 
+  sceIoMkdir(INTERNAL_DIR, 0777);
+  sceIoMkdir(EXTERNAL_DIR, 0777);
+  sceIoMkdir(DATA_PATH "/root", 0777);
   sceIoMkdir(FILES_DIR, 0777);
   sceIoMkdir(CACHE_DIR, 0777);
   sceIoMkdir(OBB_DIR, 0777);
   sceIoMkdir(SHADER_CACHE, 0777);
   write_fake_cpuinfo();
 
-  crash_init();
+  // no_crash_handler=1 lets vita3k (or the vita's coredump) report faults itself
+  if (!config_int("no_crash_handler", 0)) crash_init();
   libc_init();
   imports_init();
   jni_init();

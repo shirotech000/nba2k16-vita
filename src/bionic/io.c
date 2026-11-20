@@ -16,6 +16,7 @@
 
 #include "bionic/bionic.h"
 #include "loader/exports.h"
+#include "loader/so_loader.h"
 #include "util/abi.h"
 #include "util/log.h"
 #include "util/paths.h"
@@ -327,19 +328,28 @@ static int b_mkdir(const char *path, int mode) {
   return 0;
 }
 
+// these get logged on purpose, the game likes cleaning up dirs on boot
 static int b_rmdir(const char *path) {
   char fixed[512];
-  return sceIoRmdir(path_fix(path, fixed, sizeof(fixed))) < 0 ? -1 : 0;
+  int r = sceIoRmdir(path_fix(path, fixed, sizeof(fixed)));
+  L("rmdir(%s) -> 0x%X", fixed, r < 0 ? r : 0);
+  return r < 0 ? sce_fail(r) : 0;
 }
 
 static int b_unlink(const char *path) {
   char fixed[512];
-  return sceIoRemove(path_fix(path, fixed, sizeof(fixed))) < 0 ? -1 : 0;
+  int r = sceIoRemove(path_fix(path, fixed, sizeof(fixed)));
+  L("unlink(%s) -> 0x%X", fixed, r < 0 ? r : 0);
+  static int bt_once;
+  if (!bt_once++) so_backtrace("first unlink");
+  return r < 0 ? sce_fail(r) : 0;
 }
 
 static int b_rename(const char *a, const char *b) {
   char fa[512], fb[512];
-  return sceIoRename(path_fix(a, fa, sizeof(fa)), path_fix(b, fb, sizeof(fb))) < 0 ? -1 : 0;
+  int r = sceIoRename(path_fix(a, fa, sizeof(fa)), path_fix(b, fb, sizeof(fb)));
+  L("rename(%s -> %s) -> 0x%X", fa, fb, r < 0 ? r : 0);
+  return r < 0 ? sce_fail(r) : 0;
 }
 
 // --- dirs, straight on top of sceIoDopen ---
