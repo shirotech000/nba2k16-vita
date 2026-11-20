@@ -436,6 +436,7 @@ static void chunk_maybe_release(gpu_chunk *c, int ti)
 void gpu_free(gpu_block *b)
 {
   if (!b) return;
+  if (b->zc) { free(b); return; }   // zero-copy: the memory is the game's
   if (!b->chunk) {
     // gpu_alloc_mapped block: unmap, hand it back to bigmem
     extern void bigmem_free(void *p);
@@ -470,7 +471,8 @@ gpu_block *gpu_alloc_mapped(uint32_t size)
   if (!p) { free(b); return NULL; }
   b->ptr = p;
   b->size = sz;
-  if (!bigmem_is_borrowed(p)) {   // borrowed pool space is already mapped
+  extern int bigmem_gpu_readable(const void *p, size_t n);
+  if (!bigmem_gpu_readable(p, sz)) {   // borrowed / auto-mapped blocks are readable already
     int r = sceGxmMapMemory(p, sz, SCE_GXM_MEMORY_ATTRIB_READ);
     if (r < 0) {
       L_ONCE("gxm: mapping cpu memory for the gpu failed 0x%08X", r);
@@ -487,6 +489,7 @@ void gpu_mapped_flush(gpu_block *b, uint32_t off, uint32_t size)
 {
   if (b && !b->chunk && size) kuKernelFlushCaches((uint8_t *)b->ptr + off, size);
 }
+
 
 // ---- lending pool space to the cpu ----
 // bigmem's very last resort before the game gets a NULL: free space inside
@@ -1335,7 +1338,18 @@ int gxm_init(void)
   rt_get(SCREEN_W, SCREEN_H, gxm_msaa_display() ? gxm_msaa_setting() : SCE_GXM_MULTISAMPLE_NONE);
   g_dry_run = config_int("gpu_dry_run", 0);
   if (g_dry_run) L("gxm: gpu_dry_run=1, no scenes/draws/clears/flips get submitted");
+  { extern void bigmem_enable_gpu_map(void); bigmem_enable_gpu_map(); }
   g_ready = 1;
   gpu_mem_log("after gxm init");
   return 0;
+}
+
+// wait until the gpu has finished every scene submitted so far. safe from any
+// thread: it only reads the notification, never ends a scene
+void gxm_wait_submitted(void)
+{
+  if (!g_ready || g_dry_run) return;
+  uint32_t target = g_in_scene ? g_scene_ctr - 1 : g_scene_ctr;
+  int spins = 0;
+  while (!gxm_scene_done(target) && spins++ < 20000) sceKernelDelayThread(100);
 }

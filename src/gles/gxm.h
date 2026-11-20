@@ -42,6 +42,7 @@ typedef struct gpu_block {
   uint32_t off;
   gpu_chunk *chunk;   // NULL = cpu memory mapped for the gpu (gpu_alloc_mapped)
   int mapped;         // that mapping is ours to undo
+  int zc;             // zero-copy: points at the game's own memory, never freed by us
 } gpu_block;
 
 gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref);
@@ -50,6 +51,7 @@ void gpu_free(gpu_block *b);
 // gpu_mapped_flush() after
 gpu_block *gpu_alloc_mapped(uint32_t size);
 void gpu_mapped_flush(gpu_block *b, uint32_t off, uint32_t size);
+void gxm_wait_submitted(void);
 // bigmem's last resort: free space inside existing pool chunks, for the cpu
 void *gxm_borrow(uint32_t size, void **handle);
 void gxm_unborrow(void *handle);

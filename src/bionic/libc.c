@@ -140,6 +140,12 @@ static void *alloc_any(size_t n) {
 }
 
 static void free_any(void *p) {
+  // the game frees vertex blocks a zero-copy vbo may still be drawing from,
+  // and it never fences. let the gpu finish what's submitted first
+  extern int gl_zc_overlaps(const void *p, size_t n);
+  extern void gxm_wait_submitted(void);
+  extern int gl_zc_any(void);
+  if (gl_zc_any() && gl_zc_overlaps(p, usable(p))) gxm_wait_submitted();
   if (spill_owns(p)) spill_free(p);
   else if (bigmem_owns(p)) bigmem_free(p);
   else __real_free(p);

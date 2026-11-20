@@ -1,6 +1,8 @@
 // GL fixed state, buffers, getters, and pushing state to gxm per draw.
 #include <stdlib.h>
 #include <string.h>
+#include <kubridge.h>
+#include <psp2/kernel/threadmgr.h>
 #include "gles/gl_internal.h"
 #include "gles/gl_api.h"
 
@@ -266,15 +268,113 @@ static gl_buffer *bound_buf(GLenum target)
   return buf_get(n);
 }
 
+// ---- zero-copy vbos ----
+// the game uploads its vertex/index data straight from blocks it keeps for
+// the whole scene (VCDisplayList, glBufferData @+0x1304f98 / +0x130573c,
+// see the zero-copy analysis). from those two sites the buffer just points
+// at the game's block (gpu-mapped) instead of copying it into the pool,
+// which leaves the pool for textures. the game never fences, so freeing a
+// block a live zero-copy buffer uses waits for the gpu first (libc free).
+#include "loader/so_loader.h"
+#define ZC_MAX 4096
+static struct { uintptr_t lo, hi; } zc_ranges[ZC_MAX];
+static int zc_n;
+static volatile uintptr_t zc_lo = ~(uintptr_t)0, zc_hi;
+static SceKernelLwMutexWork zc_lock;
+static int zc_on = -1;
+
+static int zc_site(uintptr_t lr)
+{
+  so_module *m = so_module_for_addr(lr);
+  if (!m) return 0;
+  uintptr_t off = lr - (uintptr_t)m->base;
+  return (off >= 0x1304f98 && off <= 0x1304fa0) || (off >= 0x130573c && off <= 0x1305744);
+}
+
+static void zc_add(uintptr_t lo, uintptr_t hi)
+{
+  sceKernelLockLwMutex(&zc_lock, 1, NULL);
+  if (zc_n < ZC_MAX) {
+    zc_ranges[zc_n].lo = lo;
+    zc_ranges[zc_n].hi = hi;
+    zc_n++;
+    if (lo < zc_lo) zc_lo = lo;
+    if (hi > zc_hi) zc_hi = hi;
+  }
+  sceKernelUnlockLwMutex(&zc_lock, 1);
+}
+
+static void zc_remove(uintptr_t lo)
+{
+  sceKernelLockLwMutex(&zc_lock, 1, NULL);
+  for (int i = 0; i < zc_n; i++)
+    if (zc_ranges[i].lo == lo) { zc_ranges[i] = zc_ranges[--zc_n]; break; }
+  sceKernelUnlockLwMutex(&zc_lock, 1);
+}
+
+int gl_zc_any(void) { return zc_on > 0 && zc_n > 0; }
+
+// libc's free calls this: is the gpu maybe reading [p, p+n)?
+int gl_zc_overlaps(const void *p, size_t n)
+{
+  uintptr_t a = (uintptr_t)p, e = a + n;
+  if (zc_on <= 0 || !zc_n || e <= zc_lo || a >= zc_hi) return 0;
+  int r = 0;
+  sceKernelLockLwMutex(&zc_lock, 1, NULL);
+  for (int i = 0; i < zc_n && !r; i++) r = a < zc_ranges[i].hi && e > zc_ranges[i].lo;
+  sceKernelUnlockLwMutex(&zc_lock, 1);
+  return r;
+}
+
+static void buf_release(gl_buffer *b)
+{
+  if (!b->mem) return;
+  if (b->mem->zc) zc_remove((uintptr_t)b->mem->ptr);
+  gpu_free_deferred(b->mem);
+  b->mem = NULL;
+}
+
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage)
 {
+  uintptr_t lr = (uintptr_t)__builtin_return_address(0);
   gl_buffer *b = bound_buf(target);
   if (!b || size < 0) { GL_ERR(GL_INVALID_OPERATION); return; }
+  if (zc_on < 0) {
+    extern int config_int(const char *key, int def);
+    zc_on = config_int("zero_copy", 1);
+    sceKernelCreateLwMutex(&zc_lock, "zc", 0, 0, NULL);
+    L("gl: zero-copy vbos %s (zero_copy=0 turns it off)", zc_on ? "on" : "off");
+  }
+  // zero-copy buffers never get reused for other data
+  if (b->mem && b->mem->zc) buf_release(b);
   // orphan if the gpu may still read it, or the size is way off
   if (b->mem && ((uint32_t)size > b->mem->size || (uint32_t)size * 2 < b->mem->size ||
                  gxm_busy(b->last_use))) {
     gpu_free_deferred(b->mem);
     b->mem = NULL;
+  }
+  extern int bigmem_gpu_readable(const void *p, size_t n);
+  if (zc_on > 0 && data && size > 0 && !((uintptr_t)data & 3) && zc_site(lr) &&
+      bigmem_gpu_readable(data, (size_t)size)) {
+    gpu_block *zb = calloc(1, sizeof(*zb));
+    if (zb) {
+      if (b->mem) { gpu_free_deferred(b->mem); b->mem = NULL; }
+      zb->ptr = (void *)data;
+      zb->size = (uint32_t)size;
+      zb->zc = 1;
+      kuKernelFlushCaches((void *)data, (uint32_t)size);
+      zc_add((uintptr_t)data, (uintptr_t)data + (uint32_t)size);
+      b->mem = zb;
+      b->size = (uint32_t)size;
+      b->usage = usage;
+      b->last_use = 0;
+      static unsigned zc_count, zc_bytes;
+      zc_count++;
+      zc_bytes += (uint32_t)size;
+      if ((zc_count & 63) == 1)
+        L("gl: zero-copy vbo #%u (%u KiB not copied so far)", zc_count, zc_bytes >> 10);
+      return;
+    }
   }
   free(b->shadow);
   b->shadow = NULL;
@@ -306,6 +406,13 @@ void glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void *d
     GL_ERR(GL_INVALID_VALUE);
     return;
   }
+  if (b->mem && b->mem->zc) {
+    // morph re-uploads come from the same block, usually in place
+    uint8_t *dst = (uint8_t *)b->mem->ptr + off;
+    if ((const void *)dst != data) memmove(dst, data, size);
+    kuKernelFlushCaches(dst, (uint32_t)size);
+    return;
+  }
   if (!b->mem) { memcpy((uint8_t *)b->shadow + off, data, size); return; }
   if (gxm_busy(b->last_use)) {
     // gpu still has the old contents queued, copy-on-write
@@ -334,6 +441,7 @@ void glDeleteBuffers(GLsizei n, const GLuint *names)
     if (G.element_buffer == names[i]) G.element_buffer = 0;
     for (int a = 0; a < MAX_ATTRIBS; a++)
       if (G.va[a].buffer == names[i]) G.va[a].buffer = (GLuint)-1;  // dangling, draw skips it
+    if (b->mem && b->mem->zc) zc_remove((uintptr_t)b->mem->ptr);
     gpu_free_deferred(b->mem);
     nt_set(&g_bufs, names[i], NULL);
     free(b->shadow);
