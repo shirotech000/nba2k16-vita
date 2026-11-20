@@ -799,6 +799,9 @@ static uint32_t g_def_head, g_def_count, g_def_cap;
 
 static void defer_at(void (*fn)(void *), void *arg, uint32_t scene)
 {
+  // the queue is also touched by gxm_defer_drain on a game thread, and the
+  // pool lock is owner-recursive so the gpu_free fns can re-take it
+  pool_lock();
   if (g_def_count == g_def_cap) {
     uint32_t ncap = g_def_cap ? g_def_cap * 2 : 256;
     deferred_t *n = malloc(ncap * sizeof(*n));
@@ -813,6 +816,7 @@ static void defer_at(void (*fn)(void *), void *arg, uint32_t scene)
   d->arg = arg;
   d->scene = scene;
   g_def_count++;
+  pool_unlock();
 }
 
 void gxm_defer(void (*fn)(void *), void *arg)
@@ -824,6 +828,43 @@ void gxm_defer(void (*fn)(void *), void *arg)
 
 static void process_deferred(void)
 {
+  pool_lock();
+  while (g_def_count) {
+    deferred_t *d = &g_def[g_def_head];
+    if (!gxm_scene_done(d->scene)) break;
+    void (*fn)(void *) = d->fn;
+    void *arg = d->arg;
+    g_def_head = (g_def_head + 1) % g_def_cap;
+    g_def_count--;
+    fn(arg);   // gpu_free: re-takes the pool lock, that's fine, it's recursive
+  }
+  pool_unlock();
+}
+
+// run every pending deferred free right now. bigmem calls this from a game
+// thread before handing the game a NULL it would crash on (career exit,
+// hw26/28: the match scene's already-freed blocks were still parked here
+// waiting for the gpu). waits for the scenes to finish first - the render
+// thread keeps running on its own (it ran at 60fps through the exit hang),
+// this only waits, it never drives the scene itself
+uint32_t gxm_defer_drain(void)
+{
+  if (!g_ready || !g_pool_lock_ok) return 0;
+  pool_lock();
+  uint32_t n = g_def_count, want = 0;
+  for (uint32_t i = 0; i < g_def_count; i++)
+    if (g_def[(g_def_head + i) % g_def_cap].scene > want) want = g_def[(g_def_head + i) % g_def_cap].scene;
+  pool_unlock();
+  if (!n) return 0;
+  int spins = 0;
+  while (!gxm_scene_done(want)) {
+    sceKernelDelayThread(500);
+    if (++spins > 12000) {   // 6s cap, then take what completed
+      L("gxm: deferred drain timed out waiting for scene %u", want);
+      break;
+    }
+  }
+  pool_lock();
   while (g_def_count) {
     deferred_t *d = &g_def[g_def_head];
     if (!gxm_scene_done(d->scene)) break;
@@ -833,6 +874,8 @@ static void process_deferred(void)
     g_def_count--;
     fn(arg);
   }
+  pool_unlock();
+  return n;
 }
 
 // ============================================================ transient ring
