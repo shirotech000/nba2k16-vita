@@ -17,8 +17,8 @@
 // reserves we never hand out. GL's own pool keeps spare room inside its
 // chunks (31MB idle of 55MB in the match load test), and by the time we
 // overflow the game has made its threads, so these can stay small.
-#define GL_RESERVE   (12 * 1024 * 1024)
-#define MAIN_RESERVE (8 * 1024 * 1024)
+#define GL_RESERVE   (6 * 1024 * 1024)
+#define MAIN_RESERVE (4 * 1024 * 1024)
 #define MAX_BLOCKS   2048
 
 typedef struct {

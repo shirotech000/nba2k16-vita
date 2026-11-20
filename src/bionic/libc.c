@@ -92,13 +92,29 @@ static size_t heap_headroom(void) {
   return (size_t)_newlib_heap_size_user > used ? _newlib_heap_size_user - used : 0;
 }
 
-static void *alloc_any(size_t n) {
+static void *alloc_once(size_t n) {
   if (n >= BIG_MIN && n < 32 * 1024 * 1024 && heap_headroom() < HEADROOM_MIN) {
     void *p = bigmem_alloc(n);
     if (p) return p;
   }
   void *p = malloc(n);
   if (!p && n >= FALLBACK_MIN) p = bigmem_alloc(n);
+  return p;
+}
+
+static void *alloc_any(size_t n) {
+  void *p = alloc_once(n);
+  if (p || n < BIG_MIN) return p;
+  // everything's at its reserve. loading is bursty and other threads drop
+  // their temp buffers all the time, so give it a couple seconds before
+  // handing the game a NULL it'll probably crash on
+  static volatile int waits;
+  if (__sync_add_and_fetch(&waits, 1) <= 8) L("mem: %uK didn't fit anywhere, waiting for memory to free up", (unsigned)(n / 1024));
+  for (int i = 0; i < 100 && !p; i++) {
+    sceKernelDelayThread(20 * 1000);
+    p = alloc_once(n);
+  }
+  if (p) L("mem: %uK fit after waiting", (unsigned)(n / 1024));
   return p;
 }
 
