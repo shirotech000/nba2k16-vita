@@ -894,6 +894,84 @@ typedef struct {
   GLenum etc;            // etc/eac format of compressed data, 0 = raw pixels
 } src_t;
 
+// ---- raw uploads -> bc ----
+// the textures still not fitting in a match are mostly uncompressed (565,
+// 4444, rgba8). mipped pow2 ones 64px and up (3d stuff, not ui) get bc
+// encoded at upload: 565/rgb8 -> bc1 (1/4, 1/8), 4444/5551/rgba8 -> bc3
+// (1/2, 1/4), rgba8 that's fully opaque -> bc1. tex_bc_raw=0 turns it off.
+#define SRC_RGBA_BC 1   // src_t.etc marker: data is linear rgba8 to bc encode
+
+static void bc_from_rgba(const uint8_t *rgba, unsigned w, unsigned h, unsigned bs,
+                         uint8_t *level, unsigned gw, unsigned gh, unsigned bx0, unsigned by0)
+{
+  uint8_t blk[64];
+  uint32_t out[4];
+  for (unsigned by = 0; by < (h + 3) / 4; by++) {
+    for (unsigned bx = 0; bx < (w + 3) / 4; bx++) {
+      for (unsigned y = 0; y < 4; y++) {
+        unsigned sy = by * 4 + y < h ? by * 4 + y : h - 1;
+        for (unsigned x = 0; x < 4; x++) {
+          unsigned sx = bx * 4 + x < w ? bx * 4 + x : w - 1;
+          memcpy(blk + (y * 4 + x) * 4, rgba + ((size_t)sy * w + sx) * 4, 4);
+        }
+      }
+      if (bs == 8) bc1_encode(blk, 16, (uint8_t *)out, 0);
+      else bc3_encode(blk, 16, (uint8_t *)out);
+      // whole words only, it's uncached gpu memory
+      uint32_t *d = (uint32_t *)(level + (size_t)tu_morton(bx0 + bx, by0 + by, gw, gh) * bs);
+      for (unsigned i = 0; i < bs / 4; i++) d[i] = out[i];
+    }
+  }
+}
+
+// raw pixels -> linear rgba8. 0 = format we don't convert
+static int raw_to_rgba(GLenum fmt, GLenum type, const uint8_t *src, unsigned w, unsigned h,
+                       unsigned stride, uint8_t *dst, int *opaque)
+{
+  int op = 1;
+  for (unsigned y = 0; y < h; y++) {
+    const uint8_t *r = src + (size_t)y * stride;
+    uint8_t *d = dst + (size_t)y * w * 4;
+    for (unsigned x = 0; x < w; x++, d += 4) {
+      if (fmt == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) {
+        unsigned v = r[x * 2] | r[x * 2 + 1] << 8;
+        d[0] = (uint8_t)(((v >> 11) & 31) * 255 / 31);
+        d[1] = (uint8_t)(((v >> 5) & 63) * 255 / 63);
+        d[2] = (uint8_t)((v & 31) * 255 / 31);
+        d[3] = 255;
+      } else if (fmt == GL_RGBA && type == GL_UNSIGNED_SHORT_4_4_4_4) {
+        unsigned v = r[x * 2] | r[x * 2 + 1] << 8;
+        d[0] = (uint8_t)((v >> 12) * 17);
+        d[1] = (uint8_t)(((v >> 8) & 15) * 17);
+        d[2] = (uint8_t)(((v >> 4) & 15) * 17);
+        d[3] = (uint8_t)((v & 15) * 17);
+      } else if (fmt == GL_RGBA && type == GL_UNSIGNED_SHORT_5_5_5_1) {
+        unsigned v = r[x * 2] | r[x * 2 + 1] << 8;
+        d[0] = (uint8_t)((v >> 11) * 255 / 31);
+        d[1] = (uint8_t)(((v >> 6) & 31) * 255 / 31);
+        d[2] = (uint8_t)(((v >> 1) & 31) * 255 / 31);
+        d[3] = (v & 1) ? 255 : 0;
+      } else if (fmt == GL_RGBA && type == GL_UNSIGNED_BYTE) {
+        memcpy(d, r + x * 4, 4);
+      } else if (fmt == GL_RGB && type == GL_UNSIGNED_BYTE) {
+        d[0] = r[x * 3]; d[1] = r[x * 3 + 1]; d[2] = r[x * 3 + 2]; d[3] = 255;
+      } else {
+        return 0;
+      }
+      if (d[3] != 255) op = 0;
+    }
+  }
+  if (opaque) *opaque = op;
+  return 1;
+}
+
+static unsigned raw_src_bpp(GLenum fmt, GLenum type)
+{
+  if (type == GL_UNSIGNED_SHORT_5_6_5 || type == GL_UNSIGNED_SHORT_4_4_4_4 || type == GL_UNSIGNED_SHORT_5_5_5_1) return 2;
+  if (type == GL_UNSIGNED_BYTE) return fmt == GL_RGBA ? 4 : fmt == GL_RGB ? 3 : 0;
+  return 0;
+}
+
 static unsigned client_stride(unsigned w, unsigned src_bpp)
 {
   unsigned rowlen = G.unpack_row_len ? (unsigned)G.unpack_row_len : w;
@@ -982,6 +1060,10 @@ static void write_src(gl_texture *t, unsigned face, unsigned l, unsigned x0, uns
     // npot: the grid is bigger than the texture, don't leave junk in the rest
     if (!x0 && !y0 && s->w == lw && s->h == lh && (!tu_is_pow2(t->w) || !tu_is_pow2(t->h)))
       memset(base, 0, lvl_size(&sh, l));
+    if (s->etc == SRC_RGBA_BC) {
+      bc_from_rgba(s->data, s->w, s->h, fmt_bc(t->fmt), base, tu_bc_dim(t->w, l), tu_bc_dim(t->h, l), x0 / 4, y0 / 4);
+      return;
+    }
     bc_from_etc(s->etc, s->data, s->w, s->h, base, tu_bc_dim(t->w, l), tu_bc_dim(t->h, l), x0 / 4, y0 / 4, g_strip);
     return;
   }
@@ -1112,6 +1194,38 @@ void glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, 
   if (level < 0 || level > 12 || w <= 0 || h <= 0 || w > 4096 || h > 4096) { GL_ERR(GL_INVALID_VALUE); return; }
   fmt_info fi;
   pick_format(ifmt, fmt, type, &fi);
+  static int raw_bc = -1;
+  if (raw_bc < 0) {
+    extern int config_int(const char *key, int def);
+    raw_bc = config_int("tex_bc_raw", 1) != 0;
+  }
+  unsigned rbpp = raw_src_bpp(fmt, type);
+  if (raw_bc && bc_enabled() && face < 0 && data && rbpp) {
+    // level 0: mipped pow2 3d-ish textures. mips: follow what level 0 became
+    int start = level == 0 && w >= 64 && h >= 64 && tu_is_pow2((unsigned)w) && tu_is_pow2((unsigned)h) &&
+                is_mip_filter(t->min_filter);
+    int follow = level > 0 && t->mem && !t->is_cube && fmt_bc(t->fmt) && t->raw_bc;
+    if (start || follow) {
+      uint8_t *rgba = malloc((size_t)w * h * 4);
+      int opaque = 0;
+      if (rgba && raw_to_rgba(fmt, type, data, (unsigned)w, (unsigned)h, client_stride(w, rbpp), rgba, &opaque)) {
+        int bc3 = start ? !opaque : fmt_bc(t->fmt) == 16;
+        fmt_info bfi;
+        etc_format(bc3 ? 0x9278 /* etc2 rgba -> bc3 */ : 0x9274 /* etc2 rgb -> bc1 */, &bfi, 1);
+        src_t bs = { &bfi, rgba, (unsigned)w, (unsigned)h, 0, SRC_RGBA_BC };
+        tex_image(t, face, (unsigned)level, (GLenum)ifmt, &bfi, &bs, 1);
+        if (start && fmt_bc(t->fmt)) {
+          t->raw_bc = 1;
+          static unsigned n_raw;
+          if (n_raw++ < 8 || (n_raw & 63) == 0)
+            L("tex: raw %ux%u (fmt 0x%X type 0x%X) stored as %s (#%u)", w, h, fmt, type, bc3 ? "bc3" : "bc1", n_raw);
+        }
+        free(rgba);
+        return;
+      }
+      free(rgba);
+    }
+  }
   src_t s = { &fi, data, (unsigned)w, (unsigned)h, client_stride(w, fi.src_bpp), 0 };
   tex_image(t, face, (unsigned)level, (GLenum)ifmt, &fi, &s, data != NULL);
   TRACE("glTexImage2D tex %u face %d level %d %dx%d fmt 0x%X type 0x%X", t->name, face, level, w, h, fmt, type);

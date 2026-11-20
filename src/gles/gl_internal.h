@@ -59,6 +59,7 @@ typedef struct gl_texture {
   int valid;
   int levels_dropped;
   unsigned skip;            // game mip levels dropped to fit (stored level = game level - skip)
+  int raw_bc;               // uncompressed upload we bc encoded (its mips follow)
   GLenum min_filter, mag_filter, wrap_s, wrap_t;
   uint32_t last_use;
   // render-to-texture
