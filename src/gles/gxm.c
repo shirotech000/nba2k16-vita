@@ -1,5 +1,6 @@
 // sceGxm device: memory, rings, scenes, display. written straight against
 // sony's gxm api, see gxm.h for the overview.
+#include <kubridge.h>
 #include "gles/gxm.h"
 #include "util/paths.h"
 
@@ -435,6 +436,14 @@ static void chunk_maybe_release(gpu_chunk *c, int ti)
 void gpu_free(gpu_block *b)
 {
   if (!b) return;
+  if (!b->chunk) {
+    // gpu_alloc_mapped block: unmap, hand it back to bigmem
+    extern void bigmem_free(void *p);
+    if (b->mapped) sceGxmUnmapMemory(b->ptr);
+    bigmem_free(b->ptr);
+    free(b);
+    return;
+  }
   pool_lock();
   gpu_chunk *c = b->chunk;
   int ti = c->mb.cdram ? 0 : 1;
@@ -443,6 +452,40 @@ void gpu_free(gpu_block *b)
   chunk_maybe_release(c, ti);
   pool_unlock();
   free(b);
+}
+
+// ---- cpu memory the gpu reads directly ----
+// vbos that didn't fit in the pool used to be copied into the ring every
+// draw (1.3MB player meshes: 8 fps). now they live in a bigmem block that's
+// mapped for gpu reads, same as any other buffer from the draw's point of view
+gpu_block *gpu_alloc_mapped(uint32_t size)
+{
+  extern void *bigmem_alloc_ex(size_t n, int urgent);
+  extern int bigmem_is_borrowed(const void *p);
+  extern void bigmem_free(void *p);
+  uint32_t sz = ALIGN_UP(size, 4096);
+  gpu_block *b = calloc(1, sizeof(*b));
+  if (!b) return NULL;
+  void *p = bigmem_alloc_ex(sz, 1);
+  if (!p) { free(b); return NULL; }
+  b->ptr = p;
+  b->size = sz;
+  if (!bigmem_is_borrowed(p)) {   // borrowed pool space is already mapped
+    int r = sceGxmMapMemory(p, sz, SCE_GXM_MEMORY_ATTRIB_READ);
+    if (r < 0) {
+      L_ONCE("gxm: mapping cpu memory for the gpu failed 0x%08X", r);
+      bigmem_free(p);
+      free(b);
+      return NULL;
+    }
+    b->mapped = 1;
+  }
+  return b;
+}
+
+void gpu_mapped_flush(gpu_block *b, uint32_t off, uint32_t size)
+{
+  if (b && !b->chunk && size) kuKernelFlushCaches((uint8_t *)b->ptr + off, size);
 }
 
 // ---- lending pool space to the cpu ----
@@ -509,7 +552,7 @@ void gpu_free_deferred(gpu_block *b)
   if (b) gxm_defer(gpu_free_cb, b);
 }
 
-int gpu_is_cdram(const gpu_block *b) { return b && b->chunk->mb.cdram; }
+int gpu_is_cdram(const gpu_block *b) { return b && b->chunk && b->chunk->mb.cdram; }
 
 // ============================================================ ptr -> info map
 // the patcher frees by pointer, so remember what we handed out

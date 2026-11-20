@@ -181,6 +181,14 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
 
 void *bigmem_alloc(size_t n) { return bigmem_alloc_ex(n, 0); }
 
+int bigmem_is_borrowed(const void *p) {
+  sceKernelLockLwMutex(&lock, 1, NULL);
+  int i = find(p);
+  int r = i >= 0 && blocks[i].borrow != NULL;
+  sceKernelUnlockLwMutex(&lock, 1);
+  return r;
+}
+
 int bigmem_owns(const void *p) {
   if (!maybe_ours((uintptr_t)p)) return 0;  // fast path, nearly every free()
   sceKernelLockLwMutex(&lock, 1, NULL);

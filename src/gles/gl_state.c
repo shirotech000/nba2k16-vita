@@ -283,17 +283,20 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
     b->mem = gpu_alloc((uint32_t)size, 16, pref);
     if (!b->mem) {
       // gpu pool's full (hw match load: heads + crowd vbos died here and their
-      // draws got dropped). keep a cpu copy, draws stream it through the ring
-      b->shadow = malloc((size_t)size);
-      if (!b->shadow) { GL_ERR(GL_OUT_OF_MEMORY); b->size = 0; return; }
+      // draws got dropped). cpu memory mapped for the gpu instead
+      b->mem = gpu_alloc_mapped((uint32_t)size);
+      if (!b->mem) { GL_ERR(GL_OUT_OF_MEMORY); b->size = 0; return; }
       static int n;
-      if (n++ < 8) L("gl: buffer %u (%u bytes) has no gpu room, kept on the cpu", b->name, (unsigned)size);
+      if (n++ < 8) L("gl: buffer %u (%u bytes) has no pool room, using mapped cpu memory", b->name, (unsigned)size);
     }
     b->last_use = 0;
   }
   b->size = (uint32_t)size;
   b->usage = usage;
-  if (data && size) memcpy(b->mem ? b->mem->ptr : b->shadow, data, size);
+  if (data && size) {
+    memcpy(b->mem->ptr, data, size);
+    gpu_mapped_flush(b->mem, 0, (uint32_t)size);
+  }
 }
 
 void glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void *data)
@@ -319,6 +322,7 @@ void glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void *d
     b->last_use = 0;
   }
   memcpy((uint8_t *)b->mem->ptr + off, data, size);
+  gpu_mapped_flush(b->mem, (uint32_t)off, (uint32_t)size);
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint *names)

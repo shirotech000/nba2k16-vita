@@ -40,11 +40,16 @@ typedef struct gpu_block {
   void *ptr;
   uint32_t size;
   uint32_t off;
-  gpu_chunk *chunk;
+  gpu_chunk *chunk;   // NULL = cpu memory mapped for the gpu (gpu_alloc_mapped)
+  int mapped;         // that mapping is ours to undo
 } gpu_block;
 
 gpu_block *gpu_alloc(uint32_t size, uint32_t align, int pref);
 void gpu_free(gpu_block *b);
+// pool's full: a bigmem block mapped read-only for the gpu. cpu writes need
+// gpu_mapped_flush() after
+gpu_block *gpu_alloc_mapped(uint32_t size);
+void gpu_mapped_flush(gpu_block *b, uint32_t off, uint32_t size);
 // bigmem's last resort: free space inside existing pool chunks, for the cpu
 void *gxm_borrow(uint32_t size, void **handle);
 void gxm_unborrow(void *handle);
