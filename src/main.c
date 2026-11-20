@@ -9,6 +9,7 @@
 
 #include "android/android.h"
 #include "android/jni.h"
+#include "game/patches.h"
 #include "loader/imports.h"
 #include "loader/so_loader.h"
 #include "util/log.h"
@@ -16,7 +17,7 @@
 
 // newlib heap. the .so images, GPU memory and thread stacks live outside
 // of this, so it can't be the whole budget.
-int _newlib_heap_size_user = 224 * 1024 * 1024;
+int _newlib_heap_size_user = 240 * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 1024 * 1024;
 
 void libc_init(void);
@@ -57,10 +58,14 @@ int main(void) {
 
   need_file(STL_SO_PATH, "libgnustl_shared.so");
   need_file(GAME_SO_PATH, "libnba2k16_clean_opt.so");
+  // not fatal, the game itself bails cleanly without it, but say why
+  if (!file_exists(OBB_FILE))
+    L("WARNING: no game data at %s, the game will exit right after boot", OBB_FILE);
 
   if (so_load(&stl_mod, STL_SO_PATH) < 0) fatal("couldn't load gnustl");
   if (so_load(&game_mod, GAME_SO_PATH) < 0) fatal("couldn't load the game lib");
   if (so_relocate(&stl_mod) < 0 || so_relocate(&game_mod) < 0) fatal("relocation failed");
+  patches_apply(&game_mod);  // text is still RW here
   imports_finalize();
   if (so_finalize(&stl_mod) < 0 || so_finalize(&game_mod) < 0) fatal("couldn't make code executable");
 

@@ -265,10 +265,35 @@ static int apply_rels(so_module *mod, const Elf32_Rel *rels, size_t n) {
   return 0;
 }
 
+// linux maps "kuser helpers" at fixed addresses up at 0xffff0fxx. bits of
+// the game (google play games sdk etc) keep function pointers to them in
+// .data. nothing lives there on the vita, so point them at our own.
+extern void kuser_dmb(void), kuser_cmpxchg(void), kuser_cmpxchg64(void);
+
+static void fix_kuser_pointers(so_module *mod) {
+  static const struct { uint32_t addr; void (*fn)(void); const char *name; } helpers[] = {
+    { 0xFFFF0FA0, kuser_dmb, "dmb" },
+    { 0xFFFF0FC0, kuser_cmpxchg, "cmpxchg" },
+    { 0xFFFF0F60, kuser_cmpxchg64, "cmpxchg64" },
+  };
+  int n[3] = { 0 };
+  for (uint32_t *p = (uint32_t *)ALIGN_UP(mod->data_start, 4); p < (uint32_t *)mod->data_end; p++) {
+    for (int h = 0; h < 3; h++) {
+      if (*p == helpers[h].addr) {
+        *p = (uint32_t)helpers[h].fn;
+        n[h]++;
+      }
+    }
+  }
+  if (n[0] + n[1] + n[2])
+    L("so_relocate: %s: swapped kuser pointers (dmb %d, cmpxchg %d, cmpxchg64 %d)", mod->name, n[0], n[1], n[2]);
+}
+
 int so_relocate(so_module *mod) {
   L("so_relocate: %s", mod->name);
   if (apply_rels(mod, mod->rel, mod->nrel) < 0) return -1;
   if (apply_rels(mod, mod->plt_rel, mod->nplt_rel) < 0) return -1;
+  fix_kuser_pointers(mod);
   L("so_relocate: %s done, %d unresolved", mod->name, mod->n_unresolved);
   return 0;
 }
@@ -332,6 +357,21 @@ uintptr_t so_find_exidx(uintptr_t pc, int *count) {
   }
   *count = (int)m->exidx_count;
   return m->exidx;
+}
+
+void so_backtrace(const char *why) {
+  // poor man's backtrace: anything on the stack that points into a
+  // module's code is probably a return address. good enough to find callers.
+  uintptr_t *sp = __builtin_frame_address(0);
+  int shown = 0;
+  L("backtrace (%s):", why);
+  for (int i = 0; i < 512 && shown < 12; i++) {
+    so_module *m = so_module_for_addr(sp[i]);
+    if (m && sp[i] >= m->text_start && sp[i] < m->text_end) {
+      char w[96];
+      L("  #%d %s", shown++, so_describe(sp[i], w, sizeof(w)));
+    }
+  }
 }
 
 const char *so_describe(uintptr_t addr, char *buf, size_t len) {

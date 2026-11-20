@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "android/jni.h"
+#include "game/patches.h"
 #include "loader/so_loader.h"
 #include "util/abi.h"
 #include "util/log.h"
@@ -105,6 +106,31 @@ static jvalue h_path(jobj *self, const jvalue *a, jmeth *m) {
 }
 static jvalue h_self(jobj *self, const jvalue *a, jmeth *m) { (void)a; (void)m; return (jvalue){ .l = self }; }
 static jvalue h_true(jobj *self, const jvalue *a, jmeth *m) { (void)self; (void)a; (void)m; return (jvalue){ .z = 1 }; }
+static jobj *find_class(const char *name);
+static jvalue h_class_loader(jobj *self, const jvalue *a, jmeth *m) {
+  (void)self; (void)a; (void)m;
+  static jobj *loader;
+  if (!loader) loader = new_obj(K_OBJECT, "java/lang/ClassLoader");
+  return (jvalue){ .l = loader };
+}
+// the obb file is named after this (main.<code>.<package>.obb), v0.0.29 is 29
+static jvalue h_version_code(jobj *self, const jvalue *a, jmeth *m) {
+  (void)self; (void)a; (void)m;
+  return (jvalue){ .i = config_int("version_code", GAME_VERSION_CODE) };
+}
+static jvalue h_version_name(jobj *self, const jvalue *a, jmeth *m) {
+  (void)self; (void)a; (void)m;
+  return (jvalue){ .l = new_string(GAME_VERSION_NAME) };
+}
+// loadClass("com.foo.Bar") -> the jclass for com/foo/Bar
+static jvalue h_load_class(jobj *self, const jvalue *a, jmeth *m) {
+  (void)self; (void)m;
+  const jobj *s = a[0].l;
+  char name[256];
+  snprintf(name, sizeof(name), "%s", is_jobj(s) && s->str ? s->str : "?");
+  for (char *p = name; *p; p++) if (*p == '.') *p = '/';
+  return (jvalue){ .l = find_class(name) };
+}
 
 static const struct { const char *name; const char *sig; jhandler fn; } handlers[] = {
   { "getPackageName", NULL, h_package },
@@ -120,6 +146,13 @@ static const struct { const char *name; const char *sig; jhandler fn; } handlers
   { "exists", "()Z", h_true },
   { "getApplicationContext", NULL, h_self },
   { "getContext", NULL, h_self },
+  { "getClassLoader", NULL, h_class_loader },
+  { "loadClass", NULL, h_load_class },
+  // android 6 runtime permission dance, we always have them
+  { "isPermissionGranted", "()Z", h_true },
+  { "isPermissionReceived", "()Z", h_true },
+  { "getVersionCode", "()I", h_version_code },
+  { "getVersionName", NULL, h_version_name },
 };
 
 static jhandler pick_handler(const char *name, const char *sig) {
@@ -177,8 +210,10 @@ static const char *next_param(const char *p, char *type) {
 #define MAX_ARGS 16
 
 static jvalue invoke(jobj *self, jmeth *m, const jvalue *args) {
-  if (m->calls++ < 4)
-    L("JNI: call %s.%s %s on %s", m->cls, m->name, m->sig, self ? class_of(self) : "static");
+  // first few calls, then every power of two so polling loops still show up
+  int n = ++m->calls;
+  if (n <= 4 || !(n & (n - 1)))
+    L("JNI: call #%d %s.%s %s on %s", n, m->cls, m->name, m->sig, self ? class_of(self) : "static");
   if (m->fn) return m->fn(self, args, m);
   return (jvalue){ .j = 0 };
 }

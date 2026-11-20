@@ -27,8 +27,10 @@ static void mem_add(void *p, size_t req) {
   if (!p) {
     __sync_add_and_fetch(&mem_fails, 1);
     L("malloc(%u) FAILED, live %uK peak %uK", (unsigned)req, mem_live / 1024, mem_peak / 1024);
+    so_backtrace("malloc fail");
     return;
   }
+  if (req >= 32 * 1024 * 1024) so_backtrace("huge alloc");
   int n = __sync_add_and_fetch(&mem_live, (int)malloc_usable_size(p));
   if (n > mem_peak) mem_peak = n;
   if ((int)req > mem_biggest) {

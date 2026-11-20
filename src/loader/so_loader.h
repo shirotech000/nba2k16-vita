@@ -53,5 +53,8 @@ int so_hook(uintptr_t func, uintptr_t dst);
 // exidx lookup for gnustl's unwinder
 uintptr_t so_find_exidx(uintptr_t pc, int *count);
 
+// logs likely return addresses found on the current stack
+void so_backtrace(const char *why);
+
 // pretty "lib+0x1234" for crash logs
 const char *so_describe(uintptr_t addr, char *buf, size_t len);

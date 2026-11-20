@@ -11,6 +11,9 @@
 #define SHACCCG_PATH  "ur0:data/libshacccg.suprx"
 
 #define PACKAGE_NAME  "com.t2ksports.nba2k16android"
+#define GAME_VERSION_CODE 29
+#define GAME_VERSION_NAME "0.0.29"
+#define OBB_FILE      OBB_DIR "/main.29." PACKAGE_NAME ".obb"
 
 // turns an android path into a vita one. returns out.
 char *path_fix(const char *in, char *out, int outlen);

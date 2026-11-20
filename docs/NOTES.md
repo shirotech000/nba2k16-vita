@@ -35,7 +35,7 @@ Running notes on what the game needs and where the port is at. Newest stuff goes
 
 ## Memory
 
-Extended memory mode (`ATTRIBUTE2=12`) with a 224 MB newlib heap. On top of that:
+Extended memory mode (`ATTRIBUTE2=12`) with a 240 MB newlib heap. On top of that:
 - ~41 MB of .so images via kubridge
 - GPU memory: CDRAM first, then LPDDR
 - thread stacks (1 MB default per game thread)
@@ -47,6 +47,24 @@ Whether 2K16 fits at all is the big open question. `malloc` is instrumented (liv
 - No game files, game shader text, or other dumped content goes in git.
 - No code from vitaGL / vitashark / Rinnegatamante's loaders. vitaGL is OK as a behavior reference for shader quirks, but nothing gets lifted.
 
+## Game patches (src/game/patches.c)
+
+Every patch checks the original bytes first.
+
+- `get_global_heap()` @ +0x786A6C: grabs one **400 MB** block for the whole game heap (`mov r1/r2, #0x19000000` at +0x786AA8 / +0x786B3C). We shrink it to `heap - 64MB` (176 MB right now). Override it with `game_heap_mb=` in `ux0:data/nba2k16/config.txt`. Whether the game actually fits in that is unknown until the data loads.
+
+## Other loader-level fixes
+
+- **kuser helpers:** the Google Play Games SDK bits in the game keep function pointers to Linux's kuser helpers (`0xffff0fa0` dmb, `0xffff0fc0` cmpxchg), 19 of each in .data. The loader swaps any such word in a module's data segment for our own versions (src/loader/kuser.S).
+- **OBB name:** comes from `getVersionCode()`, which is 29 for v0.0.29, so the file is `main.29.com.t2ksports.nba2k16android.obb`. Probe order: `/sdcard/` first, then the obb dir.
+
+## Vita3K notes
+
+- kubridge HLE supports reserve/commit/protect. `kuKernelFlushCaches` is a missing NID (harmless there). Only data aborts reach our exception handler.
+- `port.log` loses its tail when Vita3K is killed. `tools/vita3k/run.ps1` reads the `sceClibPrintf` copy out of Vita3K's stdout instead.
+
 ## Log
 
 - **2026-11-20**: Analyzed the binaries and set up the repo. Wrote the loader (kubridge reserve/commit/protect), import registry with trap stubs, bionic shims, fake NativeActivity/looper/input, fake JNI, and curl/ssl stubs. The GLES→GXM layer, GLSL→Cg translator and OpenSL ES are written in parallel.
+- **2026-11-20**: First boots in Vita3K with GL stubbed out. Fixed the 400 MB heap (patch) and the kuser helper crash. JNI needed ClassLoader.loadClass, the permission checks and getVersionCode. Now all 686 ctors run, then `JNI_OnLoad` → `onCreate` → `android_main` thread → full lifecycle → the game looks for the OBB → no OBB → the game asks for the Java expansion downloader → `exit(0)`. **Blocked on game data.**
+- OpenSL: PCM buffer-queue players work. The game also wants an AAC-ADTS decoder player (probably music/commentary streams), which gets refused for now. sceAudiodec can do AAC, that's for later. Took ALC-off and core pinning from PSPMania's audio driver.

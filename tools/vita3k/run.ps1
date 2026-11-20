@@ -1,0 +1,85 @@
+# installs the vpk into vita3k, copies the game libs in, runs it for a bit
+# and prints the tail of port.log.
+#   .\tools\vita3k\run.ps1 -GameFiles C:\path\to\extracted_libs [-Obb C:\path\to\obb_dir] [-Play]
+param(
+    [string]$Vita3KExe = 'C:\Users\Shiro\mbaavita\tools\vita3k\app\Vita3K.exe',
+    [string]$Vpk,
+    [string]$GameFiles,          # folder with libnba2k16_clean_opt.so + libgnustl_shared.so
+    [string]$Obb,                # folder with the .obb file(s), optional
+    [string]$Shacccg = 'C:\Users\Shiro\mbaavita\tools\libshacccg.suprx',
+    [int]$TimeoutSeconds = 40,
+    [int]$TailLines = 80,
+    [switch]$Play                # leave it running in a normal window
+)
+$ErrorActionPreference = 'Stop'
+$titleId = 'NBAK00016'
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+if (-not $Vpk) { $Vpk = Join-Path $repo 'build\nba2k16_vita.vpk' }
+if (-not (Test-Path $Vpk)) { throw "no vpk at $Vpk, build first" }
+if (-not (Test-Path $Vita3KExe)) { throw "vita3k not found: $Vita3KExe" }
+
+# figure out where vita3k keeps its ux0/ur0
+$appDir = Split-Path -Parent $Vita3KExe
+$cfg = Get-Content (Join-Path $appDir 'config.yml') -Raw
+$pref = ([regex]::Match($cfg, '(?m)^pref-path:\s*(.+)$')).Groups[1].Value.Trim()
+if (-not $pref) { $pref = Join-Path $appDir '' }
+$dataDir = Join-Path $pref 'ux0\data\nba2k16'
+New-Item -ItemType Directory -Force -Path $dataDir, (Join-Path $dataDir 'obb'), (Join-Path $pref 'ur0\data') | Out-Null
+
+if ($GameFiles) {
+    foreach ($so in 'libnba2k16_clean_opt.so', 'libgnustl_shared.so') {
+        Copy-Item (Join-Path $GameFiles $so) $dataDir -Force
+    }
+}
+if ($Obb) { Copy-Item (Join-Path $Obb '*.obb') (Join-Path $dataDir 'obb') -Force }
+if ((Test-Path $Shacccg) -and -not (Test-Path (Join-Path $pref 'ur0\data\libshacccg.suprx'))) {
+    Copy-Item $Shacccg (Join-Path $pref 'ur0\data\libshacccg.suprx')
+}
+
+$log = Join-Path $dataDir 'port.log'
+Remove-Item $log -Force -ErrorAction SilentlyContinue
+
+# install (vita3k takes the vpk as a positional arg)
+$out = Join-Path $env:TEMP 'nba2k16-vita3k-install.log'
+$p = Start-Process $Vita3KExe -ArgumentList ('"' + $Vpk + '"') -WorkingDirectory $appDir `
+    -WindowStyle Hidden -PassThru -RedirectStandardOutput $out
+$deadline = (Get-Date).AddSeconds(30)
+$installed = $false
+while ((Get-Date) -lt $deadline) {
+    if ((Test-Path $out) -and ((Get-Content $out -Raw) -match "\[$titleId\] installed successfully")) { $installed = $true; break }
+    if ($p.HasExited) { break }
+    Start-Sleep -Milliseconds 250
+}
+if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+if (-not $installed) { throw "install didn't confirm, check $out" }
+Write-Host "installed $titleId"
+
+# run
+$stdout = Join-Path $env:TEMP 'nba2k16-vita3k-run.log'
+if ($Play) {
+    Start-Process $Vita3KExe -ArgumentList @('-r', $titleId) -WorkingDirectory $appDir | Out-Null
+    Write-Host "running, log: $log"
+    exit 0
+}
+$p = Start-Process $Vita3KExe -ArgumentList @('-r', $titleId) -WorkingDirectory $appDir `
+    -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout
+$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+while ((Get-Date) -lt $deadline -and -not $p.HasExited) { Start-Sleep -Milliseconds 500 }
+$exited = $p.HasExited
+if (-not $exited) { Stop-Process -Id $p.Id -Force }
+
+Write-Host "--- vita3k $(if ($exited) { 'exited on its own' } else { 'killed after timeout' }) ---"
+# vita3k buffers port.log on the host side and loses the end when killed,
+# but every line also goes through sceClibPrintf which lands in its stdout
+$lines = Get-Content $stdout | Select-String 'export_sceClibPrintf\]: (.*)' |
+    ForEach-Object { $_.Matches[0].Groups[1].Value }
+if ($lines) {
+    $lines | Select-Object -Last $TailLines
+} elseif (Test-Path $log) {
+    Get-Content $log -Tail $TailLines
+} else {
+    Write-Host "no log lines, vita3k output tail:"
+    Get-Content $stdout -Tail 40
+}
+# emulator-side trouble worth knowing about
+Get-Content $stdout | Select-String 'PC is|ending the app|NID .* not found' | Select-Object -Last 5
