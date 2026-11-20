@@ -134,7 +134,7 @@ static const struct { unsigned btn; int key; } keymap[] = {
   { SCE_CTRL_LTRIGGER, 102 }, // BUTTON_L1
   { SCE_CTRL_RTRIGGER, 103 }, // BUTTON_R1
   { SCE_CTRL_START,    108 }, // BUTTON_START
-  { SCE_CTRL_SELECT,   109 }, // BUTTON_SELECT
+  { SCE_CTRL_SELECT,   4 },   // KEYCODE_BACK: android back, the game's menus have no on screen one
   { SCE_CTRL_UP,       19 },
   { SCE_CTRL_DOWN,     20 },
   { SCE_CTRL_LEFT,     21 },
