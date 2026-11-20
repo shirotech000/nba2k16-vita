@@ -18,9 +18,9 @@
 // chunks (31MB idle of 55MB in the match load test), and by the time we
 // overflow the game has made its threads, so these can stay small.
 #define GL_RESERVE   (6 * 1024 * 1024)
-#define MAIN_RESERVE (4 * 1024 * 1024)
+#define MAIN_RESERVE (8 * 1024 * 1024)  // thread stacks come from here (hw run: AAC threads failed at 4)
 #define PC_GRAN      (1024 * 1024)       // phycont is 1 MiB granular
-#define PC_RESERVE   (2 * 1024 * 1024)   // gxm's lpddr chunks come from here too
+#define PC_RESERVE   (4 * 1024 * 1024)   // gxm's lpddr chunks come from here too, up to 4MB
 #define MAX_BLOCKS   2048
 
 typedef struct {
@@ -77,6 +77,11 @@ void *bigmem_alloc(size_t n) {
   memset(&fi, 0, sizeof(fi));
   fi.size = sizeof(fi);
   sceKernelGetFreeMemorySize(&fi);
+  // hw has reported user as -2MB once things got tight, don't let that
+  // turn into a huge size_t and wave the reserve checks through
+  if ((int)fi.size_user < 0) fi.size_user = 0;
+  if ((int)fi.size_cdram < 0) fi.size_cdram = 0;
+  if ((int)fi.size_phycont < 0) fi.size_phycont = 0;
 
   SceUID uid = -1;
   size_t sz = ALIGN_UP(n, MAIN_GRAN);

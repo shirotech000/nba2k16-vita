@@ -152,6 +152,22 @@ The game wipes files in what it thinks are android's data dirs on boot. The firs
     - real cube maps, mip chains, sRGB, stencil only where the target has one;
     - **4x MSAA on the main 3D target** (mbaavita-style: sample-mode fragment programs, downscale-on-store color, sample-sized depth twin, +8 MB CDRAM). `msaa=0/2/4`, `msaa_display=1`. **Off by default for now**: with it on, the match load hung at 96% (`malloc(4194315) FAILED`, main + cdram both at their reserves). Turn it back on once textures shrink (ETC2→BC transcoding).
     - bigmem now also takes 1 MB+ blocks from phycont (keeps 2 MB for gxm). The 96% hang had ~8 MB sitting idle in there.
-  - **Open: player skin renders green** (only the skin shader; jerseys/court/UI fine). Bisect switch `cube_dummy=1`.
+  - **Player skin rendered green in Vita3K**: a Vita3K shader recompiler bug, not ours. With a one-component dest mask it only checks swizzle channel 0 for an immediate-bank constant, so `pa0.y = 1 * base.x` reads 0 and red dies. `link_back` patches the gxp (constant copied into channel 0) under Vita3K only; `v3k_gxp_fix=0` turns it off. Real hw never had it. (`cube_dummy=1` ruled out cube maps.)
+  - **Game-side perf leak:** `DeleteFile_LowLevel` retries unlink 33x on any failure and mid match the game sweeps cache files that mostly don't exist (~1100 failed removes/s, each logged). Patched to one try; missing-file unlinks aren't logged past 8.
+  - **Frame timing** in the 5 s monitor: avg frame ms, cpu stalls on the gpu, display queue wait, draws and scenes per frame. `prof=1` also times the draws.
+- **First real hw run (2026-11-20):** loader, relocs, patches and CapUnlocker detection all fine, then a data abort 3.5 s in. Our `so_backtrace` (logging the 176 MB heap alloc) scanned 512 words up from its frame and ran off the top of the thread stack into an unmapped page. Vita3K maps memory past stacks, so it never showed. Now bounded by the stack's memblock.
+  - The eboot loads **0x7f000 above its link address** (extended memory mode). Boot logs `eboot: main @ ...`; subtract `nm`'s address of `main` to get the slide for addr2line. Crash dumps (`ux0:data/psp2core-*.psp2dmp`, gzip'd ELF core) have the real base in their MODULE_INFO note.
+  - hw boot memory: free user 70656 KiB, cdram 114688 KiB, phycont 26624 KiB (288 MB newlib heap already taken). Matches mbaavita's extended-mode numbers.
+  - From mbaavita's hw runs: card io is slow (sceIoOpen/Getstat several ms, per-line open/close ~12 ms), CPU reads from uncached CDRAM are very slow (copy rows to cached ram), `--pic-veneer` keeps thumb->arm stubs pc-relative (ours already were).
+  - Deploying: see VitaDrop notes below.
   - **Screenshots:** `shot.flag` dumps the back buffer, but Vita3K doesn't write rendered frames back to guest memory, so it comes out black there (works on hw). In Vita3K, PrintWindow on the Vita3K window works instead.
 - OpenSL: PCM buffer-queue players work. The game also wants an AAC-ADTS decoder player (probably music/commentary streams), which gets refused for now. sceAudiodec can do AAC, that's for later. Took ALC-off and core pinning from PSPMania's audio driver.
+
+## Real hardware testing (VitaDrop)
+
+The Vita runs VitaDrop, an HTTP server on port 80 (`vitadrop.local`). It only answers while the app is open.
+- Upload: `curl -X POST -T <file> -H "X-File-Name: <name>" -H "X-Upload-Dir: <url-encoded dir>" http://<vita>/api/upload` (raw body; `-T` streams, so the 2 GB OBB works).
+- List: `GET /api/ls?path=<dir>/`. A missing dir also returns `[]`, so look for it in its parent's listing.
+- Download: `GET /api/dl?path=<file>`. Mkdir: `POST /api/mkdir?path=<url-encoded dir>`.
+- First install: VPK to `ux0:data/`, installed by hand in VitaShell. After that, only `ux0:app/NBAK00016/eboot.bin` gets replaced (app closed, no reboot needed). Game data: `ux0:data/nba2k16/` (libs) and `obb/`.
+- Always md5 the readback, push a saved copy of a finished build, keep old eboots for rollback, and pull `port.log` before the next launch (each boot truncates it).

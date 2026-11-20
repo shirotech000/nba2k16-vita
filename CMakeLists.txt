@@ -40,6 +40,9 @@ file(GLOB_RECURSE PORT_SOURCES CONFIGURE_DEPENDS
 )
 
 add_executable(nba2k16 ${PORT_SOURCES})
+# extended memory mode loads the eboot above its link address, so the
+# thumb->arm stubs ld makes must be pc-relative (bit mbaavita on hw)
+target_link_options(nba2k16 PRIVATE -Wl,--pic-veneer)
 
 target_link_libraries(nba2k16
   kubridge_stub

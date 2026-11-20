@@ -88,6 +88,9 @@ int main(void) {
   free(heap_probe);
   log_free_mem("boot");
   L("nba2k16 vita loader, built " __DATE__ " " __TIME__);
+  // the eboot isn't at its link address in extended memory mode. this +
+  // nm gives the slide for symbolizing a crash pc
+  L("eboot: main @ %p", (void *)main);
   if (emu_is_vita3k()) L("vita3k.flag found, running in vita3k");
 
   scePowerSetArmClockFrequency(444);

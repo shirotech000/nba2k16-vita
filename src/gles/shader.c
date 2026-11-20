@@ -1051,8 +1051,10 @@ static int async_ready(void)
   }
   sceKernelCreateLwMutex(&q_lock, "shader_q", 0, 0, NULL);
   q_sema = sceKernelCreateSema("shader_q", 0, 0, 0x7FFFFFFF, NULL);
-  // just under the game's threads (160): uses idle cpu, doesn't starve gameplay
-  SceUID th = sceKernelCreateThread("nba_shaderq", compile_worker, 0xA8, COMPILE_STACK, 0, 0, NULL);
+  // a bit above the game's threads (160). just under them was fine in
+  // vita3k, but real hw schedules by strict priority and the queue sat at
+  // 230+ for a minute. with a warm cache it hardly ever has work anyway
+  SceUID th = sceKernelCreateThread("nba_shaderq", compile_worker, 0x9A, COMPILE_STACK, 0, 0, NULL);
   if (q_sema < 0 || th < 0) {
     L("shader: no compile worker (0x%08X), compiling inline", th);
     return 0;
