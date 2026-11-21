@@ -349,15 +349,49 @@ static int b_clock_gettime(int clk, struct timespec *ts) {
   return 0;
 }
 
+// the game's retry loops sleep through these shims. a thread stuck in one
+// shows up as: same caller, many calls, forever - the caller's address
+// names the loop in the disassembly. the monitor reports the counters
+// each tick and resets them
+static struct { SceUID thid; void *caller; uint32_t calls; } g_sleepers[16];
+static void note_sleep_caller(void *caller) {
+  SceUID me = sceKernelGetThreadId();
+  int slot = -1;
+  for (int i = 0; i < 16; i++) {
+    if (g_sleepers[i].thid == me) { slot = i; break; }
+    if (!g_sleepers[i].thid && slot < 0) slot = i;
+  }
+  if (slot < 0) return;
+  g_sleepers[slot].thid = me;
+  if (!g_sleepers[slot].caller || g_sleepers[slot].caller == caller)
+    g_sleepers[slot].caller = caller;
+  g_sleepers[slot].calls++;
+}
+
+void b_sleep_report(void) {
+  for (int i = 0; i < 16; i++) {
+    if (!g_sleepers[i].thid || !g_sleepers[i].calls) continue;
+    if (g_sleepers[i].calls >= 10)
+      L("sleeper: thid %08X calling from %p (%u calls this window)",
+        g_sleepers[i].thid, g_sleepers[i].caller, g_sleepers[i].calls);
+    g_sleepers[i].calls = 0;
+  }
+}
+
 static int b_nanosleep(const struct timespec *req, struct timespec *rem) {
   SceUInt64 us = (SceUInt64)req->tv_sec * 1000000 + req->tv_nsec / 1000;
+  note_sleep_caller(__builtin_return_address(0));
   sceKernelDelayThread(us > 0xFFFFFFFF ? 0xFFFFFFFF : (SceUInt32)us);
   if (rem) rem->tv_sec = rem->tv_nsec = 0;
   return 0;
 }
 
 // delay 0 doesn't give the core away on hw, equal prio spinners need 1
-static int b_usleep(unsigned us) { sceKernelDelayThread(us ? us : 1); return 0; }
+static int b_usleep(unsigned us) {
+  note_sleep_caller(__builtin_return_address(0));
+  sceKernelDelayThread(us ? us : 1);
+  return 0;
+}
 static int b_sched_yield(void) { sceKernelDelayThread(1); return 0; }
 
 // --- strings that touch floats ---

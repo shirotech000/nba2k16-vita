@@ -187,11 +187,62 @@ typedef struct {
   void *arg;
 } thread_start;
 
+// the game's threads, registered at birth so the monitor can report who's
+// parked. the 97% wait-class: no crash, no failed ask, a gate that never
+// signals - the blocked worker's identity + wait target IS the diagnosis
+#define THREAD_REG_MAX 32
+static struct { SceUID thid; void *entry; } g_treg[THREAD_REG_MAX];
+static int g_treg_n;
+static unsigned char g_clocks[THREAD_REG_MAX][16];
+static int g_parked[THREAD_REG_MAX];
+
 static void *thread_tramp(void *p) {
   thread_start ts = *(thread_start *)p;
   free(p);
+  int slot = __sync_add_and_fetch(&g_treg_n, 1) - 1;
+  if (slot >= 0 && slot < THREAD_REG_MAX) {
+    g_treg[slot].thid = sceKernelGetThreadId();
+    g_treg[slot].entry = ts.fn;
+  }
+  // the game's tramp arg is its VCTHREAD object: [+0x2C] is the thread's
+  // real entry. one line per birth identifies which slot is which - the
+  // async thread's is the context manager's Run (base+0x131E580)
+  if (ts.arg && ((uintptr_t)ts.arg & 3) == 0) {
+    uint32_t fn = *(uint32_t *)((char *)ts.arg + 0x2C);
+    if (fn > 0x80000000)
+      L("threads: birth slot %d real fn %p%s", slot, (void *)(uintptr_t)fn,
+        slot < 0 ? " (registry full)" : "");
+  }
   cpu_place_game_thread();  // core 3 too when CapUnlocker is around
-  return ts.fn(ts.arg);
+  void *ret = ts.fn(ts.arg);
+  if (slot >= 0 && slot < THREAD_REG_MAX)
+    L("threads: exit slot %d entry %p ret %p", slot, g_treg[slot].entry, ret);
+  return ret;
+}
+
+// from the monitor tick: a thread whose run clocks stop moving for 3+
+// ticks is parked - one STUCK line with what it's waiting on. the game's
+// own delay-loop retries keep cycling their clocks, so they never trip
+// this; a gate stuck on a lost signal does. dormant threads print their
+// exit status + real entry instead - a worker that exits mid-load is an
+// event nobody notices otherwise (hw70: two died at 24-29s and the phase
+// they belonged to never completed)
+void b_threads_wait_report(void) {
+  for (int i = 0; i < g_treg_n && i < THREAD_REG_MAX; i++) {
+    if (!g_treg[i].thid) continue;
+    SceKernelThreadInfo ti;
+    memset(&ti, 0, sizeof(ti));
+    ti.size = sizeof(ti);
+    if (sceKernelGetThreadInfo(g_treg[i].thid, &ti) < 0) continue;
+    if (memcmp(g_clocks[i], &ti.runClocks, sizeof(ti.runClocks)) != 0) {
+      memcpy(g_clocks[i], &ti.runClocks, sizeof(ti.runClocks));
+      g_parked[i] = 0;
+      continue;
+    }
+    if (++g_parked[i] == 3)
+      L("threads: slot %d entry %p PARKED: status %u exitStatus %d realEntry %p waitType %u waitId %08X",
+        i, g_treg[i].entry, ti.status, ti.exitStatus, ti.entry, ti.waitType, (unsigned)ti.waitId);
+  }
 }
 
 static volatile int thread_count;
