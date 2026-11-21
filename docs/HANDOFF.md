@@ -1,6 +1,6 @@
 # Handoff: NBA 2K16 Vita port (state as of 2026-11-20)
 
-Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches).
+Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches). The end-to-end porting process is documented outside the repo at `C:\Users\Shiro\Docs\Android-to-Vita-Porting-Playbook.md` (deliberately never committed).
 
 ## Ground rules from the owner
 
@@ -17,6 +17,7 @@ Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches
   - Unreviewed edits from earlier agents are on branch `agent-wip`. Don't merge it blindly.
 - **On the Vita:** only add things under `ux0:data`, and replace `ux0:app/NBAK00016/eboot.bin`. Don't touch tai config, kubridge, ur0 or libshacccg.
 - **Ask before launching or killing Vita3K.**
+- **Grep the session export before any guessing** (owner policy, 2026-11-21): before theorizing about anything — LODs, config, crash causes, game behavior — grep the keywords in `C:\Users\Shiro\Downloads\nbacontext.json` (the owner's full session export, ~88K lines) first; it usually already contains the answer. The lines are huge JSON: use `Select-String` with a context window sliced around each match, not whole-line prints.
 
 ## Where things are
 

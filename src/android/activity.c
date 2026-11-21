@@ -26,6 +26,10 @@ typedef void (*onCreate_fn)(ANativeActivity *, void *saved, size_t saved_size);
 
 void activity_boot(void *onCreate) {
   memset(&g_activity, 0, sizeof(g_activity));
+  // render_scale: the game sizes its targets from the window we hand it
+  extern unsigned g_rw, g_rh;
+  g_window.width = g_rw;
+  g_window.height = g_rh;
   g_activity.callbacks = &callbacks;
   g_activity.vm = jni_vm();
   g_activity.env = jni_env();

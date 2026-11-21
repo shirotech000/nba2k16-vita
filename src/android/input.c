@@ -282,7 +282,9 @@ void input_poll(void) {
     memcpy(prev_axes, m.axes, sizeof(prev_axes));
   }
 
-  // front touch. panel is 1920x1088, screen is 960x544
+  // front touch. panel is 1920x1088, screen is 960x544 - or smaller with
+  // render_scale, the game's window is what the coords map into
+  extern unsigned g_rw, g_rh;
   SceTouchData t;
   memset(&t, 0, sizeof(t));
   sceTouchPeek(SCE_TOUCH_PORT_FRONT, &t, 1);
@@ -294,8 +296,8 @@ void input_poll(void) {
   te.nptr = n;
   for (int i = 0; i < n; i++) {
     te.ids[i] = t.report[i].id;
-    te.x[i] = t.report[i].x / 2.0f;
-    te.y[i] = t.report[i].y / 2.0f;
+    te.x[i] = t.report[i].x / 2.0f * (g_rw / 960.0f);
+    te.y[i] = t.report[i].y / 2.0f * (g_rh / 544.0f);
   }
 
   if (n > 0 && prev_touch_n == 0) {
