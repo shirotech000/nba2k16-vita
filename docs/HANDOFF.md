@@ -1,17 +1,13 @@
-# Handoff: NBA 2K16 Vita port (state as of 2026-11-20)
+# Handoff: NBA 2K16 Vita port (state as of 2026-11-21)
 
-Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches). The end-to-end porting process is documented outside the repo at `C:\Users\Shiro\Docs\Android-to-Vita-Porting-Playbook.md` (deliberately never committed).
+Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches). The end-to-end porting process is documented outside the repo at `C:\Users\Shiro\Docs\Android-to-Vita-Porting-Playbook.md` (deliberately never committed). The full current campaign handoff — progress, goals, and every resource location — is `C:\Users\Shiro\Docs\HANDOFF-2026-11-21.md` (also outside the repo).
 
 ## Ground rules from the owner
 
 - **No code from vitaGL or any other Rinnegatamante project.** vitaGL may be read to understand GLSL handling; lift nothing. kubridge is fine. Graphics are native sceGxm.
 - **Repo is public, but users must supply their own APK/OBB.** Never commit game files or anything derived from them: compiled shader caches, shader source, textures.
 - **Comments:** casual, short.
-- **Commit trailer:**
-  ```
-  Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01BdJ3Tv4meJizzjqTaZYFve
-  ```
+- **Commit trailer: none.** Owner decision (2026-11-21): commits carry no Co-Authored-By and no session link; they are authored under the git identity already configured in the repo. Older commits in history carry a Claude trailer — leave history as is.
 - **One owner edits the repo.** Other agents are read-only, with output only under `%TEMP%\agent_*`.
   - Before every build, run `git status` and confirm every modified file is yours.
   - Unreviewed edits from earlier agents are on branch `agent-wip`. Don't merge it blindly.
@@ -23,13 +19,16 @@ Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches
 
 | What | Where |
 |---|---|
-| Repo | `C:\Users\Shiro\nba2k16` (github.com/shirotech000/nba2k16-vita, branch `main`) |
-| Build | `wsl -e bash -lc 'cd /mnt/c/Users/Shiro/nba2k16 && bash build.sh'`, output `build/nba2k16_vita.vpk` + `build/eboot.bin` (ELF `build/nba2k16`). vitasdk is in WSL at `/usr/local/vitasdk`. |
-| Game files (user-supplied, gitignored) | `gamefiles/libnba2k16_clean_opt.so`, `gamefiles/libgnustl_shared.so`, `gamefiles/obb/main.29.com.t2ksports.nba2k16android.obb` |
-| Vita3K | `C:\Users\Shiro\mbaavita\tools\vita3k\app\Vita3K.exe`, profile `...\vita3k\profile\Vita3K\ux0\data\nba2k16\`. Run with `tools/vita3k/run.ps1 -Play` after setting `NBA_VITA3K` / `NBA_SHACCCG=C:\Users\Shiro\mbaavita\tools\libshacccg.suprx`. |
-| Hardware logs | `%TEMP%\claude\408a5b75635925ce\dd26b651-...\scratchpad\hw1..hw13\port.log` (session scratchpad, may get cleaned) |
-| Saved eboots/ELFs per build | same scratchpad: `eboot_<hash>.bin`, `nba2k16_<hash>.elf` |
-| Analysis reports (read-only agents) | `%TEMP%\agent_nba2k16_analysis\report.md` (+ `TASK1-6.md`), `%TEMP%\agent_shadersrc\report.md`, `%TEMP%\agent_zerocopy\report.md` |
+| Repo | `C:\Users\Shiro\nba2k16` (github.com/shirotech000/nba2k16-vita, branch `main`, HEAD `ab1a1ca`). `AGENTS.md` and the session transcript txt stay untracked — never stage them |
+| **Session export — grep FIRST before any guessing** | `C:\Users\Shiro\Downloads\nbacontext.json` (15.1 MB, 2,352 msgs as of 11-21 9:23 PM; re-exported often). Giant JSON lines: `Select-String` + slice ~400 chars of context around each match |
+| Build | `wsl -e bash -lc 'cd /mnt/c/Users/Shiro/nba2k16 && bash build.sh'`, output `build/nba2k16_vita.vpk` + `build/eboot.bin` (ELF `build/nba2k16`). vitasdk is in WSL at `/usr/local/vitasdk`. Run `git status` before every build |
+| Game files (user-supplied, gitignored) | `gamefiles/libnba2k16_clean_opt.so`, `gamefiles/libgnustl_shared.so`, `gamefiles/obb/main.29.com.t2ksports.nba2k16android.obb`; source zip `com.t2ksports.nba2k16android.zip`; disassembly `C:\Users\Shiro\nba2k16_GLM\game.dis` |
+| Private archive (NEVER committed into the repo) | `C:\Users\Shiro\nba2k16_GLM\` — campaign `HANDOFF.md`, `METHODOLOGY.md`, eboot/ELF ladder `eboot_<hash>*.bin` / `nba2k16_<hash>*.elf` (latest: `eboot_ab1a1ca_rewrite.bin`, md5 `19525D68B922D5B99519E72F6598A81E`), hardware logs `hw1..hw87\port.log`, pristine OBB `hw61\clean_obb\main.29...obb`, dieted backup `hw61\clean_obb\vita_obb_dieted_backup.obb` (md5 ee2b6bd7), `hw61\v3sim\`, `hw61\donors\` |
+| Live tooling | `C:\Users\Shiro\Docs\Android_Tooling\` (see its README.md; diet-pipeline has `resize_diet.py`, `diet_3337.py`, `RESIZE_DIET.md`) |
+| Porting docs (never committed) | `C:\Users\Shiro\Docs\Android-to-Vita-Porting-Playbook.md`, `Android-to-Vita-Knowledge-Base.md`, `HANDOFF-2026-11-21.md` |
+| Vita3K | `C:\Users\Shiro\mbaavita\tools\vita3k\app\Vita3K.exe`, profile `...\vita3k\profile\Vita3K\ux0\data\nba2k16\` (OBB at `obb\main.29...obb`). Ask before launch/kill; a locked-up emulator may be killed (clear `*.compiling` after). Delete `...\app\cache\shaders\NBAK00016\eboot.bin\pipeline-cache-vk*.dat` after a corrupted-cache crash. `libshacccg.suprx` in `C:\Users\Shiro\mbaavita\tools\` |
+| Hardware logs / eboot ladder | pulls land in `C:\Users\Shiro\nba2k16_GLM\hwNN\port.log` (pull `ux0:data/nba2k16/port.log` before each boot — it truncates); eboots in the GLM root |
+| Analysis reports (read-only agents) | `%TEMP%\agent_nba2k16_analysis\report.md` (+ `TASK1-6.md`), `%TEMP%\agent_shadersrc\report.md`, `%TEMP%\agent_zerocopy\report.md`, `%TEMP%\agent_resize\` (resize donors), `%TEMP%\agent_ladder\`; subagent transcripts in `~/.local/share/opencode/opencode.db` (`session_v2`/`session_message`) |
 
 ## Real hardware (VitaDrop)
 
@@ -47,9 +46,14 @@ Read this first, then `docs/NOTES.md` (deeper history, ABI notes, debug switches
   - a warm shader cache copied from Vita3K (`shadercache/*.gxp`);
   - no `config.txt`.
 
-## Current state
+## Current state (2026-11-21, build ab1a1ca)
 
-The Vita and main run the same code: build **8355718**, which main matches as c64b14d.
+HEAD is **ab1a1ca** — the `src/obb_diet.c` rewrite (full from-scratch OBB patcher
+on the validated grammar: strict parse, mip-drop with the complete b1 rebase
+(record payload_offs + head descriptor region with the packed-field guard +
+b0 LOD-bank pointers into the tail span), SCNE-archive opt-out, verify-before-
+write, donor channel kept). Eboot md5 `19525D68B922D5B99519E72F6598A81E`,
+saved in the GLM ladder as `eboot_ab1a1ca_rewrite.bin`.
 
 **What works on hardware:**
 - Boot, intro, menus and a quick match, including loading into the match.
@@ -58,10 +62,21 @@ The Vita and main run the same code: build **8355718**, which main matches as c6
 - Player heads render.
 - Audio: PCM and AAC music both play.
 
+**Current wall:** `malloc(2716532887)` (0xA1EB0097) at 59% of the match load with
+the v3-dieted OBB (reproduces in Vita3K; not present on pristine OBB in hw83).
+Path: async loader → `VCSTATICCONTEXT::Create` → `VCTEXTURE_RESOURCEHANDLER::Init2`
+→ `VCTexture_MakeAbsoluteWithVramOffsetTranslation` — a corrupted/stale meta
+field read as a size. The rewrite removes the whole corruption class; next step
+is the pristine-OBB + new-diet test in Vita3K, then hardware (see the outside
+handoff `C:\Users\Shiro\Docs\HANDOFF-2026-11-21.md` §9).
+
 **Still broken:**
-1. **Hair renders wrong, there's no crowd, and the hoops are untextured and look like they float.** Cause: about 99 textures (mostly 512×512 and 256×256 with mips, 16-bit and RGBA8) fail `gpu_alloc` at match load (`tex: OOM ... gxm fmt`), and they draw as a white 1×1 fallback. Total memory is simply exhausted.
-2. **First boot on a fresh install has no shader cache.** The ~480 compiles then make the intro lag and draws get skipped until they finish. Your Vita only works because Vita3K's compiled cache was copied over, and that can't be shipped.
-3. **In-match frame rate is about 40 fps.** The CPU-bound per-draw path is the cause; see the fps plan below.
+1. **Hair renders wrong, crowd missing on some profiles, hoops untextured.** ~99
+   textures (512²/256² mipped) fail `gpu_alloc` at match load → white 1×1
+   fallback. Memory is simply exhausted. Billboard crowds (CROWDLOD=0 +
+   CROWD2DLOD on) are the sanctioned look.
+2. **First boot on a fresh install has no shader cache** (~480 compiles lag).
+3. **In-match frame rate ~40 fps** — CPU-bound per-draw path, see below.
 
 ## Memory architecture (the main battle)
 
