@@ -166,9 +166,31 @@ static int sce_flags(int f) {
   return o;
 }
 
+// cfg_lock (default on): the game's settings-save once poisoned our
+// hard-coded low-end profile - our quality_max test hooks fed it max
+// LODs and it wrote them into its own Config.cfg. writes, renames-over
+// and deletes of that file land in a scratch copy instead: the game
+// "saves" happily, its reads keep seeing ours. cfg_lock=0 turns it off
+static int cfg_guard(char *fixed, size_t cap) {
+  static int on = -1;
+  if (on < 0) {
+    extern int config_int(const char *key, int def);
+    on = config_int("cfg_lock", 1);
+  }
+  if (!on) return 0;
+  static const char cfg[] = DATA_PATH "/internal/files/Config.cfg";
+  size_t n = sizeof(cfg) - 1;
+  if (strncmp(fixed, cfg, n) || fixed[n]) return 0;
+  strncat(fixed, ".game", cap - strlen(fixed) - 1);
+  return 1;
+}
+
 static int b_open(const char *path, int flags, ...) {
   char fixed[512];
   if (path_fix_checked("open", path, fixed, sizeof(fixed)) < 0) return -1;
+  if (((flags & 3) || (flags & B_O_CREAT) || (flags & B_O_TRUNC)) &&
+      cfg_guard(fixed, sizeof(fixed)))
+    L("cfg_lock: game write to Config.cfg -> scratch");
   SceUID uid = sceIoOpen(fixed, sce_flags(flags), 0666);
   int fd = uid < 0 ? sce_fail(uid) : fd_alloc(uid);
   if (uid >= 0 && fd < 0) {
@@ -349,6 +371,19 @@ static int b_rmdir(const char *path) {
 static int b_unlink(const char *path) {
   char fixed[512];
   if (path_fix_checked("unlink", path, fixed, sizeof(fixed)) < 0) return -1;
+  // the guarded config: the game believes the delete, the file stays
+  {
+    static const char cfg[] = DATA_PATH "/internal/files/Config.cfg";
+    static int on = -1;
+    if (on < 0) {
+      extern int config_int(const char *key, int def);
+      on = config_int("cfg_lock", 1);
+    }
+    if (on && !strncmp(fixed, cfg, sizeof(cfg) - 1) && !fixed[sizeof(cfg) - 1]) {
+      L("cfg_lock: game unlink of Config.cfg ignored");
+      return 0;
+    }
+  }
   int r = sceIoRemove(fixed);
   // the game sweeps cache files that mostly aren't there, keep a few of those
   static int missing;
@@ -365,6 +400,9 @@ static int b_rename(const char *a, const char *b) {
   char fa[512], fb[512];
   if (path_fix_checked("rename", a, fa, sizeof(fa)) < 0 ||
       path_fix_checked("rename", b, fb, sizeof(fb)) < 0) return -1;
+  // the guarded config: a rename-over lands on the scratch instead
+  if (cfg_guard(fb, sizeof(fb)))
+    L("cfg_lock: game rename over Config.cfg -> scratch");
   int r = sceIoRename(fa, fb);
   L("rename(%s -> %s) -> 0x%X", fa, fb, r < 0 ? r : 0);
   return r < 0 ? sce_fail(r) : 0;

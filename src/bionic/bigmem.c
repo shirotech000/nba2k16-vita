@@ -102,7 +102,9 @@ static size_t main_live, cdram_live;
 
 // urgent = the caller is about to hand the game a NULL (which it crashes
 // on). then the reserves shrink to small floors: a texture or thread
-// failing later beats a crash right now
+// failing later beats a crash right now. urgent_no_floor=1 takes that all
+// the way: the load tail died with user 2.06MB free, a 682K ask refused
+// only because of this 2MB floor
 #define MAIN_FLOOR  (2 * 1024 * 1024)
 #define PC_FLOOR    0                    // gxm's own chunks are 2MB, a 1MB floor saved nothing
 #define CDRAM_FLOOR (256 * 1024)
@@ -122,9 +124,15 @@ void *bigmem_alloc_ex(size_t n, int urgent) {
 
 static void *bigmem_alloc_inner(size_t n, int urgent, int no_release) {
   if (!ready) return NULL;
-  const size_t main_res = urgent ? MAIN_FLOOR : MAIN_RESERVE;
+  static int zero_floor = -1;
+  if (zero_floor < 0) {
+    extern int config_int(const char *key, int def);
+    zero_floor = config_int("urgent_no_floor", 0);
+    if (zero_floor) L("bigmem: urgent asks ignore the last floors (urgent_no_floor=1)");
+  }
+  const size_t main_res = urgent ? (zero_floor ? 0 : MAIN_FLOOR) : MAIN_RESERVE;
   const size_t pc_res = urgent ? PC_FLOOR : PC_RESERVE;
-  const size_t gl_res = urgent ? CDRAM_FLOOR : GL_RESERVE;
+  const size_t gl_res = urgent ? (zero_floor ? 0 : CDRAM_FLOOR) : GL_RESERVE;
 
   SceKernelFreeMemorySizeInfo fi;
   memset(&fi, 0, sizeof(fi));
