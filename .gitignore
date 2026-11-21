@@ -25,3 +25,6 @@ dumps/
 *.dmp
 __pycache__/
 *.zip
+
+# docs are private - kept outside the repo (C:\Users\Shiro\Docs\repo-docs\), never committed
+docs/
