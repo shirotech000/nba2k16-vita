@@ -118,8 +118,8 @@ int main(void) {
   need_file(STL_SO_PATH, "libgnustl_shared.so");
   need_file(GAME_SO_PATH, "libnba2k16_clean_opt.so");
   // not fatal, the game itself bails cleanly without it, but say why
-  if (!file_exists(OBB_FILE))
-    L("WARNING: no game data at %s, the game will exit right after boot", OBB_FILE);
+  if (!file_exists(obb_resolve()))
+    L("WARNING: no game data at %s, the game will exit right after boot", obb_resolve());
 
   if (so_load(&stl_mod, STL_SO_PATH) < 0) fatal("couldn't load gnustl");
   if (so_load(&game_mod, GAME_SO_PATH) < 0) fatal("couldn't load the game lib");
@@ -135,6 +135,12 @@ int main(void) {
 
   log_free_mem("before gfx_init");
   if (gfx_init) gfx_init();
+  {
+    // after the display's up: the diet's first-boot pass draws its own
+    // progress instead of six minutes of black
+    extern void obb_diet_run(void);
+    obb_diet_run();
+  }
   extern void bootscreen_run(void) __attribute__((weak));
   if (bootscreen_run) bootscreen_run();   // "preparing for first launch" if shaders are missing
   {

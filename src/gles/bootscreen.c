@@ -65,9 +65,15 @@ static const uint8_t *glyph_rows(char c)
 // not scissored clears: gxm's region clip is 32x32-tile granular, which
 // turned every font pixel into a block on hw
 void gl_fill_rect(int x, int y, int w, int h, float r, float g, float b);
+
+// render_scale: the ui keeps its 960x544 layout coords, rect() scales
+// them into the small target's space (glyph squares and all)
+static int sx(int v) { extern unsigned g_rw; return v * (int)g_rw / 960; }
+static int sy(int v) { extern unsigned g_rh; return v * (int)g_rh / 544; }
+
 static void rect(int x, int y, int w, int h, float r, float g, float b)
 {
-  gl_fill_rect(x, y, w, h, r, g, b);
+  gl_fill_rect(sx(x), sy(y), sx(w), sy(h), r, g, b);
 }
 
 static int text_w(const char *s, int scale) { return (int)strlen(s) * 6 * scale - scale; }
@@ -136,6 +142,32 @@ static void draw_frame(uint32_t done, uint32_t total)
   char line[64];
   snprintf(line, sizeof(line), "COMPILING SHADERS  %u / %u", (unsigned)done, (unsigned)total);
   text_c(line, 320, 2, 0.70f, 0.73f, 0.80f);
+  text_c("THIS ONLY HAPPENS ONCE PER INSTALL OR UPDATE", 470, 2, 0.40f, 0.43f, 0.50f);
+
+  gxm_swap();
+}
+
+// generic first-boot progress frame, shared with the diet's pass: same
+// look as the shader screen, caller supplies the header and counter line
+void bootscreen_progress(const char *header, const char *line, uint32_t done, uint32_t total)
+{
+  // background: dark blue to near black
+  const int bands = 34;
+  for (int i = 0; i < bands; i++) {
+    float t = (float)i / (bands - 1);
+    rect(0, i * SCR_H / bands, SCR_W, SCR_H / bands + 1,
+         0.07f - 0.05f * t, 0.09f - 0.065f * t, 0.15f - 0.11f * t);
+  }
+  rect(SCR_W / 2 - 40, 150, 80, 3, 0.25f, 0.55f, 1.0f);
+  text_c(header, 180, 4, 0.95f, 0.96f, 0.98f);
+
+  const int bx = 180, by = 280, bw = SCR_W - 360, bh = 18;
+  rrect(bx, by, bw, bh, 0.15f, 0.17f, 0.23f);
+  if (total) {
+    int fw = (int)((uint64_t)bw * done / total);
+    if (fw >= bh) rrect(bx, by, fw, bh, 0.25f, 0.55f, 1.0f);
+  }
+  if (line) text_c(line, 320, 2, 0.70f, 0.73f, 0.80f);
   text_c("THIS ONLY HAPPENS ONCE PER INSTALL OR UPDATE", 470, 2, 0.40f, 0.43f, 0.50f);
 
   gxm_swap();
