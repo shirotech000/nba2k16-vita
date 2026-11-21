@@ -31,6 +31,8 @@
 
 // turns an android path into a vita one. returns out.
 char *path_fix(const char *in, char *out, int outlen);
+// the first *.obb in the obb dir - answers for any obb name the game asks
+const char *obb_resolve(void);
 // 1 if a fixed path has a ':' anywhere but right after the device name
 int path_is_bad(const char *p);
 // path_fix, but bad paths get logged + refused: -1 with errno = ENOENT.

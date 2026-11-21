@@ -385,6 +385,17 @@ void so_backtrace(const char *why) {
       L("  #%d %s", shown++, so_describe(sp[i], w, sizeof(w)));
     }
   }
+  if (!shown) {
+    // nothing tracked on the stack: the caller is an untracked module
+    // (sceShaccCg's compiler asks landed here). raw thumb return
+    // addresses beat the empty backtraces the tail runs printed
+    for (int i = 0; i < n && shown < 8; i++)
+      if (sp[i] >= 0x70000000u && (sp[i] & 1)) {
+        L("  raw %08X", (unsigned)sp[i]);
+        shown++;
+      }
+  }
+  if (!shown) L("  (no code pointers on the stack)");
 }
 
 const char *so_describe(uintptr_t addr, char *buf, size_t len) {

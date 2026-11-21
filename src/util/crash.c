@@ -2,6 +2,7 @@
 // than a raw coredump address.
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <kubridge.h>
 
@@ -47,6 +48,31 @@ static int sp_ok(SceUInt32 sp, int thid) {
   return sp >= lo && sp < hi && hi - sp >= 16 * 4;
 }
 
+// dump memory at a fault-time register value, if it's actually mapped.
+// the memblock query is the safe probe: no second fault mid-dump
+static SceKernelMemBlockInfo mb;
+static void dump_words(const char *tag, SceUInt32 a, int words) {
+  mb.size = sizeof(mb);
+  if (a < 0x1000 || (a & 3) || sceKernelGetMemBlockInfoByAddr((void *)(uintptr_t)a, &mb) < 0) {
+    sceClibSnprintf(cbuf, sizeof(cbuf), "  mem[%s] 0x%08X unmapped\n", tag, a);
+    out();
+    return;
+  }
+  SceUInt32 lo = (SceUInt32)(uintptr_t)mb.mappedBase, hi = lo + (SceUInt32)mb.mappedSize;
+  if (a < lo) return;
+  if ((SceUInt64)a + (SceUInt64)words * 4 > hi) words = (hi - a) / 4;
+  if (words <= 0) return;
+  const SceUInt32 *p = (const SceUInt32 *)(uintptr_t)a;
+  for (int i = 0; i < words; i += 4) {
+    if (words - i >= 4)
+      sceClibSnprintf(cbuf, sizeof(cbuf), "  mem[%s]+%03X %08X %08X %08X %08X\n",
+                      tag, i * 4, p[i], p[i + 1], p[i + 2], p[i + 3]);
+    else
+      sceClibSnprintf(cbuf, sizeof(cbuf), "  mem[%s]+%03X %08X\n", tag, i * 4, p[i]);
+    out();
+  }
+}
+
 static void on_exception(KuKernelExceptionContext *c) {
   int me = sceKernelGetThreadId();
   if (!__sync_bool_compare_and_swap(&crash_thid, 0, me)) {
@@ -80,6 +106,17 @@ static void on_exception(KuKernelExceptionContext *c) {
     sceClibSnprintf(cbuf, sizeof(cbuf), "  (sp looks bad, not reading the stack)\n");
     out();
   }
+  // live struct pointers at the fault: r2 is usually the deref that died
+  // (prints "unmapped" here), r0/r3/r11 are typically the owner, the table
+  // and the record of whatever walk blew up. r8/r12 joined for the index
+  // hunt: the index header and the sorted-table's raw slots, plus whatever
+  // allocation bytes follow them
+  dump_words("r2", c->r2, 1);
+  dump_words("r0", c->r0, 0x12);
+  dump_words("r3", c->r3, 0x48);
+  dump_words("r11", c->r11, 0x0A);
+  dump_words("r8", c->r8, 0x0C);
+  dump_words("r12", c->r12, 0x10);
   // returning would just re-run the faulting insn, so bail
   sceKernelExitProcess(0);
 }

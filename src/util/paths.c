@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
 #include "loader/so_loader.h"
 #include "util/log.h"
@@ -33,12 +34,43 @@ char *path_fix(const char *in, char *out, int outlen) {
     size_t n = strlen(path_map[i].from);
     if (!strncmp(in, path_map[i].from, n) && (in[n] == '/' || in[n] == 0)) {
       snprintf(out, outlen, "%s%s", path_map[i].to, in + n);
+      // an obb is an obb: the game builds main.<code>.<pkg>.obb from its
+      // version, but a dead game's files get renamed. whatever *.obb is in
+      // the folder answers any obb-shaped ask
+      size_t dl = strlen(OBB_DIR);
+      size_t ol = strlen(out);
+      if (ol > dl + 4 && !strncmp(out, OBB_DIR, dl) && out[dl] == '/' &&
+          !strcasecmp(out + ol - 4, ".obb"))
+        snprintf(out, outlen, "%s", obb_resolve());
       return out;
     }
   }
   // anything else absolute goes under root/, never next to our own files
   snprintf(out, outlen, "%s/root%s", DATA_PATH, in);
   return out;
+}
+
+// first *.obb in the obb dir, cached. falls back to the default name so
+// the boot warning still points somewhere sensible
+static char g_obb[96];
+const char *obb_resolve(void) {
+  if (g_obb[0]) return g_obb;
+  SceUID d = sceIoDopen(OBB_DIR);
+  if (d >= 0) {
+    SceIoDirent e;
+    memset(&e, 0, sizeof(e));
+    while (sceIoDread(d, &e) > 0) {
+      size_t n = strnlen(e.d_name, sizeof(e.d_name));
+      if (n > 4 && !strcasecmp(e.d_name + n - 4, ".obb")) {
+        snprintf(g_obb, sizeof(g_obb), "%s/%s", OBB_DIR, e.d_name);
+        break;
+      }
+    }
+    sceIoDclose(d);
+  }
+  if (!g_obb[0]) snprintf(g_obb, sizeof(g_obb), "%s", OBB_FILE);
+  L("obb: resolved %s", g_obb);
+  return g_obb;
 }
 
 int path_is_bad(const char *p) {
