@@ -253,6 +253,19 @@ typedef struct {
 extern clear_prog_t CLR;
 SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fmt);
 
+// upscale shader (ours too): stretches the small game target over the
+// native back buffer at flip, render_scale < 100
+typedef struct {
+  SceGxmShaderPatcherId vid, fid;
+  SceGxmProgram *vgxp, *fgxp;
+  SceGxmVertexProgram *vp;
+  SceGxmFragmentProgram *fp;   // one: uchar4, full mask, the display target
+  const SceGxmProgramParameter *u_depth, *u_tex;
+  int tex_unit;
+  int ok;
+} scale_prog_t;
+extern scale_prog_t SCL;
+
 // ---------------------------------------------------------------- state
 typedef struct {
   int enabled;

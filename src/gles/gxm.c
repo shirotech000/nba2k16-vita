@@ -3,6 +3,7 @@
 #include <kubridge.h>
 #include <psp2/common_dialog.h>
 #include "gles/gxm.h"
+#include "gles/gl_internal.h"
 #include "util/paths.h"
 
 #include <stdio.h>
@@ -856,6 +857,13 @@ uint32_t gxm_defer_drain(void)
     if (g_def[(g_def_head + i) % g_def_cap].scene > want) want = g_def[(g_def_head + i) % g_def_cap].scene;
   pool_unlock();
   if (!n) return 0;
+  // don't wait for the scene that's open right now: it can only retire at
+  // the next flip, and the asker blocking here is often why there's no
+  // flip coming (hw56: the match's second phase crawled at one ask per 6s
+  // because every ask drained on the unflipped scene 9573). the wait was
+  // never load-bearing - the 82% wall it seemed to help was the maxed
+  // LODs in the game's own config all along
+  if (g_in_scene && want >= g_scene_ctr) want = 0;
   int spins = 0;
   while (!gxm_scene_done(want)) {
     sceKernelDelayThread(500);
@@ -864,6 +872,7 @@ uint32_t gxm_defer_drain(void)
       break;
     }
   }
+  uint32_t freed = 0;
   pool_lock();
   while (g_def_count) {
     deferred_t *d = &g_def[g_def_head];
@@ -872,10 +881,11 @@ uint32_t gxm_defer_drain(void)
     void *arg = d->arg;
     g_def_head = (g_def_head + 1) % g_def_cap;
     g_def_count--;
-    fn(arg);
+    fn(arg);   // gpu_free: re-takes the pool lock, that's fine, it's recursive
+    freed++;
   }
   pool_unlock();
-  return n;
+  return freed;   // what actually got freed, not what was still pending
 }
 
 // ============================================================ transient ring
@@ -1131,6 +1141,12 @@ void gxm_finish(void)
 
 typedef struct { void *addr; } flip_data;
 
+unsigned g_rw = SCREEN_W, g_rh = SCREEN_H;
+static SceGxmColorSurface g_game_surf;          // the small game target
+static gpu_block *g_game_mem;
+static SceGxmDepthStencilSurface g_game_depth;
+static gpu_block *g_game_depth_mem;
+
 static memblk g_disp_mb[DISPLAY_BUFFERS];
 static SceGxmColorSurface g_disp_surf[DISPLAY_BUFFERS];
 static SceGxmSyncObject *g_disp_sync[DISPLAY_BUFFERS];
@@ -1160,6 +1176,17 @@ void gxm_set_vsync(int interval) { g_vsync = interval < 0 ? 0 : interval; }
 
 void gxm_display_target(gxm_target *out)
 {
+  if (g_rw != SCREEN_W) {
+    // render_scale: the game's default framebuffer is the small target,
+    // gxm_swap upscales it over the back buffer before the flip
+    out->color = &g_game_surf;
+    out->depth = &g_game_depth;
+    out->w = g_rw;
+    out->h = g_rh;
+    out->sync = g_disp_sync[g_back];
+    out->msaa = SCE_GXM_MULTISAMPLE_NONE;
+    return;
+  }
   out->color = &g_disp_surf[g_back];
   out->depth = &g_disp_depth;
   out->w = SCREEN_W;
@@ -1240,6 +1267,70 @@ static void common_dialog_update(void)
   if (r < 0 || n < 3) { if (n++ < 12) L("gxm: sceCommonDialogUpdate -> 0x%08X", r); }
 }
 
+// render_scale: stretch the small game target over the back buffer. runs
+// after the game's last scene, before the flip; the osk already drew into
+// the small target with the game, the system dialog draws after us
+static void upscale_pass(void)
+{
+  extern scale_prog_t SCL;
+  if (!g_game_mem || !SCL.ok) return;
+  gxm_target t;
+  memset(&t, 0, sizeof(t));
+  t.color = &g_disp_surf[g_back];
+  t.depth = &g_disp_depth;
+  t.w = SCREEN_W;
+  t.h = SCREEN_H;
+  t.sync = g_disp_sync[g_back];
+  gxm_begin_scene(&t, 0);
+  if (!g_in_scene) return;
+  SceGxmContext *c = gxm_ctx;
+  sceGxmSetViewport(c, SCREEN_W * 0.5f, SCREEN_W * 0.5f, SCREEN_H * 0.5f, SCREEN_H * 0.5f, 0.5f, 0.5f);
+  sceGxmSetRegionClip(c, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, SCREEN_W - 1, SCREEN_H - 1);
+  sceGxmSetCullMode(c, SCE_GXM_CULL_NONE);
+  sceGxmSetFrontPolygonMode(c, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+  sceGxmSetBackPolygonMode(c, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+  sceGxmSetFrontFragmentProgramEnable(c, SCE_GXM_FRAGMENT_PROGRAM_ENABLED);
+  sceGxmSetBackFragmentProgramEnable(c, SCE_GXM_FRAGMENT_PROGRAM_ENABLED);
+  sceGxmSetFrontDepthFunc(c, SCE_GXM_DEPTH_FUNC_ALWAYS);
+  sceGxmSetBackDepthFunc(c, SCE_GXM_DEPTH_FUNC_ALWAYS);
+  sceGxmSetFrontDepthWriteEnable(c, SCE_GXM_DEPTH_WRITE_DISABLED);
+  sceGxmSetBackDepthWriteEnable(c, SCE_GXM_DEPTH_WRITE_DISABLED);
+  sceGxmSetFrontStencilFunc(c, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                            SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0);
+  sceGxmSetBackStencilFunc(c, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                           SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0);
+  SceGxmTexture tex;
+  sceGxmTextureInitLinear(&tex, g_game_mem->ptr, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, g_rw, g_rh, 0);
+  sceGxmTextureSetMinFilter(&tex, SCE_GXM_TEXTURE_FILTER_LINEAR);
+  sceGxmTextureSetMagFilter(&tex, SCE_GXM_TEXTURE_FILTER_LINEAR);
+  sceGxmSetVertexProgram(c, SCL.vp);
+  sceGxmSetFragmentProgram(c, SCL.fp);
+  void *ub;
+  if (sceGxmReserveVertexDefaultUniformBuffer(c, &ub) >= 0) {
+    float z = 0.5f;
+    sceGxmSetUniformDataF(ub, SCL.u_depth, 0, 1, &z);
+  }
+  sceGxmSetFragmentTexture(c, (unsigned)SCL.tex_unit, &tex);
+  float *v = ring_alloc(16 * sizeof(float), 16);
+  uint16_t *idx = ring_alloc(4 * sizeof(uint16_t), 4);
+  if (v && idx) {
+    // same y convention as gl_fill_rect: y=-1 is row 0, matching the
+    // game's content in the small buffer. indices must live in gpu
+    // memory, the ring is that
+    const float q[16] = {
+      -1.0f, -1.0f, 0.0f, 0.0f,
+       1.0f, -1.0f, 1.0f, 0.0f,
+      -1.0f,  1.0f, 0.0f, 1.0f,
+       1.0f,  1.0f, 1.0f, 1.0f,
+    };
+    memcpy(v, q, sizeof(q));
+    idx[0] = 0; idx[1] = 1; idx[2] = 2; idx[3] = 3;
+    sceGxmSetVertexStream(c, 0, v);
+    sceGxmDraw(c, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, idx, 4);
+  }
+  gxm_end_scene();
+}
+
 void gxm_swap(void)
 {
   if (!g_ready) return;
@@ -1249,7 +1340,6 @@ void gxm_swap(void)
   // few hundred frames in (past boot, all game threads exist by then)
   if (g_frame == 300) { extern void cpu_pin_render_thread(void); cpu_pin_render_thread(); }
   gxm_end_scene();
-  if (!g_dry_run) maybe_screenshot();
 
   if (g_dry_run) {
     // no flip, just keep the game's frame pacing roughly where vsync had it
@@ -1260,6 +1350,8 @@ void gxm_swap(void)
     g_ring_used = g_ring_pending = g_ring_head = 0;  // the gpu never reads it
     g_mark_count = 0;
   } else {
+    if (g_rw != SCREEN_W) upscale_pass();   // small game target -> native
+    maybe_screenshot();
     if (g_cdlg_active) common_dialog_update();
     sceGxmPadHeartbeat(&g_disp_surf[g_back], g_disp_sync[g_back]);
     flip_data d = { g_disp_mb[g_back].base };
@@ -1466,6 +1558,35 @@ int gxm_init(void)
   g_vsync = 0;
   display_cb(&d);
   g_vsync = vs;
+
+  // render_scale: the game builds its targets from the window size we
+  // report, so a smaller default target takes its whole fbo chain down
+  // with it. we upscale over the back buffer at flip
+  {
+    int scale = config_int("render_scale", 100);
+    if (scale < 50 || scale > 100) scale = 100;
+    if (scale != 100) {
+      g_rw = (unsigned)(SCREEN_W * scale / 100) & ~1u;
+      g_rh = (unsigned)(SCREEN_H * scale / 100) & ~1u;
+      g_game_mem = gpu_alloc(g_rw * g_rh * 4, 256, GPU_PREF_CDRAM);
+      g_game_depth_mem = gpu_alloc(gxm_depth_surface_size(g_rw, g_rh),
+                                   SCE_GXM_DEPTHSTENCIL_SURFACE_ALIGNMENT, GPU_PREF_CDRAM);
+      if (g_game_mem && g_game_depth_mem &&
+          sceGxmColorSurfaceInit(&g_game_surf, SCE_GXM_COLOR_FORMAT_A8B8G8R8,
+              SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+              SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, g_rw, g_rh, g_rw, g_game_mem->ptr) >= 0 &&
+          gxm_depth_surface_init(&g_game_depth, g_rw, g_rh, g_game_depth_mem->ptr) >= 0) {
+        memset(g_game_mem->ptr, 0, (size_t)g_rw * g_rh * 4);
+        L("gxm: render scale %d%% -> %ux%u, upscaling at flip", scale, g_rw, g_rh);
+      } else {
+        L("gxm: render scale setup failed, staying native");
+        g_rw = SCREEN_W;
+        g_rh = SCREEN_H;
+        if (g_game_mem) { gpu_free(g_game_mem); g_game_mem = NULL; }
+        if (g_game_depth_mem) { gpu_free(g_game_depth_mem); g_game_depth_mem = NULL; }
+      }
+    }
+  }
 
   rt_get(SCREEN_W, SCREEN_H, gxm_msaa_display() ? gxm_msaa_setting() : SCE_GXM_MULTISAMPLE_NONE);
   g_dry_run = config_int("gpu_dry_run", 0);

@@ -537,7 +537,29 @@ const SceGxmTexture *tex_for_unit(int unit, int cube, uint32_t scene)
     return g_cube_ok ? &g_black_cube : &g_white2d.gxm;
   }
   gl_texture *t = tex_get(G.tex2d[unit]);
-  if (!t || !t->valid || t->is_cube) return &g_white2d.gxm;
+  if (!t || !t->valid || t->is_cube) {
+    // white-square hunt: name any real texture that samples the dummy.
+    // name-0 (untextured draws) is normal and stays quiet.
+    static int on = -1;
+    if (on < 0) { extern int config_int(const char *key, int def); on = config_int("tex_white_log", 1); }
+    if (on && G.tex2d[unit]) {
+      static uint32_t k_key[32]; static uint32_t k_n[32]; static int n_keys;
+      uint32_t key = G.tex2d[unit] * 4u + (t ? (t->is_cube ? 3u : 2u) : 1u);
+      int hit = -1;
+      for (int i = 0; i < n_keys; i++) if (k_key[i] == key) { hit = i; break; }
+      if (hit < 0 && n_keys < 32) { hit = n_keys++; k_key[hit] = key; k_n[hit] = 0; }
+      if (hit >= 0 && (++k_n[hit] == 1 || (k_n[hit] & 1023) == 0)) {
+        if (t && !t->is_cube)
+          L("tex: tex %u samples the white dummy (not valid): mem=%s defined0=0x%X %ux%u skip=%u minf=0x%X",
+            t->name, t->mem ? "yes" : "no", t->mem ? t->defined[0] : 0,
+            t->mem ? t->w : 0, t->mem ? t->h : 0, t->skip, t->min_filter);
+        else
+          L("tex: unit %d samples the white dummy (%s, bound name %u)", unit,
+            t ? "cube bound on a 2d unit" : "bound name has no object", G.tex2d[unit]);
+      }
+    }
+    return &g_white2d.gxm;
+  }
   t->last_use = scene;
   return &t->gxm;
 }
@@ -803,7 +825,23 @@ static unsigned budget_skip(unsigned w, unsigned h, const shape *full, uint32_t 
   return sk;
 }
 
-// get 2d storage ready for (level, w, h). 0 ok, -1 upload dropped, -2 oom
+// the diagnostic switch: 1 = the pre-session broken-texture world. the old
+// build's off-by-one left the halved textures invalid and the game's load
+// fit that world; this replicates it exactly to test whether the fit
+// depends on the brokenness
+static int tex_old_break(void) {
+  static int on = -1;
+  if (on < 0) {
+    extern int config_int(const char *key, int def);
+    on = config_int("tex_old_break", 0);
+    if (on) L("tex: old_break mode - textures land the way the old build left them");
+  }
+  return on;
+}
+
+// get 2d storage ready for (level, w, h). 0 ok, -1 upload dropped, -2 oom,
+// -3 level 0 skipped on purpose (budget), -4 chain re-stored smaller, caller
+// must remap the incoming level by the new skip
 static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const fmt_info *fi, int has_data)
 {
   int same_fmt = t->mem && !t->is_cube && t->fmt == fi->fmt && t->bpp == fi->bpp;
@@ -899,16 +937,22 @@ static int prep_2d(gl_texture *t, unsigned level, unsigned w, unsigned h, const 
         half = config_int("tex_half", 1);
       }
       unsigned sk = t->skip ? 0 : budget_skip(t->w, t->h, &fs, NULL);
-      if (!sk && half && !t->skip) sk = 1;
+      // small chains aren't worth blurring (tex 3, a 128x128 menu piece,
+      // went white from this path): keep tex_half for real weight only.
+      // hw43: without this gate the splash's flow gate never opened.
+      // tex_old_break restores the old halve-everything world
+      if (!sk && half && !t->skip &&
+          (tex_old_break() || shape_bytes(&fs) >= 128 * 1024)) sk = 1;
       if (sk && (t->w >> sk) >= 8 && (t->h >> sk) >= 8) {
         unsigned hw = t->w >> sk, hh = t->h >> sk;
         shape hs = make_shape(hw, hh, t->bpp, 0, chain_len(hw, hh), fmt_bc(t->fmt) != 0);
+        unsigned ow = t->w, oh = t->h;
         if (tex_realloc(t, &hs, NULL, 0, -1, -1) == 0) {
           t->skip = sk;
           static unsigned n_half;
           if (n_half++ < 16 || (n_half & 63) == 0)
-            L("tex: %ux%u texture %u halved to %ux%u (budget)", t->w, t->h, t->name, hw, hh);
-          return 0;   // the arriving level lands in the new level 0 through skip
+            L("tex: %ux%u texture %u halved to %ux%u (budget)", ow, oh, t->name, hw, hh);
+          return -4;  // stored smaller, caller remaps this level by the new skip
         }
         // even the smaller store failed: the pool is truly out. don't grow
         static unsigned n_grow;
@@ -1182,6 +1226,55 @@ static void write_src(gl_texture *t, unsigned face, unsigned l, unsigned x0, uns
   free(heap);
 }
 
+// the budget bets can re-store a chain smaller than the incoming upload, and
+// the incoming pixels normally get dropped there. if nothing ever lands in
+// the new base the texture draws white (court floor, loading screen logos).
+// squash the incoming image into the stored base instead: nearest-downscale,
+// blurry beats white. returns 1 if the base got content.
+static int fill_base_from_src(gl_texture *t, const src_t *s)
+{
+  if (!s->data || !t->mem || (t->defined[0] & 1)) return 0;
+  unsigned sw = s->w, sh = s->h, dw = t->w, dh = t->h;
+  unsigned bcbs = fmt_bc(t->fmt);
+  if (!sw || !sh || !dw || !dh) return 0;
+  if (s->etc && s->etc != SRC_RGBA_BC && !bcbs) return 0;  // decoded etc only feeds bc here
+  if (!s->etc && bcbs) return 0;                           // raw pixels can't write bc blocks
+  uint8_t *buf, *out, owned = 1;
+  if (s->etc == SRC_RGBA_BC) {
+    buf = (uint8_t *)s->data;   // already linear rgba8
+    owned = 0;
+  } else if (s->etc) {
+    buf = malloc((size_t)sw * sh * 4);
+    if (!buf) return 0;
+    unsigned bw = (sw + 3) / 4, eb = etc_block_bytes(s->etc);
+    for (unsigned y = 0; y < sh; y += 4) {
+      unsigned n = sh - y < 4 ? sh - y : 4;
+      etc_decode(s->etc, s->data + (size_t)(y / 4) * bw * eb, sw, n, buf + (size_t)y * sw * 4, sw * 4);
+    }
+  } else {
+    buf = malloc((size_t)sw * sh * t->bpp);
+    if (!buf) return 0;
+    src_rows(s, 0, sh, buf, sw * t->bpp);
+  }
+  if (s->etc) {
+    out = malloc((size_t)dw * dh * 4);
+    if (!out) { if (owned) free(buf); return 0; }
+    tu_resample_nearest(buf, sw, sh, sw * 4, out, dw, dh, dw * 4, 4);
+    shape s2 = shape_of(t);
+    uint8_t *base = (uint8_t *)t->mem->ptr + lvl_off(&s2, 0, 0);
+    bc_from_rgba(out, dw, dh, bcbs, base, tu_bc_dim(dw, 0), tu_bc_dim(dh, 0), 0, 0);
+  } else {
+    out = malloc((size_t)dw * dh * t->bpp);
+    if (!out) { free(buf); return 0; }
+    tu_resample_nearest(buf, sw, sh, sw * t->bpp, out, dw, dh, dw * t->bpp, t->bpp);
+    put_rows(t, 0, 0, 0, 0, dw, dh, out, dw * t->bpp);
+  }
+  if (owned) free(buf);
+  free(out);
+  t->defined[0] |= 1;
+  return 1;
+}
+
 // turn a bc texture back into the rgba8 one tex_bc=0 would have made. for the
 // things bc storage can't take: pixel sub images and mip generation. reads
 // the blocks back from gpu memory, slow, but nothing the game does hits it.
@@ -1241,7 +1334,31 @@ static void tex_image(gl_texture *t, int face, unsigned level, GLenum ifmt, cons
   }
   int r = face < 0 ? prep_2d(t, level, s->w, s->h, fi, has_data)
                    : prep_cube(t, f, level, s->w, s->h, fi);
-  if (r == -3) return;                        // stored smaller, level 0 skipped on purpose
+  int old_break = tex_old_break();
+  if (r == -3) {
+    // budget bet shrank the chain, the incoming level 0 was dropped. squash
+    // the pixels into the stored base instead - white squares (court floor,
+    // loading logos) come from the empty base. old_break: the old game ran
+    // with those whites
+    if (!old_break && face < 0 && !(t->defined[0] & 1) && fill_base_from_src(t, s)) tex_desc(t);
+    return;
+  }
+  if (r == -4 && old_break) {
+    // the old build: the triggering mip lands where it lands - one level
+    // too deep, oversized write, level 0 never fills, the texture is the
+    // invalid one the old load fit with
+    r = 0;
+  } else if (r == -4 && level < t->skip) {
+    // budget bet shrank the chain below this mip: squash it into the base
+    if (face < 0 && !(t->defined[0] & 1) && fill_base_from_src(t, s)) tex_desc(t);
+    else t->levels_dropped++;
+    return;
+  } else if (r == -4) {
+    // the chain was just re-stored smaller and t->skip is new. this level
+    // was checked against the old skip (0), so remap it down now
+    level -= t->skip;
+    r = 0;
+  }
   if (r == -2) { GL_ERR(GL_OUT_OF_MEMORY); tex_desc(t); return; }
   if (r < 0) { t->levels_dropped++; return; }
   if (level == 0) {

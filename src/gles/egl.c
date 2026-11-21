@@ -160,8 +160,8 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface s, EGLint attr, EGLint *va
   (void)dpy; (void)s;
   EGLint v = 0;
   switch (attr) {
-  case EGL_WIDTH: v = SCREEN_W; break;
-  case EGL_HEIGHT: v = SCREEN_H; break;
+  case EGL_WIDTH: v = (EGLint)g_rw; break;
+  case EGL_HEIGHT: v = (EGLint)g_rh; break;
   case EGL_CONFIG_ID: v = 1; break;
   case EGL_RENDER_BUFFER: v = EGL_BACK_BUFFER; break;
   case EGL_SWAP_BEHAVIOR: v = EGL_BUFFER_DESTROYED; break;

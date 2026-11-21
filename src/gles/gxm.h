@@ -10,6 +10,10 @@
 #define DISPLAY_STRIDE  960   // pixels, 64 aligned
 #define DISPLAY_BUFFERS 3
 
+// render_scale < 100: the game renders into a g_rw x g_rh target and we
+// upscale to the native back buffer at flip. == SCREEN_W/H when off
+extern unsigned g_rw, g_rh;
+
 // knobs. rings are bigger than the sdk defaults, this game is draw heavy
 // param buffer: 4MB (pb_mb= in config.txt). gxm's default 16MB came straight
 // out of cdram on hw and a full match load needs every MB; if it ever fills

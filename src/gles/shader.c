@@ -539,6 +539,21 @@ static const char *clear_fs_cg =
   "  return uColor;\n"
   "}\n";
 
+// the upscale pair: a quad sampling the small game target
+static const char *scale_vs_cg =
+  "void main(float2 aPosition, float2 aUV, uniform float uDepth, out float4 oPos : POSITION, out float2 oUV : TEXCOORD0)\n"
+  "{\n"
+  "  oPos = float4(aPosition, uDepth, 1.0f);\n"
+  "  oUV = aUV;\n"
+  "}\n";
+static const char *scale_fs_cg =
+  "float4 main(float2 vUV : TEXCOORD0, uniform sampler2D uTex) : COLOR\n"
+  "{\n"
+  "  return tex2D(uTex, vUV);\n"
+  "}\n";
+
+scale_prog_t SCL;
+
 static void clear_init_job(void *unused)
 {
   (void)unused;
@@ -573,6 +588,53 @@ static void clear_init_job(void *unused)
   if (r < 0) { L("shader: clear vertex program failed 0x%08X", r); return; }
   CLR.ok = 1;
   L("shader: clear shader ready");
+
+  // the upscale pair, same trip
+  log = NULL;
+  SCL.vgxp = shacc_compile(scale_vs_cg, 0, &log);
+  SCL.fgxp = shacc_compile(scale_fs_cg, 1, &log);
+  if (!SCL.vgxp || !SCL.fgxp) {
+    L("shader: scale shader failed to compile:\n%s", log ? log : "");
+    free(log);
+    return;
+  }
+  free(log);
+  sceGxmShaderPatcherRegisterProgram(gxm_patcher, SCL.vgxp, &SCL.vid);
+  sceGxmShaderPatcherRegisterProgram(gxm_patcher, SCL.fgxp, &SCL.fid);
+  const SceGxmProgramParameter *vpos = sceGxmProgramFindParameterByName(SCL.vgxp, "aPosition");
+  const SceGxmProgramParameter *vuv = sceGxmProgramFindParameterByName(SCL.vgxp, "aUV");
+  SCL.u_depth = sceGxmProgramFindParameterByName(SCL.vgxp, "uDepth");
+  SCL.u_tex = sceGxmProgramFindParameterByName(SCL.fgxp, "uTex");
+  if (!vpos || !vuv || !SCL.u_depth || !SCL.u_tex) {
+    L("shader: scale shader params missing");
+    return;
+  }
+  SceGxmVertexAttribute sa[2];
+  sa[0].streamIndex = 0; sa[0].offset = 0;
+  sa[0].format = SCE_GXM_ATTRIBUTE_FORMAT_F32; sa[0].componentCount = 2;
+  sa[0].regIndex = sceGxmProgramParameterGetResourceIndex(vpos);
+  sa[1].streamIndex = 0; sa[1].offset = 8;
+  sa[1].format = SCE_GXM_ATTRIBUTE_FORMAT_F32; sa[1].componentCount = 2;
+  sa[1].regIndex = sceGxmProgramParameterGetResourceIndex(vuv);
+  SceGxmVertexStream ss;
+  ss.stride = 16;
+  ss.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+  r = sceGxmShaderPatcherCreateVertexProgram(gxm_patcher, SCL.vid, sa, 2, &ss, 1, &SCL.vp);
+  if (r < 0) { L("shader: scale vertex program failed 0x%08X", r); return; }
+  SCL.tex_unit = sceGxmProgramParameterGetResourceIndex(SCL.u_tex);
+  SceGxmBlendInfo bi;
+  memset(&bi, 0, sizeof(bi));
+  bi.colorMask = SCE_GXM_COLOR_MASK_ALL;
+  bi.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+  bi.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+  bi.colorSrc = bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+  bi.colorDst = bi.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+  r = sceGxmShaderPatcherCreateFragmentProgram(gxm_patcher, SCL.fid,
+      SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_MULTISAMPLE_NONE,
+      &bi, SCL.vgxp, &SCL.fp);
+  if (r < 0) { L("shader: scale fragment program failed 0x%08X", r); return; }
+  SCL.ok = 1;
+  L("shader: scale shader ready");
 }
 
 SceGxmFragmentProgram *clear_get_fp(uint8_t cmask, SceGxmOutputRegisterFormat fmt)
@@ -1728,6 +1790,24 @@ void glLinkProgram(GLuint prog)
   gxm_prof_link(sceKernelGetProcessTimeWide() - t0);
 }
 
+// links that died only because the heap was empty at the load's peak (one
+// vita3k run lost a 39-program wave in a second there, crowd and floor
+// draws among them). the game links each program once, so without a retry
+// they stay dead for the whole boot. the monitor tick re-runs them once the
+// squeeze is over.
+static struct { GLuint name; int tries; } relink_q[32];
+static int relink_n;
+
+static void relink_forget(GLuint prog)
+{
+  for (int i = 0; i < relink_n; i++)
+    if (relink_q[i].name == prog) {
+      memmove(&relink_q[i], &relink_q[i + 1], (size_t)(relink_n - i - 1) * sizeof(relink_q[0]));
+      relink_n--;
+      return;
+    }
+}
+
 static void glLinkProgram_impl(GLuint prog)
 {
   gl_program *p = prog_get(prog);
@@ -1758,12 +1838,52 @@ static void glLinkProgram_impl(GLuint prog)
     if (mvs && mfs) man_record(mvs->src, mfs->src);
   }
   p->log = log;
-  if (!p->linked) {
-    L("!!!! shader: LINK FAILED for program %u (vs %u fs %u):\n%s", prog, p->vs, p->fs, log ? log : "?");
-    // drop any half-built state, keep the log
-    p->log = NULL;
-    prog_reset(p);
-    p->log = log;
+  if (p->linked) {
+    relink_forget(prog);
+    return;
+  }
+  L("!!!! shader: LINK FAILED for program %u (vs %u fs %u):\n%s", prog, p->vs, p->fs, log ? log : "?");
+  // an oom death at the load's peak isn't the shader's fault: queue it for
+  // the monitor tick, it relinks once the squeeze is over
+  if (log && (strstr(log, "out of memory") || strstr(log, "fatal internal error"))) {
+    int tries = 0;
+    for (int i = 0; i < relink_n; i++)
+      if (relink_q[i].name == prog) { tries = relink_q[i].tries; break; }
+    relink_forget(prog);
+    if (tries < 5 && relink_n < (int)(sizeof(relink_q) / sizeof(relink_q[0]))) {
+      relink_q[relink_n].name = prog;
+      relink_q[relink_n].tries = tries + 1;
+      relink_n++;
+      if (tries == 0)
+        L("shader: program %u oom-failed, will relink when memory returns", prog);
+    } else if (tries >= 5) {
+      L("shader: program %u still oom-failing after %d retries, giving up this boot", prog, tries);
+    } else {
+      static unsigned full;
+      if (full++ < 4) L("shader: relink queue full, program %u left dead this boot", prog);
+    }
+    return;
+  }
+  // real failure: drop any half-built state, keep the log
+  p->log = NULL;
+  prog_reset(p);
+  p->log = log;
+}
+
+void shader_relink_tick(void)
+{
+  if (!relink_n) return;
+  SceKernelFreeMemorySizeInfo fi;
+  memset(&fi, 0, sizeof(fi));
+  fi.size = sizeof(fi);
+  sceKernelGetFreeMemorySize(&fi);
+  if ((int)fi.size_user < 4 * 1024 * 1024 && (int)fi.size_cdram < 2 * 1024 * 1024) return;
+  // the same floors the compile worker defers at: relink in the load's lulls
+  // too - the old 8M gate never opened during the tail (hw41)
+  for (int i = 0; i < 3 && relink_n; i++) {
+    if (!prog_get(relink_q[0].name)) { relink_forget(relink_q[0].name); continue; }
+    L("shader: relink retry for program %u (%d queued)", relink_q[0].name, relink_n - 1);
+    glLinkProgram_impl(relink_q[0].name);
   }
 }
 

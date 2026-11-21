@@ -113,6 +113,11 @@ void osk_input(unsigned pressed, int tap, int tx, int ty)
   if (pressed & START) finish(1);
   if (pressed & SELECT) finish(0);
   if (tap) {
+    // touches arrive in the (possibly scaled) window space, the key rects
+    // are laid out in 960x544
+    extern unsigned g_rw, g_rh;
+    tx = tx * 960 / (int)g_rw;
+    ty = ty * 544 / (int)g_rh;
     for (int r = 0; r < 5; r++) {
       for (int c = 0; c < row_len(r); c++) {
         int x, y, w, h;
