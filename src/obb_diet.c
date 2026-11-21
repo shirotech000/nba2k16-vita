@@ -1,26 +1,46 @@
-// obb_diet.c - the on-device texture diet. this is the "converter" the
-// project always wanted, running where the data lives: at boot, before the
-// game loads, against the user's own OBB. no game data ships - only this
-// algorithm. every mipped TXTR >= 128KB in every 94EF3BFF archive gets its
-// level-0 mip dropped and its declared dims halved; the game's own mip 1
-// becomes the new base. one-time (obb_diet.done marker), obb_diet=0 in
-// config.txt turns it off, obb_diet_force=1 re-runs it (a no-op on an
-// already-dieted obb: the spans fall under the 128K gate).
+// obb_diet.c - on-device OBB surgery, rewritten from the validated grammar.
+// runs once at boot (obb_diet.done marker), before the game loads, against
+// the user's own OBB. no game data ships - only this algorithm.
 //
-// archive grammar per the iff project (iffs/tex_diet.py, obb_diet_all.py,
-// nba2k16_GLM/HANDOFF.md): header {magic FF3BEF94, data_start @+4 (LE),
-// total @+8 (BE), block_count @+0x10, dir_count @+0x18}, block table at
-// +0x20 (u32 x 0x20/entry), the pointer table + resource records live in
-// the raw file from +0x60 to data_start, the two ZLIB-wrapped blocks at
-// data_start. resource record: {file_id, type_id, block_index, meta_off}
-// + payload_off if block_index==2. TXTR dims are the u16 pair at
-// block0[meta_off+0xA0], the payload is a full mip chain: dims*bpp*4/3.
+// OBB container: TOC at 0x800, 16B entries {u32 size, u32 hi(0), u32 name_crc
+// ascending, u32 sector}; entries live at 2048B sector boundaries.
+//
+// IFF archive (magic 0xFF3BEF94 LE): data_start u32 LE @+4, total u32 BE @+8,
+// block_count @+0x10, dir_count @+0x18, block table @+0x20 (0x20/entry:
+// ha, hb, align, dsz, codec, off, ssz, res). a block is "ZLIB" + BE dsz +
+// BE csz + u32, then the raw zlib stream. the record area [0x60, data_start)
+// holds a pointer table at T (first entry dir_count*4+1, ptr[i] =
+// R_i-(T-1)-4*i) then the records, flush at data_start. record: {file_id,
+// type_id, block_index, meta_off} 16B, + payload_off u32 when block_index==2.
+//
+// TXTR meta (in b0, 0xC0 bytes): format enum @+0x08 (1=RGBA8, 2=RGB565,
+// 16=L8/A8), dims u16 pair @+0xA0/+0xA2, LOD-bank offset @+0x88 (companion
+// 0x7F @+0x8C). TXTR payload (in b1) is a raw mip chain, w*h*bpp*4/3 bytes.
+//
+// the diet: every qualifying TXTR gets its top mip level(s) excised from b1
+// and its dims scaled down - the game's own next mip becomes the new base.
+// scene archives (any SCNE record) are never cut: their metadata carries
+// baked payload offsets (hw65), they go through the donor channel instead.
+//
+// every absolute b1 offset is rebased with the strictly-before rule:
+//   - record payload_off fields
+//   - the head descriptor region [0x60, T) - packed (count<<16|tag) fields
+//     (low half 0x80..0x83) are data and never shift (hw86's 2.7GB ask)
+//   - b0 LOD-bank pointers into the tail span [max_po, b1sz) - the last
+//     payload record's span when it isn't a texture - except meta data slots
+// nothing else moves: data_start and the pointer table stay put, so a rebase
+// can't corrupt the head. the rebuilt archive is fully re-parsed and verified
+// in memory before a single byte hits the OBB; any doubt skips the entry.
+//
+// config.txt: obb_diet=0 disables, obb_diet_force=1 re-arms the marker,
+// obb_diet_scale=2|4 (mip levels dropped per texture), obb_diet_min_span.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h>
 #include <psp2/kernel/processmgr.h>
 #include <zlib.h>
 
@@ -28,10 +48,15 @@
 #include "util/paths.h"
 #include "game/patches.h"
 
-#define TXTR_CRC 0x5C369069
-#define MAX_ENTRY (8 * 1024 * 1024)
-#define MIN_SPAN (128 * 1024)
-#define DIET_LEVEL 6
+#define TXTR_CRC 0x5C369069u
+#define SCNE_CRC 0xE26C9B5Du
+#define MAX_ENTRY (8u * 1024 * 1024)
+#define MAX_RECS 2048
+#define MAX_BANK 8192
+#define TOC_OFF 0x800
+#define TOC_MAX 3500
+#define SECTOR 2048
+#define NO_PO 0xFFFFFFFFu
 
 static uint32_t ru32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint16_t ru16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -64,7 +89,8 @@ static int wr_full(SceUID fd, const void *buf, SceSize n) {
   return 0;
 }
 
-// two decompressed blocks + the header facts we keep
+// ---- the archive ----------------------------------------------------------
+
 typedef struct {
   uint8_t *b0, *b1;
   uint32_t b0sz, b1sz;
@@ -74,25 +100,28 @@ typedef struct {
 
 static void arc_free(arc_t *a) { free(a->b0); free(a->b1); a->b0 = a->b1 = NULL; }
 
+// strict: magic, exactly 2 ZLIB blocks, wrapper dsz sane, inflate == dsz
 static int arc_parse(const uint8_t *d, uint32_t n, arc_t *a) {
   memset(a, 0, sizeof(*a));
-  if (n < 0x90 || ru32(d) != 0xFF3BEF94) return -1;
+  if (n < 0x90 || ru32(d) != 0xFF3BEF94u) return -1;
   a->data_start = ru32(d + 0x04);
   uint32_t block_count = ru32(d + 0x10);
   a->dir_count = ru32(d + 0x18);
-  if (block_count != 2 || a->data_start >= n) return -1;
+  if (block_count != 2 || a->data_start >= n || a->data_start < 0x60) return -1;
   for (int i = 0; i < 2; i++) {
     const uint8_t *e = d + 0x20 + i * 0x20;
     a->ha[i] = ru32(e); a->hb[i] = ru32(e + 4); a->align[i] = ru32(e + 8);
     a->codec[i] = ru32(e + 0x10);
     uint32_t off = ru32(e + 0x14), ssz = ru32(e + 0x18);
     if ((uint64_t)off + ssz > n || memcmp(d + off, "ZLIB", 4) != 0) {
-      arc_free(a);   // b0 (h7-block archives land here at i=1) must not leak
+      arc_free(a);
       return -1;
     }
+    // the wrapper's stored csz overruns the stream on some originals - hand
+    // inflate the whole span as capacity, it stops at stream end
     uint32_t dsz = (uint32_t)d[off + 4] << 24 | (uint32_t)d[off + 5] << 16 |
                    (uint32_t)d[off + 6] << 8 | d[off + 7];
-    if (!dsz || dsz > 32u * 1024 * 1024) {
+    if (!dsz || dsz > 48u * 1024 * 1024) {
       arc_free(a);
       return -1;
     }
@@ -102,8 +131,6 @@ static int arc_parse(const uint8_t *d, uint32_t n, arc_t *a) {
       return -1;
     }
     uLongf got = dsz;
-    // the original files' wrapper csz is not the true length: hand inflate
-    // the whole stored span (ssz-16) as capacity, it stops at stream end
     if (uncompress(out, &got, d + off + 16, ssz - 16) != Z_OK || got != dsz) {
       free(out);
       arc_free(a);
@@ -114,307 +141,439 @@ static int arc_parse(const uint8_t *d, uint32_t n, arc_t *a) {
   return 0;
 }
 
-// the single TXTR record with a payload, from the raw file's directory
-// region. 0 = found (meta_off into b0, payload_off into b1), -1 = no
-// the single-TXTR rule was the diet's blind spot: the heavy arenas carry
-// 8-99 textures each and none of them qualified. the v2 collects every
-// block-2 record (all types - spans need the neighbors as boundaries) and
-// diets every qualifying TXTR independently, rebasing the record offsets
-// after each cut
+// ---- the records ----------------------------------------------------------
+
 typedef struct {
-  uint32_t file_pos;   // the record's own location in the raw file
-  uint32_t type;
-  uint32_t meta;      // into b0
-  uint32_t po;        // into b1 (its payload_off field is at file_pos+16)
-} b2rec;
+  uint32_t pos;    // the record's own file offset
+  uint32_t type, blk, meta, po;   // po = NO_PO when blk != 2
+} rec_t;
 
-#define MAX_B2 512
-
-static int collect_b2(const uint8_t *d, const arc_t *a, b2rec *out, int cap) {
-  uint32_t pos = 0x60 + a->dir_count * 4;
-  int n = 0;
-  for (uint32_t i = 0; i < a->dir_count && pos + 16 <= a->data_start; i++) {
-    uint32_t type_id = ru32(d + pos + 4);
-    uint32_t blk = ru32(d + pos + 8);
-    uint32_t mo = ru32(d + pos + 12);
-    pos += 16;
-    if (blk == 2) {
-      if (pos + 4 > a->data_start) break;
-      if (n < cap) {
-        out[n].file_pos = pos - 16;
-        out[n].type = type_id;
-        out[n].meta = mo;
-        out[n].po = ru32(d + pos);
-        n++;
+// locate the pointer table by its signature and validate the whole walk:
+// every pointer resolves, records end flush at data_start. returns the
+// record count, or -1. *T_out gets the table offset.
+static int walk_records(const uint8_t *d, const arc_t *a, rec_t *recs, int cap,
+                        uint32_t *T_out) {
+  if (a->dir_count == 0 || (int)a->dir_count > cap) return -1;
+  uint32_t want = a->dir_count * 4 + 1;
+  for (uint32_t T = 0x60; T + 4 <= a->data_start; T += 4) {
+    if (ru32(d + T) != want) continue;
+    uint32_t pos = T + a->dir_count * 4;
+    int n = 0, ok = 1;
+    for (uint32_t i = 0; i < a->dir_count; i++) {
+      if (pos + 12 > a->data_start) { ok = 0; break; }
+      if (ru32(d + T + 4 * i) != pos - (T - 1) - 4 * i) { ok = 0; break; }
+      rec_t r;
+      r.pos = pos;
+      r.type = ru32(d + pos + 4);
+      r.blk = ru32(d + pos + 8);
+      r.meta = ru32(d + pos + 12);
+      r.po = NO_PO;
+      if (r.blk == 2) {
+        if (pos + 20 > a->data_start) { ok = 0; break; }
+        r.po = ru32(d + pos + 16);
+        pos += 20;
+      } else if (r.blk == 1) {
+        pos += 16;
+      } else if (r.blk == 0) {
+        pos += 12;
+      } else {
+        ok = 0;
+        break;
       }
-      pos += 4;
-    } else if (blk != 1) {
-      break;
+      if (n < cap) recs[n] = r;
+      n++;
     }
+    if (!ok || pos != a->data_start) continue;
+    *T_out = T;
+    return n;
   }
-  return n;
+  return -1;
 }
 
-static int fits_span(uint32_t w, uint32_t span) {
-  for (uint32_t bpp = 2; bpp <= 4; bpp += 2) {
-    // the floored chain sum is ~1 over the exact span: either side within 8
-    uint64_t want = (uint64_t)w * w * bpp * 4 / 3;
-    uint64_t diff = want > span ? want - span : span - want;
-    if (diff < 8) return (int)bpp;
-  }
-  return 0;
+// the payload span of a block-2 record: to the next bigger po, else b1's end
+static uint32_t rec_span(const rec_t *recs, int n, int ri, uint32_t b1sz) {
+  uint32_t span = b1sz - recs[ri].po;
+  for (int j = 0; j < n; j++)
+    if (recs[j].blk == 2 && recs[j].po > recs[ri].po && recs[j].po - recs[ri].po < span)
+      span = recs[j].po - recs[ri].po;
+  return span;
 }
 
-// the window version of fits_span: the v1-era originals could carry
-// alignment padding that leaves a span a few thousand bytes off the exact
-// chain (the crowd record sits 1.9K short of its halved chain). a 4%
-// window still can't confuse the halved chain with the full one - they
-// sit a factor of 4 apart
-static int fits_span_loose(uint32_t w, uint32_t span) {
+// the mip chain is w*h*bpp*4/3; originals carry packer padding, so a 4%
+// window (a halved chain sits a factor of 4 away - no confusion)
+static int fits_span_loose(uint32_t w, uint32_t h, uint32_t span) {
   for (uint32_t bpp = 2; bpp <= 4; bpp += 2) {
-    uint64_t want = (uint64_t)w * w * bpp * 4 / 3;
+    uint64_t want = (uint64_t)w * h * bpp * 4 / 3;
     uint64_t slack = want / 25;
     if (span >= want - slack && span <= want + slack) return (int)bpp;
   }
   return 0;
 }
 
-// the diet's depth: 2 = drop one mip level (halve), 4 = drop two (quarter).
-// the deeper the cut, the more game-heap bytes the match load keeps
-static int obb_diet_scale(void) {
-  static int s = -1;
-  if (s < 0) {
-    extern int config_int(const char *key, int def);
-    s = config_int("obb_diet_scale", 2);
-    if (s != 4) s = 2;
-    if (s == 4) L("obb diet: scale 4, dropping two mip levels per texture");
-  }
-  return s;
+static int is_pow2(uint32_t v) { return v >= 64 && v <= 2048 && (v & (v - 1)) == 0; }
+
+// ---- the cut plan ---------------------------------------------------------
+
+typedef struct {
+  uint32_t po, drop;      // excise [po, po+drop) from b1
+  uint32_t meta;          // b0 dims slot to scale
+  uint16_t nw, nh;
+} cut_t;
+
+// strictly-before shift: total drop of all cuts starting before v
+static uint32_t shift_of(const cut_t *cuts, int ncut, uint32_t v) {
+  uint32_t dl = 0;
+  for (int i = 0; i < ncut; i++)
+    if (cuts[i].po < v) dl += cuts[i].drop;
+  return dl;
 }
 
-static int diet_one(SceUID fd, uint32_t idx, uint32_t size, uint32_t crc, uint32_t sector,
-                    uint32_t *saved_out, int *funnel, int repair) {
-  if (size > MAX_ENTRY) return 0;
+static int cut_cmp(const void *a, const void *b) {
+  uint32_t pa = ((const cut_t *)a)->po, pb = ((const cut_t *)b)->po;
+  return pa < pb ? -1 : pa > pb ? 1 : 0;
+}
+
+// ---- one OBB entry --------------------------------------------------------
+
+static int diet_entry(SceUID fd, uint32_t idx, uint32_t size, uint32_t crc,
+                      uint32_t sector, uint32_t *saved, int *funnel) {
+  if (size > MAX_ENTRY || size < 0x90) return 0;
+  sceIoLseek(fd, (SceOff)sector * SECTOR, SCE_SEEK_SET);
   uint8_t head[4];
-  sceIoLseek(fd, (SceOff)sector * 2048, SCE_SEEK_SET);
-  if (rd_full(fd, head, 4) < 0) {
+  if (rd_full(fd, head, 4) < 0 || memcmp(head, "\x94\xEF\x3B\xFF", 4) != 0) {
     funnel[0]++;
-    if (funnel[6]++ < 3) L("obb diet: entry %u head read failed at 0x%X", idx, sector * 2048);
     return 0;
   }
-  if (memcmp(head, "\x94\xEF\x3B\xFF", 4) != 0) return 0;
   funnel[1]++;
   uint8_t *d = malloc(size);
   if (!d) return 0;
-  sceIoLseek(fd, (SceOff)sector * 2048, SCE_SEEK_SET);
+  sceIoLseek(fd, (SceOff)sector * SECTOR, SCE_SEEK_SET);
   if (rd_full(fd, d, size) < 0) {
     funnel[2]++;
-    if (funnel[6]++ < 3) L("obb diet: entry %u full read failed (%u bytes at 0x%X)", idx, size, sector * 2048);
     free(d);
     return 0;
   }
   funnel[3]++;
 
   arc_t a;
-  if (arc_parse(d, size, &a) < 0) { free(d); return 0; }
+  if (arc_parse(d, size, &a) < 0) {
+    free(d);
+    return 0;
+  }
   funnel[4]++;
-  b2rec recs[MAX_B2];
-  int nrec = collect_b2(d, &a, recs, MAX_B2);
-  uint8_t *out = NULL, *z0 = NULL, *z1 = NULL;
-  int ret = 0;
-  uint32_t freed = 0, ndieted = 0;
 
-  // the surgery: qualifying TXTRs from the end of b1 backward, so each
-  // cut's rebase can't disturb the cuts before it
-  for (int ri = nrec - 1; ri >= 0; ri--) {
-    b2rec *r = &recs[ri];
-    if (r->type != TXTR_CRC || r->meta + 0xA4 > a.b0sz || r->po >= a.b1sz) continue;
+  rec_t *recs = malloc(MAX_RECS * sizeof(rec_t));
+  uint32_t T = 0x60;
+  int nrec = walk_records(d, &a, recs, MAX_RECS, &T);
+  if (nrec < 0) {
+    L("obb diet: entry %u (crc %08X) record walk failed, skipping", idx, crc);
+    free(recs);
+    arc_free(&a);
+    free(d);
+    return 0;
+  }
+
+  // scene archives carry baked payload offsets in their metadata (hw65) -
+  // cutting them kills the stored-table path. donor channel only.
+  int scene = 0;
+  for (int i = 0; i < nrec; i++)
+    if (recs[i].type == SCNE_CRC) { scene = 1; break; }
+  if (scene) {
+    free(recs);
+    arc_free(&a);
+    free(d);
+    return 0;
+  }
+
+  int scale = config_int("obb_diet_scale", 2);
+  if (scale != 4) scale = 2;
+  uint32_t min_span = (uint32_t)config_int("obb_diet_min_span", 128 * 1024);
+
+  cut_t *cuts = malloc(MAX_RECS * sizeof(cut_t));
+  int ncut = 0;
+  for (int i = 0; i < nrec; i++) {
+    if (recs[i].type != TXTR_CRC || recs[i].blk != 2) continue;
+    if (recs[i].meta + 0xC0 > a.b0sz || recs[i].po >= a.b1sz) continue;
     funnel[5]++;
-    // the span: this record's po to the next bigger po (or b1's end)
-    uint32_t span = a.b1sz - r->po;
-    for (int j = 0; j < nrec; j++)
-      if (recs[j].po > r->po && recs[j].po - r->po < span) span = recs[j].po - r->po;
-    uint16_t w = ru16(a.b0 + r->meta + 0xA0), h = ru16(a.b0 + r->meta + 0xA2);
-    if (repair) {
-      // the v1 diet cut the payload but never wrote the halved dims back.
-      // the game's own lod-offset math (the crowd context build) walks the
-      // raw record fields and dies on the mismatch. the strict +-8 span
-      // test missed the v1's products entirely (hw63: their spans carry
-      // the padded originals' slack), so the window version takes over -
-      // and every mismatched record gets a census line either way: that's
-      // the on-device ground truth for what the v1 actually left behind
-      if (w == h && (w == 256 || w == 512 || w == 1024 || w == 2048)) {
-        int own = fits_span_loose(w, span);
-        int half = fits_span_loose(w / 2, span);
-        int quar = fits_span_loose(w / 4, span);
-        if (!own) {
-          if (funnel[6]++ < 40)
-            L("obb repair: entry %u tex %ux%u span %u half %d quar %d", idx, w, h, span, half, quar);
-          if (half || quar) {
-            uint32_t nw = half ? w / 2 : w / 4;
-            wu16(a.b0 + r->meta + 0xA0, (uint16_t)nw);
-            wu16(a.b0 + r->meta + 0xA2, (uint16_t)nw);
-            ndieted++;
+    uint32_t span = rec_span(recs, nrec, i, a.b1sz);
+    uint16_t w = ru16(a.b0 + recs[i].meta + 0xA0), h = ru16(a.b0 + recs[i].meta + 0xA2);
+    int bpp = fits_span_loose(w, h, span);
+    if (!(is_pow2(w) && is_pow2(h) && span >= min_span && bpp)) {
+      if (span >= min_span && funnel[6]++ < 3)
+        L("obb diet: entry %u near-miss %ux%u span %u bpp %d", idx, w, h, span, bpp);
+      continue;
+    }
+    uint32_t drop = (uint32_t)w * h * (uint32_t)bpp;
+    if (scale == 4) drop += (uint32_t)(w / 2) * (h / 2) * (uint32_t)bpp;
+    if (drop >= span) continue;
+    cuts[ncut].po = recs[i].po;
+    cuts[ncut].drop = drop;
+    cuts[ncut].meta = recs[i].meta;
+    cuts[ncut].nw = (uint16_t)(w / scale);
+    cuts[ncut].nh = (uint16_t)(h / scale);
+    ncut++;
+  }
+  if (ncut == 0) {
+    free(cuts);
+    free(recs);
+    arc_free(&a);
+    free(d);
+    return 0;
+  }
+  qsort(cuts, (size_t)ncut, sizeof(cut_t), cut_cmp);
+  uint32_t first_cut = cuts[0].po;
+  uint32_t sum_drop = 0;
+  for (int i = 0; i < ncut; i++) sum_drop += cuts[i].drop;
+
+  // new b1: the kept segments between the cuts
+  uint32_t nb1sz = a.b1sz - sum_drop;
+  uint8_t *nb1 = malloc(nb1sz);
+  if (!nb1) goto bail;
+  {
+    uint32_t cur = 0, w = 0;
+    for (int i = 0; i < ncut; i++) {
+      memcpy(nb1 + w, a.b1 + cur, cuts[i].po - cur);
+      w += cuts[i].po - cur;
+      cur = cuts[i].po + cuts[i].drop;
+    }
+    memcpy(nb1 + w, a.b1 + cur, a.b1sz - cur);
+  }
+
+  // dims in b0
+  for (int i = 0; i < ncut; i++) {
+    wu16(a.b0 + cuts[i].meta + 0xA0, cuts[i].nw);
+    wu16(a.b0 + cuts[i].meta + 0xA2, cuts[i].nh);
+  }
+
+  // b0 LOD-bank pointers: every u32 in b0 whose value lands in the tail span
+  // [tail_start, b1sz) is a pointer into the last payload record's payload
+  // (the LOD-bank store) - unless it's meta data. the tail exists only when
+  // the last payload record isn't itself a texture.
+  uint32_t tail_start = a.b1sz;
+  {
+    int lasti = -1;
+    for (int i = 0; i < nrec; i++)
+      if (recs[i].blk == 2 && (lasti < 0 || recs[i].po > recs[lasti].po)) lasti = i;
+    if (lasti >= 0 && recs[lasti].type != TXTR_CRC) tail_start = recs[lasti].po;
+  }
+  // meta extents: 1 = inside a TXTR meta, 2 = meta data slot, 3 = the +0x88 slot
+  uint8_t *mflag = calloc(a.b0sz, 1);
+  if (!mflag) goto bail;
+  for (int i = 0; i < nrec; i++) {
+    if (recs[i].type != TXTR_CRC || recs[i].meta + 0xC0 > a.b0sz) continue;
+    memset(mflag + recs[i].meta, 1, 0xC0);
+    mflag[recs[i].meta + 0x00] = 2;   // name crc can land in-tail numerically
+    mflag[recs[i].meta + 0xA0] = 2;   // packed dims pair - data, not a pointer
+    mflag[recs[i].meta + 0xA4] = 2;
+    mflag[recs[i].meta + 0x88] = 3;   // the LOD-bank offset slot
+  }
+  typedef struct { uint32_t p, oldv, newv; } bank_t;
+  bank_t *bank = malloc(MAX_BANK * sizeof(bank_t));
+  int nbank = 0, abort_arc = 0;
+  if (tail_start < a.b1sz) {
+    for (uint32_t p = 0; p + 4 <= a.b0sz; p += 4) {
+      uint32_t v = ru32(a.b0 + p);
+      int intail = (v >= tail_start && v < a.b1sz) ||
+                   ((v & 1) && v >= tail_start + 1 && v - 1 < a.b1sz);
+      if (!intail) continue;
+      if (mflag[p] == 2) continue;
+      if (mflag[p] == 1) { abort_arc = 1; break; }   // in-tail meta value that isn't the bank slot: human review
+      if (mflag[p] == 3 && ru32(a.b0 + p + 4) != 0x7F) { abort_arc = 1; break; }
+      if (nbank < MAX_BANK) {
+        bank[nbank].p = p;
+        bank[nbank].oldv = v;
+        bank[nbank].newv = v - shift_of(cuts, ncut, v);
+        nbank++;
+      }
+    }
+  }
+  if (abort_arc) {
+    L("obb diet: entry %u (crc %08X) unexpected in-tail meta value, skipping", idx, crc);
+    free(mflag); free(bank); free(nb1); free(cuts); free(recs);
+    arc_free(&a); free(d);
+    return 0;
+  }
+  for (int i = 0; i < nbank; i++)
+    wu32(a.b0 + bank[i].p, bank[i].newv);
+
+  // recompress both blocks
+  uLongf z0cap = compressBound(a.b0sz);
+  uint8_t *z0 = malloc(z0cap + 16);
+  uLongf z1cap = compressBound(nb1sz);
+  uint8_t *z1 = malloc(z1cap + 16);
+  if (!z0 || !z1) {
+    free(z0); free(z1); free(mflag); free(bank); free(nb1);
+    goto bail;
+  }
+  uLongf z0n = z0cap, z1n = z1cap;
+  if (compress2(z0 + 16, &z0n, a.b0, a.b0sz, 9) != Z_OK ||
+      compress2(z1 + 16, &z1n, nb1, nb1sz, 6) != Z_OK) {
+    free(z0); free(z1); free(mflag); free(bank); free(nb1);
+    goto bail;
+  }
+  memcpy(z0, "ZLIB", 4); wbe32(z0 + 4, a.b0sz); wbe32(z0 + 8, (uint32_t)z0n); wu32(z0 + 12, 0);
+  memcpy(z1, "ZLIB", 4); wbe32(z1 + 4, nb1sz); wbe32(z1 + 8, (uint32_t)z1n); wu32(z1 + 12, 0);
+
+  uint32_t total = a.data_start + (uint32_t)(16 + z0n) + (uint32_t)(16 + z1n);
+  uint32_t cap = (size + SECTOR - 1) & ~(uint32_t)(SECTOR - 1);
+  if (total >= cap) {
+    L("obb diet: entry %u rebuild %u >= span cap %u, skipping", idx, total, cap);
+    free(z0); free(z1); free(mflag); free(bank); free(nb1);
+    goto bail;
+  }
+
+  // assemble: header + block table + head (with rebases) + the two blocks.
+  // data_start never moves, so the pointer table needs no repair
+  uint8_t *out = malloc(total);
+  if (!out) {
+    free(z0); free(z1); free(mflag); free(bank); free(nb1);
+    goto bail;
+  }
+  memcpy(out, d, 0x20);
+  wu32(out + 0x04, a.data_start);
+  wbe32(out + 0x08, total);
+  {
+    uint32_t dszv[2] = { a.b0sz, nb1sz };
+    uint32_t offv[2] = { a.data_start, a.data_start + (uint32_t)(16 + z0n) };
+    uint32_t sszv[2] = { (uint32_t)(16 + z0n), (uint32_t)(16 + z1n) };
+    for (int i = 0; i < 2; i++) {
+      uint8_t *te = out + 0x20 + i * 0x20;
+      wu32(te, a.ha[i]); wu32(te + 4, a.hb[i]); wu32(te + 8, a.align[i]);
+      wu32(te + 12, dszv[i]); wu32(te + 16, a.codec[i]); wu32(te + 20, offv[i]);
+      wu32(te + 24, sszv[i]); wu32(te + 28, 0);
+    }
+  }
+  memcpy(out + 0x60, d + 0x60, a.data_start - 0x60);
+  // record payload_off fields
+  for (int i = 0; i < nrec; i++) {
+    if (recs[i].blk != 2) continue;
+    uint32_t nv = recs[i].po - shift_of(cuts, ncut, recs[i].po);
+    if (nv != recs[i].po) wu32(out + recs[i].pos + 16, nv);
+  }
+  // head descriptor region [0x60, T): genuine b1 offsets shift, packed
+  // (count<<16|tag) fields (low half 0x80..0x83, count >= 0x20) never do
+  for (uint32_t off = 0x60; off + 4 <= T; off += 4) {
+    uint32_t v = ru32(out + off);
+    if (v < first_cut || v >= a.b1sz) continue;
+    uint32_t lo = v & 0xFFFF;
+    if (lo >= 0x80 && lo <= 0x83 && (v >> 16) >= 0x20) continue;
+    uint32_t dl = shift_of(cuts, ncut, v);
+    if (dl) wu32(out + off, v - dl);
+  }
+  memcpy(out + a.data_start, z0, 16 + z0n);
+  memcpy(out + a.data_start + 16 + z0n, z1, 16 + z1n);
+
+  // ---- verify the rebuild in memory before touching the OBB ----
+  {
+    arc_t v;
+    int bad = 0;
+    if (arc_parse(out, total, &v) < 0) {
+      L("obb diet: entry %u rebuild doesn't parse, skipping", idx);
+      bad = 1;
+    } else {
+      rec_t *vr = malloc(MAX_RECS * sizeof(rec_t));
+      uint32_t vT = 0x60;
+      int vn = walk_records(out, &v, vr, MAX_RECS, &vT);
+      if (vn != nrec || vT != T) {
+        L("obb diet: entry %u walk mismatch (%d/%u T %#x/%#x), skipping", idx, vn, nrec, vT, T);
+        bad = 1;
+      } else {
+        // every record's po must equal the planned shifted value
+        for (int i = 0; i < vn && !bad; i++) {
+          if (vr[i].blk != 2) continue;
+          uint32_t want = NO_PO;
+          for (int j = 0; j < nrec; j++)
+            if (recs[j].pos == vr[i].pos) { want = recs[j].po - shift_of(cuts, ncut, recs[j].po); break; }
+          if (want != NO_PO && vr[i].po != want) bad = 1;
+        }
+        // every TXTR's span must fit its (new) dims
+        int consistent = 0;
+        for (int i = 0; i < vn && !bad; i++) {
+          if (vr[i].type != TXTR_CRC || vr[i].blk != 2) continue;
+          if (vr[i].meta + 0xC0 > v.b0sz || vr[i].po >= v.b1sz) { bad = 1; break; }
+          uint32_t span = rec_span(vr, vn, i, v.b1sz);
+          uint16_t w = ru16(v.b0 + vr[i].meta + 0xA0), h = ru16(v.b0 + vr[i].meta + 0xA2);
+          if (fits_span_loose(w, h, span)) consistent++;
+          else if (funnel[6]++ < 10)
+            L("obb diet: entry %u verify: tex %ux%u span %u inconsistent", idx, w, h, span);
+        }
+        if (!bad && consistent < ncut) {
+          L("obb diet: entry %u verify: %d consistent < %d cut, skipping", idx, consistent, ncut);
+          bad = 1;
+        }
+        // bank contents must be byte-identical at the shifted targets
+        for (int i = 0; i < nbank && !bad; i++) {
+          uint32_t ov = bank[i].oldv, nv = bank[i].newv;
+          uint32_t n = 8;
+          if (ov + n > a.b1sz) n = a.b1sz - ov;
+          if (nv + n > v.b1sz || n < 4 || memcmp(a.b1 + ov, v.b1 + nv, n) != 0) {
+            L("obb diet: entry %u bank slot %#x content moved, skipping", idx, bank[i].p);
+            bad = 1;
           }
         }
       }
-      continue;
+      free(vr);
+      arc_free(&v);
     }
-    int bpp = fits_span(w, span);
-    if (!(w == h && (w == 256 || w == 512 || w == 1024 || w == 2048) && span >= MIN_SPAN && bpp)) {
-      if (funnel[6]++ < 3 && span >= MIN_SPAN)
-        L("obb diet: entry %u tex near-miss: dims %ux%u span %u bpp %d", idx, w, h, span, bpp);
-      continue;
+    if (bad) {
+      free(out); free(z0); free(z1); free(mflag); free(bank); free(nb1);
+      goto bail;
     }
-    uint32_t scl = (uint32_t)obb_diet_scale();
-    uint32_t nw = w / scl, nh = h / scl;
-    uint32_t drop = w * h * (uint32_t)bpp;
-    if (scl == 4) drop += (w / 2) * (h / 2) * (uint32_t)bpp;
-    if (r->po + drop > a.b1sz) continue;
-    // patch the dims in b0, excise the top mip level(s) from b1 in place
-    wu16(a.b0 + r->meta + 0xA0, (uint16_t)nw);
-    wu16(a.b0 + r->meta + 0xA2, (uint16_t)nh);
-    memmove(a.b1 + r->po, a.b1 + r->po + drop, a.b1sz - r->po - drop);
-    a.b1sz -= drop;
-    freed += drop;
-    ndieted++;
-    // rebase every record after this cut: the local table and the raw
-    // file's payload_off fields (the directory region rides in the gap)
-    for (int j = 0; j < nrec; j++)
-      if (recs[j].po > r->po) {
-        recs[j].po -= drop;
-        wu32(d + recs[j].file_pos + 16, recs[j].po);
-      }
   }
 
-  if (ndieted) {
-    // b0 always recompresses (the repair only ever touches it, the diet
-    // patched it too). b1 recompresses only for the diet - in repair mode
-    // the original compressed block rides along verbatim: the v1-era
-    // originals are packed tighter than our level 6, so recompressing b1
-    // blew every rebuilt archive past its span cap and the first repair
-    // healed nothing for exactly that reason (hw64: detected, rebuilt,
-    // rejected)
-    uLongf z0cap = compressBound(a.b0sz);
-    z0 = malloc(z0cap + 16);
-    if (!z0) goto done;
-    uLongf z0n = z0cap;
-    if (compress2(z0 + 16, &z0n, a.b0, a.b0sz, repair ? 9 : DIET_LEVEL) != Z_OK) goto done;
-    memcpy(z0, "ZLIB", 4);
-    wbe32(z0 + 4, a.b0sz); wbe32(z0 + 8, (uint32_t)z0n); wu32(z0 + 12, 0);
-    // the untouched b1: its original compressed block, whole
-    uint32_t ob1_off = ru32(d + 0x40 + 0x14), ob1_ssz = ru32(d + 0x40 + 0x18);
-    uLongf z1n = 0;
-    if (!repair) {
-      uLongf z1cap = compressBound(a.b1sz);
-      z1 = malloc(z1cap + 16);
-      if (!z1) goto done;
-      z1n = z1cap;
-      if (compress2(z1 + 16, &z1n, a.b1, a.b1sz, DIET_LEVEL) != Z_OK) goto done;
-      memcpy(z1, "ZLIB", 4);
-      wbe32(z1 + 4, a.b1sz); wbe32(z1 + 8, (uint32_t)z1n); wu32(z1 + 12, 0);
-    }
-    uint32_t gap_len = a.data_start - 0x60;
-    uint32_t total = a.data_start + (uint32_t)(16 + z0n) +
-                     (repair ? ob1_ssz : (uint32_t)(16 + z1n));
-    // must fit the entry's real span: the file rounds each entry up to a
-    // 2048 boundary, so the tail of the last sector is slack the repair
-    // can grow into when the recompressed b0 shifts a few bytes
-    uint32_t cap = (size + 2047) & ~2047u;
-    if (total >= cap) goto done;
-    out = malloc(total);
-    if (!out) goto done;
-    memcpy(out, d, 0x20);
-    wu32(out + 0x04, a.data_start);
-    wbe32(out + 0x08, total);
-    uint8_t *te = out + 0x20;
-    uint32_t b1off = a.data_start + (uint32_t)(16 + z0n);
-    for (int i = 0; i < 2; i++, te += 0x20) {
-      uint32_t dsz = i == 0 ? a.b0sz : a.b1sz;
-      uint32_t off = i == 0 ? a.data_start : b1off;
-      uint32_t ssz = repair && i != 0 ? ob1_ssz : (uint32_t)(i == 0 ? z0n : z1n) + 16;
-      wu32(te, a.ha[i]); wu32(te + 4, a.hb[i]); wu32(te + 8, a.align[i]);
-      wu32(te + 12, dsz); wu32(te + 16, a.codec[i]); wu32(te + 20, off);
-      wu32(te + 24, ssz); wu32(te + 28, 0);
-    }
-    memcpy(out + 0x60, d + 0x60, gap_len);   // the rebased records ride along
-    memcpy(out + a.data_start, z0, 16 + z0n);
-    if (repair) memcpy(out + b1off, d + ob1_off, ob1_ssz);
-    else memcpy(out + b1off, z1, 16 + z1n);
-    // verify: the assembled archive must parse, and every dieted texture
-    // must come back with a consistent span for its scaled dims
-    {
-      arc_t v;
-      if (arc_parse(out, total, &v) < 0) {
-        L("obb diet: entry %u failed verification, skipping", idx);
-        arc_free(&v);
-        goto done;
-      }
-      b2rec vr[MAX_B2];
-      int vn = collect_b2(out, &v, vr, MAX_B2);
-      uint32_t consistent = 0;
-      for (int j = 0; j < vn; j++) {
-        if (vr[j].type != TXTR_CRC || vr[j].meta + 0xA4 > v.b0sz || vr[j].po >= v.b1sz) continue;
-        uint32_t span = v.b1sz - vr[j].po;
-        for (int k = 0; k < vn; k++)
-          if (vr[k].po > vr[j].po && vr[k].po - vr[j].po < span) span = vr[k].po - vr[j].po;
-        uint16_t vw = ru16(v.b0 + vr[j].meta + 0xA0), vh = ru16(v.b0 + vr[j].meta + 0xA2);
-        // loose: the v1 products carry packer padding that the strict +-8
-        // rejects, and the healed records inherit it
-        if (fits_span_loose(vw, span) && vw == vh) consistent++;
-      }
-      arc_free(&v);
-      if (consistent < ndieted) {
-        L("obb diet: entry %u verification: %u consistent < %u dieted, skipping", idx, consistent, ndieted);
-        goto done;
-      }
-    }
-    // write the data first, the TOC last
-    sceIoLseek(fd, (SceOff)sector * 2048, SCE_SEEK_SET);
-    if (wr_full(fd, out, total) < 0) {
-      L("obb diet: entry %u write failed", idx);
-      goto done;
-    }
+  // write the data first, the TOC last
+  sceIoLseek(fd, (SceOff)sector * SECTOR, SCE_SEEK_SET);
+  if (wr_full(fd, out, total) < 0) {
+    L("obb diet: entry %u data write failed", idx);
+    free(out); free(z0); free(z1); free(mflag); free(bank); free(nb1);
+    goto bail;
+  }
+  {
     uint8_t toc[16];
     wu32(toc, total); wu32(toc + 4, 0); wu32(toc + 8, crc); wu32(toc + 12, sector);
-    sceIoLseek(fd, 0x800 + (SceOff)idx * 16, SCE_SEEK_SET);
+    sceIoLseek(fd, TOC_OFF + (SceOff)idx * 16, SCE_SEEK_SET);
     if (wr_full(fd, toc, 16) < 0) {
       L("obb diet: entry %u TOC write failed", idx);
-      goto done;
+      free(out); free(z0); free(z1); free(mflag); free(bank); free(nb1);
+      goto bail;
     }
-    L("obb diet: entry %u (crc %08X) %u textures dieted, %uK freed, %u -> %u bytes",
-      idx, crc, ndieted, freed / 1024, size, total);
-    *saved_out += size - total;
-    ret = 1;
   }
-done:
-  free(out); free(z0); free(z1);
+  L("obb diet: entry %u (crc %08X) %d textures cut, %uK freed, %u -> %u bytes",
+    idx, crc, ncut, sum_drop / 1024, size, total);
+  *saved += size - total;
+  free(out); free(z0); free(z1); free(mflag); free(bank); free(nb1);
+  free(cuts); free(recs);
   arc_free(&a);
   free(d);
-  return ret;
+  return 1;
+
+bail:
+  free(cuts); free(recs);
+  arc_free(&a);
+  free(d);
+  return 0;
 }
 
-// undo the crowd archive's diet: its 1397 per-spectator metadata records
-// carry baked offsets into the payload, so the excision shifted the data
-// under them and no dims heal can fix prebaked tables (hw65: the load's
-// tail died at 98% in the stored-table path, a raw table base). the donor
-// (the pristine archive extract, pushed from the pc as crowd_pristine.iff)
-// lands back in the entry's original sector - the diet shrank the entry in
-// place, so the span after it is dead space by construction. only the
-// toc's size word changes, the crc and sector stay
-static void obb_restore_run(void) {
-  SceIoStat st;
-  if (sceIoGetstat(DATA_PATH "/obb_restore.done", &st) >= 0) return;
-  SceUID df = sceIoOpen(DATA_PATH "/crowd_pristine.iff", SCE_O_RDONLY, 0);
-  if (df < 0) {
-    L("obb restore: no donor at " DATA_PATH "/crowd_pristine.iff, skipping");
-    return;
-  }
+// ---- the donor channel ----------------------------------------------------
+// any donor_<8hex>.iff in the data dir replaces the whole OBB entry the crc
+// names (the PC-built resizes - crowd scene etc.). the donor lands at the
+// entry's original sector, only the TOC size word changes. a marker records
+// the applied donor's size+fnv, so re-pushing a changed donor re-applies.
+
+static uint32_t donor_fnv(const uint8_t *d, uint32_t n) {
+  uint32_t h = 0x811C9DC5;
+  while (n--) { h ^= *d++; h *= 0x01000193; }
+  return h;
+}
+
+static void obb_donor_apply(const char *path, uint32_t crc) {
+  SceUID df = sceIoOpen(path, SCE_O_RDONLY, 0);
+  if (df < 0) return;
   SceOff dn = sceIoLseek(df, 0, SCE_SEEK_END);
   sceIoLseek(df, 0, SCE_SEEK_SET);
-  if (dn <= 0 || dn > 8 * 1024 * 1024) {
+  if (dn <= 0 || dn > (SceOff)MAX_ENTRY) {
     sceIoClose(df);
-    L("obb restore: donor size weird (%lld)", (long long)dn);
+    L("obb donor: %s size weird (%lld), skipping", path, (long long)dn);
     return;
   }
   uint32_t dsz = (uint32_t)dn;
@@ -422,86 +581,133 @@ static void obb_restore_run(void) {
   if (!donor) { sceIoClose(df); return; }
   if (rd_full(df, donor, dsz) < 0 || memcmp(donor, "\x94\xEF\x3B\xFF", 4) != 0) {
     free(donor); sceIoClose(df);
-    L("obb restore: donor read or magic failed");
+    L("obb donor: %s read or magic failed", path);
     return;
   }
   sceIoClose(df);
+  uint32_t fnv = donor_fnv(donor, dsz);
+
+  char mk[64];
+  snprintf(mk, sizeof(mk), DATA_PATH "/obb_donor_%08X.done", crc);
+  SceUID mf = sceIoOpen(mk, SCE_O_RDONLY, 0);
+  if (mf >= 0) {
+    char prev[64];
+    SceSSize got = sceIoRead(mf, prev, sizeof(prev) - 1);
+    sceIoClose(mf);
+    if (got > 0) {
+      prev[got] = 0;
+      uint32_t psz = 0, pfn = 0;
+      if (sscanf(prev, "%u %x", &psz, &pfn) == 2 && psz == dsz && pfn == fnv) {
+        free(donor);
+        return;  // unchanged donor, already applied
+      }
+    }
+  }
+
   SceUID fd = sceIoOpen(obb_resolve(), SCE_O_RDWR, 0);
-  if (fd < 0) { free(donor); L("obb restore: no obb at %s", obb_resolve()); return; }
-  uint8_t *toc = malloc(3500 * 16);
+  if (fd < 0) { free(donor); L("obb donor: no obb at %s", obb_resolve()); return; }
+  uint8_t *toc = malloc(TOC_MAX * 16);
   if (!toc) { free(donor); sceIoClose(fd); return; }
-  sceIoLseek(fd, 0x800, SCE_SEEK_SET);
-  if (rd_full(fd, toc, 3500 * 16) < 0) {
+  sceIoLseek(fd, TOC_OFF, SCE_SEEK_SET);
+  if (rd_full(fd, toc, TOC_MAX * 16) < 0) {
     free(donor); free(toc); sceIoClose(fd);
-    L("obb restore: toc read failed");
+    L("obb donor: toc read failed");
     return;
   }
-  // find the crowd entry by its crc - the diet never changed the toc crcs
   int found = -1;
   uint32_t last = 0;
-  for (uint32_t i = 0; i < 3500; i++) {
+  for (uint32_t i = 0; i < TOC_MAX; i++) {
     if (ru32(toc + i * 16 + 4) != 0) break;
-    uint32_t crc = ru32(toc + i * 16 + 8);
-    if (crc < last) break;
-    last = crc;
-    if (crc == 0x1E947EE5) { found = (int)i; break; }
+    uint32_t c = ru32(toc + i * 16 + 8);
+    if (c < last) break;
+    last = c;
+    if (c == crc) { found = (int)i; break; }
   }
   if (found < 0) {
     free(donor); free(toc); sceIoClose(fd);
-    L("obb restore: crowd entry (crc 1E947EE5) not found");
+    L("obb donor: entry (crc %08X) not found", crc);
     return;
   }
   uint32_t old_size = ru32(toc + found * 16);
-  uint32_t sector = ru32(toc + found * 16 + 12);
-  uint32_t need = (dsz + 2047) / 2048;
+  uint32_t sec = ru32(toc + found * 16 + 12);
+  uint32_t need = (dsz + SECTOR - 1) / SECTOR;
   // nobody else may live inside the span we're about to fill
-  for (uint32_t i = 0; i < 3500; i++) {
+  for (uint32_t i = 0; i < TOC_MAX; i++) {
     if (ru32(toc + i * 16 + 4) != 0) break;
     if ((int)i == found) continue;
-    uint32_t sz = ru32(toc + i * 16), sec = ru32(toc + i * 16 + 12);
-    if (!sz || !sec) continue;
-    uint32_t end = sec + (sz + 2047) / 2048;
-    if (sec < sector + need && end > sector) {
+    uint32_t sz = ru32(toc + i * 16), sc = ru32(toc + i * 16 + 12);
+    if (!sz || !sc) continue;
+    uint32_t end = sc + (sz + SECTOR - 1) / SECTOR;
+    if (sc < sec + need && end > sec) {
       free(donor); free(toc); sceIoClose(fd);
-      L("obb restore: entry %u (sector %u..%u) overlaps the target span, aborting", i, sec, end);
+      L("obb donor: entry %u (sector %u..%u) overlaps, aborting", i, sc, end);
       return;
     }
   }
-  sceIoLseek(fd, (SceOff)sector * 2048, SCE_SEEK_SET);
+  sceIoLseek(fd, (SceOff)sec * SECTOR, SCE_SEEK_SET);
   if (wr_full(fd, donor, dsz) < 0) {
     free(donor); free(toc); sceIoClose(fd);
-    L("obb restore: data write failed");
+    L("obb donor: data write failed");
     return;
   }
   wu32(toc + found * 16, dsz);
-  sceIoLseek(fd, 0x800 + (SceOff)found * 16, SCE_SEEK_SET);
+  sceIoLseek(fd, TOC_OFF + (SceOff)found * 16, SCE_SEEK_SET);
   if (wr_full(fd, toc + found * 16, 16) < 0) {
     free(donor); free(toc); sceIoClose(fd);
-    L("obb restore: toc patch failed");
+    L("obb donor: toc patch failed");
     return;
   }
   free(donor); free(toc); sceIoClose(fd);
-  L("obb restore: crowd entry %d, %u -> %u bytes at sector %u, toc patched",
-    found, old_size, dsz, sector);
-  SceUID m = sceIoOpen(DATA_PATH "/obb_restore.done",
-                       SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
-  if (m >= 0) { sceIoWrite(m, "crowd restored\n", 14); sceIoClose(m); }
+  L("obb donor: crc %08X entry %d, %u -> %u bytes at sector %u, toc patched",
+    crc, found, old_size, dsz, sec);
+  SceUID m = sceIoOpen(mk, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+  if (m >= 0) {
+    char note[64];
+    int wl = snprintf(note, sizeof(note), "%u %08x\n", dsz, fnv);
+    sceIoWrite(m, note, wl);
+    sceIoClose(m);
+  }
 }
 
+static void obb_donor_scan(void) {
+  SceUID df = sceIoDopen(DATA_PATH);
+  if (df < 0) return;
+  SceIoDirent de;
+  while (1) {
+    memset(&de, 0, sizeof(de));
+    if (sceIoDread(df, &de) <= 0) break;
+    const char *dn = de.d_name;
+    size_t len = strlen(dn);
+    if (len != 18 || memcmp(dn, "donor_", 6) != 0 || memcmp(dn + 14, ".iff", 4) != 0)
+      continue;
+    uint32_t crc = 0;
+    int ok = 1;
+    for (int i = 0; i < 8; i++) {
+      char c = dn[6 + i];
+      crc <<= 4;
+      if (c >= '0' && c <= '9') crc |= c - '0';
+      else if (c >= 'a' && c <= 'f') crc |= c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F') crc |= c - 'A' + 10;
+      else { ok = 0; break; }
+    }
+    if (!ok) continue;
+    char path[300];
+    snprintf(path, sizeof(path), DATA_PATH "/%s", dn);
+    obb_donor_apply(path, crc);
+  }
+  sceIoDclose(df);
+}
+
+// ---- the entry point ------------------------------------------------------
+
 void obb_diet_run(void) {
-  // the crowd archive's diet reversal runs first if asked: it changes the
-  // obb itself, before the scan-based passes get their say
-  if (config_int("obb_diet_restore", 0)) obb_restore_run();
-  // repair v3 marker: each version bump re-arms the pass after the
-  // previous one's marker (v1 of the repair healed nothing - the +-8 span
-  // test missed the padding; v2 detected but its rebuild was rejected -
-  // our level-6 recompress outgrew the span). a fixed pass must never be
-  // locked out by its predecessor's marker
-  int repair = config_int("obb_diet_repair", 0);
-  if (!repair && !config_int("obb_diet", 1)) return;
-  const char *marker = repair ? DATA_PATH "/obb_repair3.done" : DATA_PATH "/obb_diet.done";
+  // donors first: a pushed donor is the intent, the markers make it
+  // self-limiting, and the diet then sees the replaced entries as-is
+  obb_donor_scan();
+
+  if (!config_int("obb_diet", 1)) return;
   SceIoStat st;
-  if (sceIoGetstat(marker, &st) >= 0 && !config_int("obb_diet_force", 0))
+  if (sceIoGetstat(DATA_PATH "/obb_diet.done", &st) >= 0 && !config_int("obb_diet_force", 0))
     return;
 
   SceUID fd = sceIoOpen(obb_resolve(), SCE_O_RDWR, 0);
@@ -509,17 +715,17 @@ void obb_diet_run(void) {
     L("obb diet: no obb at %s (0x%08X)", obb_resolve(), fd);
     return;
   }
-  uint8_t *toc = malloc(3500 * 16);
+  uint8_t *toc = malloc(TOC_MAX * 16);
   if (!toc) { sceIoClose(fd); return; }
-  sceIoLseek(fd, 0x800, SCE_SEEK_SET);
-  if (rd_full(fd, toc, 3500 * 16) < 0) {
+  sceIoLseek(fd, TOC_OFF, SCE_SEEK_SET);
+  if (rd_full(fd, toc, TOC_MAX * 16) < 0) {
     L("obb diet: toc read failed");
     free(toc);
     sceIoClose(fd);
     return;
   }
-  uint32_t count = 3500, last = 0, n_entries = 0;
-  for (uint32_t i = 0; i < count; i++) {
+  uint32_t last = 0, n_entries = 0;
+  for (uint32_t i = 0; i < TOC_MAX; i++) {
     if (ru32(toc + i * 16 + 4) != 0) break;             // the hi word
     uint32_t crc = ru32(toc + i * 16 + 8);
     if (crc < last) break;                              // sorted ascending
@@ -530,29 +736,27 @@ void obb_diet_run(void) {
 
   SceUInt64 t0 = sceKernelGetProcessTimeWide();
   uint32_t dieted = 0, saved = 0;
-  int funnel[7] = {0};   // headfail, magic, readfail, parsed, txtr, qualified, anomaly log budget
-  // the first-boot UI: draws after the display's up (main.c runs us there)
+  int funnel[7] = {0};   // magicfail, iff, readfail, readok, parsed, txtr, log budget
   extern void bootscreen_progress(const char *h, const char *l, uint32_t d, uint32_t t) __attribute__((weak));
   extern void gl_boot_ensure(void);
   if (bootscreen_progress) gl_boot_ensure();
   SceUInt64 last_draw = 0;
-  char line[96];
   for (uint32_t i = 0; i < n_entries; i++) {
     uint32_t size = ru32(toc + i * 16);
     uint32_t crc = ru32(toc + i * 16 + 8);
     uint32_t sector = ru32(toc + i * 16 + 12);
-    if (diet_one(fd, i, size, crc, sector, &saved, funnel, repair)) dieted++;
+    if (diet_entry(fd, i, size, crc, sector, &saved, funnel)) dieted++;
     if (bootscreen_progress) {
       SceUInt64 now = sceKernelGetProcessTimeWide();
       if (now - last_draw > 250 * 1000 || i + 1 == n_entries) {
-        snprintf(line, sizeof(line), "%s  %u / %u",
-                 repair ? "REPAIRING GAME DATA" : "OPTIMIZING GAME DATA", i + 1, n_entries);
+        char line[96];
+        snprintf(line, sizeof(line), "OPTIMIZING GAME DATA  %u / %u", i + 1, n_entries);
         bootscreen_progress("PREPARING GAME DATA", line, i + 1, n_entries);
         last_draw = now;
       }
     }
   }
-  L("obb diet funnel: headfail %d, magic %d, readfail %d, parsed %d, txtr %d, qualified %d",
+  L("obb diet funnel: magicfail %d iff %d readfail %d readok %d parsed %d txtr %d",
     funnel[0], funnel[1], funnel[2], funnel[3], funnel[4], funnel[5]);
   free(toc);
   sceIoClose(fd);
@@ -560,19 +764,11 @@ void obb_diet_run(void) {
   L("obb diet: %u archives dieted, %uK saved, %u.%u s",
     dieted, saved / 1024, (unsigned)(ms / 1000), (unsigned)(ms % 1000));
 
-  if (dieted) {
-    SceUID m = sceIoOpen(marker,
-                         SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
-    if (m >= 0) {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "%u archives, %uK saved\n", dieted, saved / 1024);
-      sceIoWrite(m, buf, strlen(buf));
-      sceIoClose(m);
-    }
-  } else {
-    // nothing to do - still mark it so we never scan again
-    SceUID m = sceIoOpen(marker, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
-    if (m >= 0) { sceIoWrite(m, "nothing to do\n", 13); sceIoClose(m); }
-    L("obb diet: nothing qualified, marked done");
+  SceUID m = sceIoOpen(DATA_PATH "/obb_diet.done", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+  if (m >= 0) {
+    char buf[128];
+    int wl = snprintf(buf, sizeof(buf), "%u archives, %uK saved\n", dieted, saved / 1024);
+    sceIoWrite(m, buf, wl);
+    sceIoClose(m);
   }
 }
